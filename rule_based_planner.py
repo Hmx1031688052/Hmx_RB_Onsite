@@ -432,13 +432,14 @@ class PlannerConfig(object):
         """Apply the evaluator's five comfort thresholds.
 
         Emergency collision braking remains allowed to bypass longitudinal
-        jerk limiting in StableController; all ordinary driving uses these
-        exact symmetric limits.
+        jerk limiting in StableController. Ordinary longitudinal commands use
+        a margin below the evaluator boundary because the score is computed
+        from differentiated vehicle motion, not from the ideal command.
         """
         self.comfort_mode = True
-        self.max_accel = 3.0
-        self.max_decel = 3.0
-        self.max_lon_jerk = 6.0
+        self.max_accel = 2.8
+        self.max_decel = 2.6
+        self.max_lon_jerk = 4.5
         self.max_lat_accel = 0.5
         self.max_lat_jerk = 1.0
         self.max_lateral_accel = 0.5
@@ -3338,6 +3339,7 @@ class StableController(object):
         planned_accel=0.0,
     ):
         speed_error = target_speed - ego_speed
+        stationary_stale_brake_cleared = False
         if emergency:
             self.speed_integral = 0.0
             desired_acc = -self.config.max_decel if ego_speed > 1.0 else -2.0
@@ -3360,15 +3362,21 @@ class StableController(object):
                 max(0.0, self.config.max_accel),
             )
             self.last_speed_error = error
-            # A previous emergency frame may leave ``last_acc`` strongly
-            # negative. Once the requested speed is at or above ego speed,
-            # retaining that braking state can drive a kinematic chassis
-            # through zero into reverse even though the target is forward.
-            if error >= 0.0 and self.last_acc < 0.0:
+            # Clear stale braking only after the physical vehicle is already
+            # stationary. While moving, a transition from braking to driving
+            # must pass continuously through zero acceleration; resetting
+            # ``last_acc`` there bypasses the configured jerk limit.
+            if (
+                ego_speed < 0.08
+                and target_speed > 0.05
+                and self.last_acc < 0.0
+            ):
                 self.last_acc = 0.0
+                stationary_stale_brake_cleared = True
 
         # Acceleration command jerk limiting is bypassed only for emergency
         # braking; normal following and curve entry remain deliberately smooth.
+        acceleration_before_limit = self.last_acc
         if emergency:
             acc = desired_acc
         else:
@@ -3386,6 +3394,9 @@ class StableController(object):
             non_reversing_floor = -0.8 * ego_speed / max(dt, 1e-3)
             acc = max(acc, non_reversing_floor)
         self.last_acc = acc
+        actual_accel_command_jerk = (
+            acc - acceleration_before_limit
+        ) / max(dt, 1e-3)
         self.last_debug.update(
             {
                 "ego_speed": ego_speed,
@@ -3398,6 +3409,12 @@ class StableController(object):
                     None
                     if emergency
                     else max(0.5, self.config.max_lon_jerk)
+                ),
+                "actual_accel_command_jerk": (
+                    actual_accel_command_jerk
+                ),
+                "stationary_stale_brake_cleared": (
+                    stationary_stale_brake_cleared
                 ),
                 "acc": acc,
                 "emergency": bool(emergency),

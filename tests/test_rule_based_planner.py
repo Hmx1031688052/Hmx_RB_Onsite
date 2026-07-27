@@ -1315,16 +1315,49 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertGreaterEqual(drive.acc, 0.0)
 
-    def test_forward_target_clears_stale_emergency_braking(self):
-        controller = StableController()
-        controller.last_acc = -4.0
+    def test_forward_target_crosses_zero_with_jerk_limit_while_moving(self):
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        controller = StableController(config)
+        controller.last_acc = -config.max_decel
         acc = controller._longitudinal_control(
             ego_speed=1.0,
-            target_speed=1.2,
+            target_speed=5.0,
+            dt=0.1,
+            emergency=False,
+        )
+        self.assertAlmostEqual(
+            -config.max_decel + config.max_lon_jerk * 0.1,
+            acc,
+        )
+        self.assertLess(acc, 0.0)
+        self.assertAlmostEqual(
+            config.max_lon_jerk,
+            controller.last_debug["actual_accel_command_jerk"],
+        )
+        self.assertFalse(
+            controller.last_debug["stationary_stale_brake_cleared"]
+        )
+
+    def test_stationary_forward_target_clears_stale_brake(self):
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        controller = StableController(config)
+        controller.last_acc = -config.max_decel
+        acc = controller._longitudinal_control(
+            ego_speed=0.0,
+            target_speed=5.0,
             dt=0.1,
             emergency=False,
         )
         self.assertGreaterEqual(acc, 0.0)
+        self.assertLessEqual(
+            acc,
+            config.max_lon_jerk * 0.1 + 1e-9,
+        )
+        self.assertTrue(
+            controller.last_debug["stationary_stale_brake_cleared"]
+        )
 
     def test_changing_forward_target_does_not_create_derivative_braking(self):
         controller = StableController()
@@ -1374,9 +1407,9 @@ class RulePlannerTest(unittest.TestCase):
         config = PlannerConfig()
         config.enable_comfort_mode()
         self.assertTrue(config.comfort_mode)
-        self.assertEqual(config.max_accel, 3.0)
-        self.assertEqual(config.max_decel, 3.0)
-        self.assertEqual(config.max_lon_jerk, 6.0)
+        self.assertEqual(config.max_accel, 2.8)
+        self.assertEqual(config.max_decel, 2.6)
+        self.assertEqual(config.max_lon_jerk, 4.5)
         self.assertEqual(config.max_lat_accel, 0.5)
         self.assertEqual(config.max_lat_jerk, 1.0)
         self.assertEqual(config.max_lateral_accel, 0.5)

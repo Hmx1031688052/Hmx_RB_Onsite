@@ -31,7 +31,7 @@ class GroundTruthObstacleAdapter:
         sensor_offset_y=0.013,
         velocity_filter=0.55,
         trust_reported_velocity=True,
-        track_hold_seconds=0.35,
+        track_hold_seconds=1.0,
         innovation_gate_m=4.0,
         innovation_gate_speed=12.0,
     ):

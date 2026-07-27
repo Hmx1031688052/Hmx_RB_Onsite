@@ -157,6 +157,31 @@ class GroundTruthObstacleAdapterTests(unittest.TestCase):
         )
         self.assertEqual([], expired)
 
+    def test_default_hold_bridges_observed_gt_empty_window(self):
+        ego = Object()
+        ego.x = 0.0
+        ego.y = 0.0
+        ego.theta = 0.0
+        adapter = GroundTruthObstacleAdapter(
+            sensor_offset_x=0.0,
+            sensor_offset_y=0.0,
+        )
+        adapter.update(
+            truth(10.0, 10.0, 0.0, vx=5.0), ego
+        )
+
+        held = adapter.update(
+            {"timestamp_s": 10.65, "roles": []}, ego
+        )
+        self.assertEqual(1, len(held))
+        self.assertAlmostEqual(13.25, held[0].x)
+        self.assertTrue(held[0].track_predicted)
+
+        expired = adapter.update(
+            {"timestamp_s": 11.01, "roles": []}, ego
+        )
+        self.assertEqual([], expired)
+
     def test_implausible_position_jump_is_rejected(self):
         ego = Object()
         ego.x = 0.0

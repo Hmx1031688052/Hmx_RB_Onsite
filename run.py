@@ -200,7 +200,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-manual-scenario-override-v8"
+    "2026-07-27-comfort-longitudinal-v9"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -274,7 +274,7 @@ npc_truth_recorder = None
 npc_truth_frames = deque(maxlen=64)
 gt_obstacle_adapter = GroundTruthObstacleAdapter(
     track_hold_seconds=float(
-        os.environ.get("GT_TRACK_HOLD_SECONDS", "0.35")
+        os.environ.get("GT_TRACK_HOLD_SECONDS", "1.0")
     ),
     innovation_gate_m=float(
         os.environ.get("GT_TRACK_INNOVATION_GATE_M", "4.0")
@@ -2312,7 +2312,9 @@ def get_pointcloud_msg():
             f"speed_error={float(controller_debug.get('speed_error', float('nan'))):.3f}m/s "
             f"planned_acc={float(controller_debug.get('planned_accel', float('nan'))):.3f}m/s2 "
             f"desired_acc={float(controller_debug.get('desired_acc', float('nan'))):.3f}m/s2 "
-            f"accel_jerk={float(controller_debug.get('accel_command_jerk') if controller_debug.get('accel_command_jerk') is not None else float('nan')):.3f}m/s3 "
+            f"accel_jerk_limit={float(controller_debug.get('accel_command_jerk') if controller_debug.get('accel_command_jerk') is not None else float('nan')):.3f}m/s3 "
+            f"accel_jerk_actual={float(controller_debug.get('actual_accel_command_jerk', float('nan'))):.3f}m/s3 "
+            f"stale_brake_cleared={bool(controller_debug.get('stationary_stale_brake_cleared', False))} "
             f"integral={float(controller_debug.get('speed_integral', float('nan'))):.3f} "
             f"lookahead={float(controller_debug.get('lookahead', float('nan'))):.3f}m "
             f"lateral_error={float(controller_debug.get('lateral_error', float('nan'))):.3f}m "
@@ -2512,6 +2514,29 @@ def process_notify():
             print("start session")
             start_test = True
             model.start = 1
+            # DriveSim holds the chassis brake while a prepared scenario is
+            # waiting to start.  Publish a neutral command immediately when
+            # the start notification arrives instead of waiting for the first
+            # perception/planning cycle.  Matching the current forward speed
+            # releases that inherited brake without requesting a speed step.
+            stable_controller.reset()
+            last_control_wall_time = None
+            startup_speed = max(
+                0.0,
+                float(
+                    getattr(
+                        getattr(model, "ego", None),
+                        "speed",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            )
+            send_control_cmd(0.0, startup_speed, 0.0)
+            print(
+                "[startup-control] neutral brake release "
+                f"speed={startup_speed:.3f}m/s"
+            )
             if drive_trace_logger is not None:
                 drive_trace_logger.record_event(
                     "test_start",
@@ -2870,9 +2895,9 @@ if __name__ == "__main__":
         dest="comfort_mode",
         action="store_true",
         help=(
-            "enforce evaluator limits: longitudinal acceleration 3 m/s^2, "
-            "longitudinal jerk 6 m/s^3, lateral acceleration 0.5 m/s^2, "
-            "lateral jerk 1 m/s^3 and yaw rate 0.5 rad/s"
+            "use a score-safe profile: commanded acceleration +2.8/-2.6 "
+            "m/s^2 and longitudinal jerk 4.5 m/s^3, with evaluator lateral "
+            "limits 0.5 m/s^2, 1 m/s^3 and yaw rate 0.5 rad/s"
         ),
     )
     comfort_group.add_argument(
