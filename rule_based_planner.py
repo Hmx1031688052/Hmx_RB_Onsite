@@ -362,6 +362,35 @@ class PlannerConfig(object):
                 )
             ),
         )
+        # The direct-goal route begins with the current vehicle heading.
+        # Keep its steering authority deliberately small: a 42 degree wheel
+        # command at 30 m/s makes the kinematic chassis unrecoverable.
+        self.mt05_sprint_max_steer_deg = _clip(
+            float(os.environ.get("RULE_MT05_SPRINT_MAX_STEER_DEG", "11.0")),
+            2.0,
+            42.0,
+        )
+        self.mt05_sprint_steer_rate_deg_s = max(
+            10.0,
+            float(os.environ.get("RULE_MT05_SPRINT_STEER_RATE_DEG_S", "80.0")),
+        )
+        self.mt05_sprint_recovery_heading_deg = _clip(
+            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_HEADING_DEG", "25.0")),
+            5.0,
+            90.0,
+        )
+        self.mt05_sprint_recovery_lateral_m = max(
+            0.5,
+            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_LATERAL_M", "3.0")),
+        )
+        self.mt05_sprint_recovery_speed = max(
+            0.0,
+            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_SPEED", "8.0")),
+        )
+        self.mt05_sprint_recovery_decel = max(
+            0.5,
+            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_DECEL", "10.0")),
+        )
         # ``comfort_mode`` is deliberately opt-in at the library level so
         # existing users of PlannerConfig keep their tuning.  run.py enables
         # it by default for the scored DriveSim entrypoint.
@@ -439,6 +468,10 @@ class PlannerConfig(object):
         ) < 0.0 else 1.0
         self.max_steering_wheel_deg = float(
             os.environ.get("RULE_MAX_STEER_DEG", "42.0")
+        )
+        self.mt05_sprint_max_steer_deg = min(
+            self.mt05_sprint_max_steer_deg,
+            self.max_steering_wheel_deg,
         )
         self.steering_rate_low = float(
             os.environ.get("RULE_STEER_RATE_LOW", "90.0")
@@ -1433,9 +1466,10 @@ class RuleBasedPlanner(object):
         )
         target = curve_limit
         if self._mt05_sprint_active:
-            target = min(
-                target, self.config.mt05_sprint_speed
-            )
+            # The MT_05 sprint reference is a purpose-built constant-radius
+            # arc. Steering is hard-capped separately in the controller, so
+            # do not apply the ordinary map-curve speed cap a second time.
+            target = self.config.mt05_sprint_speed
 
         remaining = max(0.0, self.reference.length - projection["s"] - self.config.goal_stop_buffer)
         goal_limit = configured_base_limit
@@ -2300,7 +2334,7 @@ class RuleBasedPlanner(object):
         )
 
     def _mt05_straight_sprint_path(self, ego, global_path):
-        """Return one session-stable straight ray through the route goal."""
+        """Return a session-stable, heading-continuous sprint arc to goal."""
         if self._mt05_sprint_path is not None:
             return self._mt05_sprint_path
         try:
@@ -2328,25 +2362,80 @@ class RuleBasedPlanner(object):
         direct_distance = math.hypot(dx, dy)
         if direct_distance < 1.0:
             return None
-        direction_x = dx / direct_distance
-        direction_y = dy / direct_distance
+        start_yaw = _finite(getattr(ego, "theta", 0.0))
+        chord_yaw = math.atan2(dy, dx)
+        # A circular arc has chord bearing (start_yaw + end_yaw) / 2.  Choose
+        # the end yaw that reaches the requested goal while preserving the
+        # initial vehicle tangent.  The old straight ray demanded the whole
+        # start-to-goal heading error in one control tick.
+        turn_angle = _wrap(2.0 * _wrap(chord_yaw - start_yaw))
+        use_arc = (
+            abs(turn_angle) > math.radians(2.0)
+            and abs(turn_angle) < math.radians(170.0)
+        )
+        if use_arc:
+            curvature = (
+                2.0 * math.sin(0.5 * turn_angle) / direct_distance
+            )
+            arc_length = abs(turn_angle / max(abs(curvature), EPS))
+            stations = np.linspace(
+                0.0,
+                arc_length,
+                max(3, int(math.ceil(arc_length / 0.5)) + 1),
+            )
+            arc_yaw = start_yaw + curvature * stations
+            xs = start_x + (
+                np.sin(arc_yaw) - math.sin(start_yaw)
+            ) / curvature
+            ys = start_y - (
+                np.cos(arc_yaw) - math.cos(start_yaw)
+            ) / curvature
+            # Continue along the final tangent. This keeps projection valid
+            # past the scoring goal without asking the controller to turn
+            # back toward the route.
+            extension = np.linspace(0.5, 100.0, 200)
+            end_yaw = start_yaw + turn_angle
+            xs = np.concatenate(
+                (xs, goal_x + extension * math.cos(end_yaw))
+            )
+            ys = np.concatenate(
+                (ys, goal_y + extension * math.sin(end_yaw))
+            )
+            kappas = np.concatenate(
+                (
+                    np.full(stations.size, curvature, dtype=float),
+                    np.zeros(extension.size, dtype=float),
+                )
+            )
+            reference_kind = "arc"
+        else:
+            # Retain a straight fallback for a near-collinear route or a
+            # near-U-turn geometry that cannot be represented by one arc.
+            direction_x = dx / direct_distance
+            direction_y = dy / direct_distance
+            total_distance = direct_distance + 100.0
+            stations = np.linspace(
+                0.0,
+                total_distance,
+                max(3, int(math.ceil(total_distance / 0.5)) + 1),
+            )
+            xs = start_x + direction_x * stations
+            ys = start_y + direction_y * stations
+            kappas = np.zeros(stations.size, dtype=float)
+            curvature = 0.0
+            arc_length = direct_distance
+            reference_kind = "straight-fallback"
         # Continue well beyond the scoring goal.  The platform ends the case
         # when the goal is crossed; extending the ray prevents any implicit
         # terminal braking in the local trajectory/controller.
-        total_distance = direct_distance + 100.0
-        stations = np.linspace(
-            0.0,
-            total_distance,
-            max(3, int(math.ceil(total_distance / 0.5)) + 1),
-        )
         self._mt05_sprint_path = {
-            "x": (start_x + direction_x * stations).tolist(),
-            "y": (start_y + direction_y * stations).tolist(),
-            "kappa": np.zeros(stations.size).tolist(),
-            "speed_limit": np.zeros(stations.size).tolist(),
+            "x": xs.tolist(),
+            "y": ys.tolist(),
+            "kappa": kappas.tolist(),
+            "speed_limit": np.zeros(xs.size).tolist(),
             "frame_id": "MT_05-direct-sprint",
             "stamp": (
-                "mt05-direct-sprint",
+                "mt05-direct-sprint-arc",
                 round(start_x, 3),
                 round(start_y, 3),
                 round(goal_x, 3),
@@ -2355,17 +2444,22 @@ class RuleBasedPlanner(object):
         }
         self._mt05_sprint_goal = (goal_x, goal_y)
         print(
-            "[mt05-sprint] straight reference "
+            "[mt05-sprint] {} reference "
             "start=({:.3f},{:.3f}) goal=({:.3f},{:.3f}) "
-            "distance={:.3f}m speed={:.3f}m/s "
-            "pulse_accel={:.3f}m/s2".format(
+            "chord={:.3f}m arc={:.3f}m turn={:.1f}deg kappa={:.4f} "
+            "speed={:.3f}m/s pulse_accel={:.3f}m/s2 steer_cap={:.1f}deg".format(
+                reference_kind,
                 start_x,
                 start_y,
                 goal_x,
                 goal_y,
                 direct_distance,
+                arc_length,
+                math.degrees(turn_angle),
+                curvature,
                 self.config.mt05_sprint_speed,
                 self.config.mt05_sprint_accel,
+                self.config.mt05_sprint_max_steer_deg,
             )
         )
         return self._mt05_sprint_path
@@ -3491,19 +3585,23 @@ class StableController(object):
                 max(speed * speed, EPS),
             )
             if sprint_mode:
-                # MT_05 deliberately trades a very short lateral-acceleration
-                # interval for a much shorter total time.  Point directly at
-                # the goal ray instead of constraining the turn by the normal
-                # comfort/yaw-rate envelope.
+                # Follow the arc's feed-forward curvature. Do not point at
+                # the distant goal directly: that saturated the steering at
+                # 42 degrees when the initial tangent differed from the goal
+                # chord by 57 degrees.
                 physical_front_limit = math.radians(
-                    cfg.max_steering_wheel_deg
+                    cfg.mt05_sprint_max_steer_deg
                     / max(cfg.steering_ratio, EPS)
                 )
                 front_angle = _clip(
-                    1.15 * global_heading_error
+                    math.atan(
+                        cfg.controller_wheelbase
+                        * global_reference_curvature
+                    )
+                    + 0.35 * global_heading_error
                     - math.atan2(
-                        1.8 * global_offset,
-                        max(speed, 4.0),
+                        0.8 * global_offset,
+                        max(speed, 8.0),
                     ),
                     -physical_front_limit,
                     physical_front_limit,
@@ -3562,14 +3660,14 @@ class StableController(object):
             )
             rate = min(rate, comfort_rate)
         if sprint_mode:
-            rate = max(rate, 180.0)
+            rate = max(rate, cfg.mt05_sprint_steer_rate_deg_s)
         rate_limited = _clip(
             self.filtered_steer,
             self.last_steer - rate * dt,
             self.last_steer + rate * dt,
         )
         limit = (
-            cfg.max_steering_wheel_deg
+            cfg.mt05_sprint_max_steer_deg
             if sprint_mode
             else self._steering_limit(
                 speed,
@@ -3970,8 +4068,22 @@ class StableController(object):
                 alignment_speed_cap = min(alignment_speed_cap, 5.0)
             elif abs_lateral_error > 1.2:
                 alignment_speed_cap = min(alignment_speed_cap, 7.0)
+        sprint_recovery_active = bool(
+            sprint_mode
+            and (
+                abs_heading_error >= math.radians(
+                    self.config.mt05_sprint_recovery_heading_deg
+                )
+                or abs_lateral_error
+                >= self.config.mt05_sprint_recovery_lateral_m
+            )
+        )
         if sprint_mode:
-            alignment_speed_cap = float("inf")
+            alignment_speed_cap = (
+                self.config.mt05_sprint_recovery_speed
+                if sprint_recovery_active
+                else float("inf")
+            )
         target_speed = min(target_speed, alignment_speed_cap)
         if target_speed < ego_speed or math.isfinite(alignment_speed_cap):
             planned_accel = min(0.0, planned_accel)
@@ -3990,11 +4102,18 @@ class StableController(object):
             # Deliberately concentrate the evaluator-threshold violation into
             # a short pulse, then coast.  This is isolated to MT_05 and avoids
             # spending the whole case near the acceleration threshold.
-            acc = (
-                self.config.mt05_sprint_accel
-                if ego_speed < target_speed - 0.5
-                else 0.0
-            )
+            if sprint_recovery_active:
+                acc = (
+                    -self.config.mt05_sprint_recovery_decel
+                    if ego_speed > target_speed + 0.5
+                    else 0.0
+                )
+            else:
+                acc = (
+                    self.config.mt05_sprint_accel
+                    if ego_speed < target_speed - 0.5
+                    else 0.0
+                )
             self.last_acc = acc
             self.speed_integral = 0.0
             self.last_debug.update(
@@ -4005,6 +4124,7 @@ class StableController(object):
                     "actual_accel_command_jerk": float("nan"),
                     "accel_command_jerk": None,
                     "sprint_accel_pulse_active": acc > 0.0,
+                    "sprint_recovery_active": sprint_recovery_active,
                 }
             )
         else:
@@ -4042,6 +4162,7 @@ class StableController(object):
                 ),
                 "centerline_safety_stop": centerline_safety_stop,
                 "mt05_sprint_mode": sprint_mode,
+                "sprint_recovery_active": sprint_recovery_active,
                 "output_acc": acc,
                 "output_steer": steer,
             }

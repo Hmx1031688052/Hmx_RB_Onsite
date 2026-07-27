@@ -331,7 +331,7 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertGreater(mt05_limit, 1.8 * ordinary_limit)
 
-    def test_mt05_sprint_replaces_curve_with_straight_goal_ray(self):
+    def test_mt05_sprint_uses_heading_continuous_arc_to_goal(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -364,14 +364,14 @@ class RulePlannerTest(unittest.TestCase):
             planner.last_debug["mt05_sprint_goal"],
             [10.0, -10.0],
         )
-        self.assertTrue(
-            np.allclose(planner.reference.kappa, 0.0)
+        self.assertGreater(
+            float(np.max(np.abs(planner.reference.kappa))), 0.05
         )
-        line_cross = (
-            result.trajectory.x * -10.0
-            - result.trajectory.y * 10.0
-        )
-        self.assertLess(np.max(np.abs(line_cross)), 1e-6)
+        self.assertAlmostEqual(planner.reference.x[0], 0.0)
+        self.assertAlmostEqual(planner.reference.y[0], 0.0)
+        arc_end = int(np.argmax(np.abs(planner.reference.kappa) < 1e-8))
+        self.assertAlmostEqual(planner.reference.x[arc_end - 1], 10.0, places=2)
+        self.assertAlmostEqual(planner.reference.y[arc_end - 1], -10.0, places=2)
 
     def test_mt05_sprint_uses_short_acceleration_pulse(self):
         path = {
@@ -419,6 +419,9 @@ class RulePlannerTest(unittest.TestCase):
             launch.speed, config.mt05_sprint_speed
         )
         self.assertGreater(launch.steer, 0.0)
+        self.assertLessEqual(
+            abs(launch.steer), config.mt05_sprint_max_steer_deg
+        )
         self.assertEqual(coast.acc, 0.0)
         self.assertTrue(
             controller.last_debug["mt05_sprint_mode"]

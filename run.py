@@ -211,7 +211,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-mt05-direct-sprint-v14"
+    "2026-07-27-mt05-arc-sprint-v15"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2376,6 +2376,7 @@ def get_pointcloud_msg():
             f"tracking_recovery={bool(controller_debug.get('tracking_recovery_active', False))} "
             f"sprint_mode={bool(controller_debug.get('mt05_sprint_mode', False))} "
             f"sprint_pulse={bool(controller_debug.get('sprint_accel_pulse_active', False))} "
+            f"sprint_recovery={bool(controller_debug.get('sprint_recovery_active', False))} "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "
@@ -3885,6 +3886,10 @@ if __name__ == "__main__":
         f"{planner_config.mt05_sprint_speed:.3f}m/s "
         f"mt05_sprint_accel="
         f"{planner_config.mt05_sprint_accel:.3f}m/s2 "
+        f"mt05_sprint_steer_cap="
+        f"{planner_config.mt05_sprint_max_steer_deg:.3f}deg "
+        f"mt05_sprint_recovery_speed="
+        f"{planner_config.mt05_sprint_recovery_speed:.3f}m/s "
         f"avoidance_speed={planner_config.static_avoidance_speed:.3f}m/s "
         f"avoidance_half_width={planner_config.avoidance_half_width:.3f}m "
         f"minimum_bypass_shift="
