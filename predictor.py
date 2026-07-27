@@ -1673,14 +1673,18 @@ class Predictor:
         if not math.isfinite(x) or not math.isfinite(y):
             return False, "non-finite position", x, y, length, width
 
-        # 只有非 AITown 地图才按局部坐标范围过滤
-        if not self._is_aitown_map():
-            if abs(x) > 1000.0 or abs(y) > 1000.0:
-                return False, "position out of range", x, y, length, width
-        else:
-            # AITown 地图使用 UTM 大坐标
-            if abs(x) > 10000000.0 or abs(y) > 10000000.0:
-                return False, "position out of range", x, y, length, width
+        # DriveSim maps use different world-coordinate origins. The episode
+        # init-state gate rejects stale positions, so only reject obviously
+        # corrupt magnitudes here.
+        if abs(x) > 10000000.0 or abs(y) > 10000000.0:
+            return (
+                False,
+                "position magnitude exceeds 10000000m",
+                x,
+                y,
+                length,
+                width,
+            )
 
         return True, "", x, y, length, width
 

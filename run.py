@@ -212,7 +212,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-roundabout-idm-v19"
+    "2026-07-27-roundabout-idm-ins-fix-v20"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -797,16 +797,12 @@ def _valid_imu_xy(x, y):
     if not math.isfinite(x) or not math.isfinite(y):
         return False
 
-    # ===== 修改 begin：AITownReconstructed_V0103_200518.xodr 允许 UTM 大坐标 =====
-    current_map = globals().get("map_name", "")
-    if _is_aitown_map(current_map):
-        if abs(x) > 10000000.0 or abs(y) > 10000000.0:
-            return False
-    else:
-        # 其它地图仍然保持原来的局部坐标限制
-        if abs(x) > 1000.0 or abs(y) > 1000.0:
-            return False
-    # ===== 修改 end =====
+    # Map coordinates are not guaranteed to use a local +/-1000 m frame.
+    # MT_21, for example, legitimately starts near (786, 1569). Stale
+    # previous-session samples are already rejected by the init-state gate,
+    # so this check should only reject obviously corrupt magnitudes.
+    if abs(x) > 10000000.0 or abs(y) > 10000000.0:
+        return False
 
     return True
 
@@ -854,8 +850,14 @@ def _ins_sample_status(ins):
     xy = _ins_xy(ins)
     if xy is None:
         return False, "missing position", xy
+    if not all(math.isfinite(value) for value in xy):
+        return False, "non-finite position", xy
     if not _valid_imu_xy(xy[0], xy[1]):
-        return False, "invalid position", xy
+        return (
+            False,
+            "position magnitude exceeds 10000000m",
+            xy,
+        )
 
     heading = getattr(ins, "heading", 0.0)
     try:
