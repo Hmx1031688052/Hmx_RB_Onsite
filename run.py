@@ -135,6 +135,10 @@ def _setup_global_route_path():
 
 _setup_global_route_path()
 
+from opendrive_spiral_compat import install_spiral_support
+
+install_spiral_support()
+
 import cv2
 import numpy as np
 
@@ -182,6 +186,13 @@ from npc_truth import (
 )
 from gloplan.global_route_planner import DirectGlobalRoutePlanner, RoutePlanningError
 
+# The runtime compatibility patch changes parsed road geometry.  Invalidate
+# routes cached by the legacy parser even when the external ros2_map package
+# itself has not yet been updated.
+DirectGlobalRoutePlanner.PLANNER_CACHE_VERSION = (
+    "direct-global-route-v2-spiral"
+)
+
 try:
     from google.protobuf.json_format import MessageToDict
 except ImportError:  # pragma: no cover - protobuf is provided by DriveSim
@@ -200,7 +211,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-comfort-longitudinal-v9"
+    "2026-07-27-xodr-spiral-v10"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
