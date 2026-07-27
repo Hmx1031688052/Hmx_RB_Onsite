@@ -328,68 +328,63 @@ class PlannerConfig(object):
                 )
             ),
         )
-        # MT_05 is a short intersection task made almost entirely of a
-        # constant-radius turn.  Applying the evaluator's 0.5 m/s^2 comfort
-        # threshold as its cruise-speed budget limits it to about 4 m/s.
-        # Give only this map the same lateral budget already available to the
-        # tracking-recovery controller; obstacle handling remains unchanged.
-        self.map_curve_lateral_accel_overrides = {
-            "mt_05-intersection.xodr": max(
-                0.5,
-                float(
-                    os.environ.get(
-                        "RULE_MT05_CURVE_LAT_ACCEL", "4.5"
-                    )
-                ),
-            )
-        }
-        self.mt05_direct_sprint_enabled = (
-            os.environ.get("RULE_MT05_DIRECT_SPRINT", "1") == "1"
+        self.map_curve_lateral_accel_overrides = {}
+        # Generic direct-goal sprint. ``sprint_map_names`` is a selector, not
+        # a hard-coded planner branch: use a comma-separated map list or "*"
+        # to make the same controller available to every scenario.
+        self.sprint_enabled = (
+            os.environ.get("RULE_SPRINT_ENABLED", "0") == "1"
         )
-        self.mt05_sprint_speed = max(
+        self.sprint_map_names = self._normalise_sprint_maps(
+            os.environ.get("RULE_SPRINT_MAPS", "")
+        )
+        self.sprint_speed = max(
             5.0,
             float(
                 os.environ.get(
-                    "RULE_MT05_SPRINT_SPEED", "30.0"
+                    "RULE_SPRINT_SPEED", "30.0"
                 )
             ),
         )
-        self.mt05_sprint_accel = max(
+        self.sprint_accel = max(
             3.0,
             float(
                 os.environ.get(
-                    "RULE_MT05_SPRINT_ACCEL", "40.0"
+                    "RULE_SPRINT_ACCEL", "40.0"
                 )
             ),
         )
         # The direct-goal route begins with the current vehicle heading.
         # Keep its steering authority deliberately small: a 42 degree wheel
         # command at 30 m/s makes the kinematic chassis unrecoverable.
-        self.mt05_sprint_max_steer_deg = _clip(
-            float(os.environ.get("RULE_MT05_SPRINT_MAX_STEER_DEG", "11.0")),
+        self.sprint_max_steer_deg = _clip(
+            float(os.environ.get("RULE_SPRINT_MAX_STEER_DEG", "11.0")),
             2.0,
             42.0,
         )
-        self.mt05_sprint_steer_rate_deg_s = max(
+        self.sprint_steer_rate_deg_s = max(
             10.0,
-            float(os.environ.get("RULE_MT05_SPRINT_STEER_RATE_DEG_S", "80.0")),
+            float(os.environ.get("RULE_SPRINT_STEER_RATE_DEG_S", "80.0")),
         )
-        self.mt05_sprint_recovery_heading_deg = _clip(
-            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_HEADING_DEG", "25.0")),
+        self.sprint_recovery_heading_deg = _clip(
+            float(os.environ.get("RULE_SPRINT_RECOVERY_HEADING_DEG", "25.0")),
             5.0,
             90.0,
         )
-        self.mt05_sprint_recovery_lateral_m = max(
+        self.sprint_recovery_lateral_m = max(
             0.5,
-            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_LATERAL_M", "3.0")),
+            float(os.environ.get("RULE_SPRINT_RECOVERY_LATERAL_M", "3.0")),
         )
-        self.mt05_sprint_recovery_speed = max(
+        self.sprint_recovery_speed = max(
             0.0,
-            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_SPEED", "8.0")),
+            float(os.environ.get("RULE_SPRINT_RECOVERY_SPEED", "8.0")),
         )
-        self.mt05_sprint_recovery_decel = max(
+        self.sprint_recovery_decel = max(
             0.5,
-            float(os.environ.get("RULE_MT05_SPRINT_RECOVERY_DECEL", "10.0")),
+            float(os.environ.get("RULE_SPRINT_RECOVERY_DECEL", "10.0")),
+        )
+        self.sprint_ignore_obstacles = (
+            os.environ.get("RULE_SPRINT_IGNORE_OBSTACLES", "0") == "1"
         )
         # ``comfort_mode`` is deliberately opt-in at the library level so
         # existing users of PlannerConfig keep their tuning.  run.py enables
@@ -469,8 +464,8 @@ class PlannerConfig(object):
         self.max_steering_wheel_deg = float(
             os.environ.get("RULE_MAX_STEER_DEG", "42.0")
         )
-        self.mt05_sprint_max_steer_deg = min(
-            self.mt05_sprint_max_steer_deg,
+        self.sprint_max_steer_deg = min(
+            self.sprint_max_steer_deg,
             self.max_steering_wheel_deg,
         )
         self.steering_rate_low = float(
@@ -508,6 +503,96 @@ class PlannerConfig(object):
         self.w_lateral_change = 0.30
         self.w_terminal_center = 1.0
         self.w_direction_switch = 80.0
+
+    @staticmethod
+    def _normalise_sprint_maps(map_names):
+        """Return lower-case map basenames accepted by sprint selection."""
+        if map_names is None:
+            return set()
+        if isinstance(map_names, str):
+            values = map_names.split(",")
+        else:
+            values = map_names
+        result = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            result.add(
+                "*" if text == "*" else os.path.basename(text).lower()
+            )
+        return result
+
+    def configure_sprint(
+        self,
+        enabled=None,
+        map_names=None,
+        speed=None,
+        accel=None,
+        max_steer_deg=None,
+        steer_rate_deg_s=None,
+        recovery_heading_deg=None,
+        recovery_lateral_m=None,
+        recovery_speed=None,
+        recovery_decel=None,
+        ignore_obstacles=None,
+    ):
+        """Configure the generic direct-goal sprint controller.
+
+        ``map_names`` accepts an iterable, a comma-separated string, or
+        ``"*"``. Unspecified values retain their existing settings, making
+        this safe to call from a CLI adapter or directly from another planner.
+        """
+        if enabled is not None:
+            self.sprint_enabled = bool(enabled)
+        if map_names is not None:
+            self.sprint_map_names = self._normalise_sprint_maps(map_names)
+        if speed is not None:
+            self.sprint_speed = max(0.1, float(speed))
+        if accel is not None:
+            self.sprint_accel = max(0.1, float(accel))
+        if max_steer_deg is not None:
+            self.sprint_max_steer_deg = _clip(
+                float(max_steer_deg),
+                0.1,
+                self.max_steering_wheel_deg,
+            )
+        if steer_rate_deg_s is not None:
+            self.sprint_steer_rate_deg_s = max(
+                0.1, float(steer_rate_deg_s)
+            )
+        if recovery_heading_deg is not None:
+            self.sprint_recovery_heading_deg = _clip(
+                float(recovery_heading_deg), 1.0, 179.0
+            )
+        if recovery_lateral_m is not None:
+            self.sprint_recovery_lateral_m = max(
+                0.1, float(recovery_lateral_m)
+            )
+        if recovery_speed is not None:
+            self.sprint_recovery_speed = max(
+                0.0, float(recovery_speed)
+            )
+        if recovery_decel is not None:
+            self.sprint_recovery_decel = max(
+                0.1, float(recovery_decel)
+            )
+        if ignore_obstacles is not None:
+            self.sprint_ignore_obstacles = bool(ignore_obstacles)
+        return self
+
+    def sprint_applies_to(self, map_name):
+        """Whether the configured sprint controller owns this map."""
+        if not self.sprint_enabled:
+            return False
+        basename = os.path.basename(str(map_name or "")).lower()
+        return bool(
+            basename
+            and (
+                "*" in self.sprint_map_names
+                or basename in self.sprint_map_names
+            )
+        )
 
     def enable_comfort_mode(self):
         """Apply the evaluator's five comfort thresholds.
@@ -782,9 +867,9 @@ class RuleBasedPlanner(object):
         self._scenario_override_error = ""
         self._active_manual_override = None
         self._active_manual_override_key = None
-        self._mt05_sprint_path = None
-        self._mt05_sprint_goal = None
-        self._mt05_sprint_active = False
+        self._sprint_path = None
+        self._sprint_goal = None
+        self._sprint_active = False
         self._load_scenario_overrides(force=True)
 
     def reset(self, map_name=""):
@@ -794,9 +879,9 @@ class RuleBasedPlanner(object):
         self.behavior = "STOP"
         self.map_name = str(map_name or "")
         self.last_debug = {}
-        self._mt05_sprint_path = None
-        self._mt05_sprint_goal = None
-        self._mt05_sprint_active = False
+        self._sprint_path = None
+        self._sprint_goal = None
+        self._sprint_active = False
         self.avoidance_side = 0
         self.avoidance_obstacle_id = None
         self.avoidance_origin_d = None
@@ -1465,11 +1550,11 @@ class RuleBasedPlanner(object):
             projection["s"], path_limit, ego["speed"]
         )
         target = curve_limit
-        if self._mt05_sprint_active:
-            # The MT_05 sprint reference is a purpose-built constant-radius
+        if self._sprint_active:
+            # The sprint reference is a purpose-built constant-radius
             # arc. Steering is hard-capped separately in the controller, so
             # do not apply the ordinary map-curve speed cap a second time.
-            target = self.config.mt05_sprint_speed
+            target = self.config.sprint_speed
 
         remaining = max(0.0, self.reference.length - projection["s"] - self.config.goal_stop_buffer)
         goal_limit = configured_base_limit
@@ -1505,15 +1590,15 @@ class RuleBasedPlanner(object):
                 "_last_map_curve_override_active",
                 False,
             ),
-            "mt05_sprint_active": self._mt05_sprint_active,
-            "mt05_sprint_speed_mps": (
-                self.config.mt05_sprint_speed
-                if self._mt05_sprint_active
+            "sprint_active": self._sprint_active,
+            "sprint_speed_mps": (
+                self.config.sprint_speed
+                if self._sprint_active
                 else None
             ),
-            "mt05_sprint_accel_mps2": (
-                self.config.mt05_sprint_accel
-                if self._mt05_sprint_active
+            "sprint_accel_mps2": (
+                self.config.sprint_accel
+                if self._sprint_active
                 else None
             ),
             "goal_limit_mps": goal_limit,
@@ -2190,8 +2275,8 @@ class RuleBasedPlanner(object):
             acceleration = max(
                 0.05,
                 (
-                    self.config.mt05_sprint_accel
-                    if self._mt05_sprint_active
+                    self.config.sprint_accel
+                    if self._sprint_active
                     else self.config.max_accel
                 ),
             )
@@ -2253,8 +2338,8 @@ class RuleBasedPlanner(object):
         self.avoidance_origin_d = None
         manual_override = self._active_manual_override
         behavior = (
-            "MT05_SPRINT"
-            if self._mt05_sprint_active
+            "SPRINT"
+            if self._sprint_active
             else (
                 "MANUAL_OVERRIDE"
                 if manual_override is not None
@@ -2333,10 +2418,10 @@ class RuleBasedPlanner(object):
             trajectory, desired_speed, behavior, False, ""
         )
 
-    def _mt05_straight_sprint_path(self, ego, global_path):
+    def _build_sprint_path(self, ego, global_path):
         """Return a session-stable, heading-continuous sprint arc to goal."""
-        if self._mt05_sprint_path is not None:
-            return self._mt05_sprint_path
+        if self._sprint_path is not None:
+            return self._sprint_path
         try:
             route_x = np.asarray(
                 global_path.get("x", []), dtype=float
@@ -2428,23 +2513,23 @@ class RuleBasedPlanner(object):
         # Continue well beyond the scoring goal.  The platform ends the case
         # when the goal is crossed; extending the ray prevents any implicit
         # terminal braking in the local trajectory/controller.
-        self._mt05_sprint_path = {
+        self._sprint_path = {
             "x": xs.tolist(),
             "y": ys.tolist(),
             "kappa": kappas.tolist(),
             "speed_limit": np.zeros(xs.size).tolist(),
-            "frame_id": "MT_05-direct-sprint",
+            "frame_id": "direct-sprint",
             "stamp": (
-                "mt05-direct-sprint-arc",
+                "direct-sprint-arc",
                 round(start_x, 3),
                 round(start_y, 3),
                 round(goal_x, 3),
                 round(goal_y, 3),
             ),
         }
-        self._mt05_sprint_goal = (goal_x, goal_y)
+        self._sprint_goal = (goal_x, goal_y)
         print(
-            "[mt05-sprint] {} reference "
+            "[sprint] {} reference "
             "start=({:.3f},{:.3f}) goal=({:.3f},{:.3f}) "
             "chord={:.3f}m arc={:.3f}m turn={:.1f}deg kappa={:.4f} "
             "speed={:.3f}m/s pulse_accel={:.3f}m/s2 steer_cap={:.1f}deg".format(
@@ -2457,12 +2542,20 @@ class RuleBasedPlanner(object):
                 arc_length,
                 math.degrees(turn_angle),
                 curvature,
-                self.config.mt05_sprint_speed,
-                self.config.mt05_sprint_accel,
-                self.config.mt05_sprint_max_steer_deg,
+                self.config.sprint_speed,
+                self.config.sprint_accel,
+                self.config.sprint_max_steer_deg,
             )
         )
-        return self._mt05_sprint_path
+        return self._sprint_path
+
+    def configure_sprint(self, **kwargs):
+        """Public runtime interface for generic sprint configuration."""
+        self.config.configure_sprint(**kwargs)
+        self._sprint_path = None
+        self._sprint_goal = None
+        self._sprint_active = False
+        return self
 
     def plan(self, ego, obstacles, global_path, map_name="", ego_lateral_speed=0.0, now=None):
         """Return the safest sampled local trajectory for the current frame."""
@@ -2472,14 +2565,12 @@ class RuleBasedPlanner(object):
             self.last_debug = {"reason": "ego unavailable"}
             return PlanResult(None, 0.0, "STOP", True, "ego unavailable")
         self.map_name = str(map_name or self.map_name)
-        self._mt05_sprint_active = bool(
-            self.config.mt05_direct_sprint_enabled
-            and os.path.basename(self.map_name).lower()
-            == "mt_05-intersection.xodr"
+        self._sprint_active = self.config.sprint_applies_to(
+            self.map_name
         )
         planning_path = global_path
-        if self._mt05_sprint_active:
-            planning_path = self._mt05_straight_sprint_path(
+        if self._sprint_active:
+            planning_path = self._build_sprint_path(
                 ego, global_path
             )
         if not self.reference.update(planning_path):
@@ -2497,11 +2588,16 @@ class RuleBasedPlanner(object):
 
         manual_override = self._match_scenario_override(projection)
         detected_obstacle_count = len(obstacles or [])
+        sprint_collision_bypass = bool(
+            self._sprint_active
+            and self.config.sprint_ignore_obstacles
+        )
         prepared_obstacles = (
             []
             if (
                 self.config.ignore_obstacles
                 or manual_override is not None
+                or sprint_collision_bypass
             )
             else self._prepare_obstacles(obstacles)
         )
@@ -2536,18 +2632,18 @@ class RuleBasedPlanner(object):
             "desired_speed": desired_speed,
             "speed_limits": dict(self._last_speed_limit_debug),
             "remaining": max(0.0, self.reference.length - projection["s"]),
-            "mt05_sprint_active": self._mt05_sprint_active,
-            "mt05_sprint_goal": (
+            "sprint_active": self._sprint_active,
+            "sprint_goal": (
                 None
-                if self._mt05_sprint_goal is None
-                else list(self._mt05_sprint_goal)
+                if self._sprint_goal is None
+                else list(self._sprint_goal)
             ),
-            "mt05_sprint_goal_distance": (
+            "sprint_goal_distance": (
                 None
-                if self._mt05_sprint_goal is None
+                if self._sprint_goal is None
                 else math.hypot(
-                    self._mt05_sprint_goal[0] - ego_values["x"],
-                    self._mt05_sprint_goal[1] - ego_values["y"],
+                    self._sprint_goal[0] - ego_values["x"],
+                    self._sprint_goal[1] - ego_values["y"],
                 )
             ),
             "intervention_distance": self._intervention_distance(
@@ -2557,6 +2653,7 @@ class RuleBasedPlanner(object):
             "raw_obstacle_count": len(prepared_obstacles),
             "planning_obstacle_count": len(planning_obstacles),
             "ignore_obstacles": bool(self.config.ignore_obstacles),
+            "sprint_collision_bypass": sprint_collision_bypass,
             "manual_control_active": (
                 manual_override is not None
             ),
@@ -3590,7 +3687,7 @@ class StableController(object):
                 # 42 degrees when the initial tangent differed from the goal
                 # chord by 57 degrees.
                 physical_front_limit = math.radians(
-                    cfg.mt05_sprint_max_steer_deg
+                    cfg.sprint_max_steer_deg
                     / max(cfg.steering_ratio, EPS)
                 )
                 front_angle = _clip(
@@ -3660,14 +3757,14 @@ class StableController(object):
             )
             rate = min(rate, comfort_rate)
         if sprint_mode:
-            rate = max(rate, cfg.mt05_sprint_steer_rate_deg_s)
+            rate = max(rate, cfg.sprint_steer_rate_deg_s)
         rate_limited = _clip(
             self.filtered_steer,
             self.last_steer - rate * dt,
             self.last_steer + rate * dt,
         )
         limit = (
-            cfg.mt05_sprint_max_steer_deg
+            cfg.sprint_max_steer_deg
             if sprint_mode
             else self._steering_limit(
                 speed,
@@ -3884,7 +3981,7 @@ class StableController(object):
             "RECOVER",
             "FOLLOW",
             "MANUAL_OVERRIDE",
-            "MT05_SPRINT",
+            "SPRINT",
         )
         if not math.isfinite(offset):
             self.last_debug.update(
@@ -3995,13 +4092,13 @@ class StableController(object):
             _finite(getattr(ego, "y", 0.0)),
         )
         behavior = str(getattr(plan_result, "behavior", ""))
-        sprint_mode = behavior == "MT05_SPRINT"
+        sprint_mode = behavior == "SPRINT"
         centerline_tracking = behavior in (
             "KEEP_LANE",
             "RECOVER",
             "FOLLOW",
             "MANUAL_OVERRIDE",
-            "MT05_SPRINT",
+            "SPRINT",
         )
         # RECOVER is rebuilt from the current Frenet state every plan cycle.
         # Its temporary S bend is a control reference, not road geometry.
@@ -4072,15 +4169,15 @@ class StableController(object):
             sprint_mode
             and (
                 abs_heading_error >= math.radians(
-                    self.config.mt05_sprint_recovery_heading_deg
+                    self.config.sprint_recovery_heading_deg
                 )
                 or abs_lateral_error
-                >= self.config.mt05_sprint_recovery_lateral_m
+                >= self.config.sprint_recovery_lateral_m
             )
         )
         if sprint_mode:
             alignment_speed_cap = (
-                self.config.mt05_sprint_recovery_speed
+                self.config.sprint_recovery_speed
                 if sprint_recovery_active
                 else float("inf")
             )
@@ -4100,17 +4197,18 @@ class StableController(object):
             and not centerline_safety_stop
         ):
             # Deliberately concentrate the evaluator-threshold violation into
-            # a short pulse, then coast.  This is isolated to MT_05 and avoids
-            # spending the whole case near the acceleration threshold.
+            # a short pulse, then coast. This is isolated to explicitly
+            # selected sprint maps and avoids spending the whole case near
+            # the acceleration threshold.
             if sprint_recovery_active:
                 acc = (
-                    -self.config.mt05_sprint_recovery_decel
+                    -self.config.sprint_recovery_decel
                     if ego_speed > target_speed + 0.5
                     else 0.0
                 )
             else:
                 acc = (
-                    self.config.mt05_sprint_accel
+                    self.config.sprint_accel
                     if ego_speed < target_speed - 0.5
                     else 0.0
                 )
@@ -4161,7 +4259,7 @@ class StableController(object):
                     self.config.strict_alignment_speed_guard
                 ),
                 "centerline_safety_stop": centerline_safety_stop,
-                "mt05_sprint_mode": sprint_mode,
+                "sprint_mode": sprint_mode,
                 "sprint_recovery_active": sprint_recovery_active,
                 "output_acc": acc,
                 "output_steer": steer,

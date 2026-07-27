@@ -288,7 +288,7 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertLessEqual(curve_limit, expected + 0.15)
 
-    def test_mt05_alone_uses_fast_curve_lateral_budget(self):
+    def test_map_specific_curve_lateral_budget(self):
         radius = 25.0
         stations = np.linspace(0.0, 60.0, 61)
         angles = stations / radius
@@ -306,32 +306,32 @@ class RulePlannerTest(unittest.TestCase):
             "mt_05-intersection.xodr"
         ] = 2.5
         ordinary = RuleBasedPlanner(config)
-        mt05 = RuleBasedPlanner(config)
+        overridden = RuleBasedPlanner(config)
         self.assertTrue(ordinary.reference.update(path))
-        self.assertTrue(mt05.reference.update(path))
+        self.assertTrue(overridden.reference.update(path))
         ordinary.map_name = "MT_06-other.xodr"
-        mt05.map_name = "MT_05-intersection.xodr"
+        overridden.map_name = "MT_05-intersection.xodr"
 
         ordinary_limit = ordinary._curve_speed_limit(
             11.0, 20.0, 4.0
         )
-        mt05_limit = mt05._curve_speed_limit(
+        overridden_limit = overridden._curve_speed_limit(
             11.0, 20.0, 4.0
         )
 
         self.assertFalse(
             ordinary._last_map_curve_override_active
         )
-        self.assertTrue(mt05._last_map_curve_override_active)
+        self.assertTrue(overridden._last_map_curve_override_active)
         self.assertAlmostEqual(
             ordinary._last_curve_lateral_accel, 0.5
         )
         self.assertAlmostEqual(
-            mt05._last_curve_lateral_accel, 2.5
+            overridden._last_curve_lateral_accel, 2.5
         )
-        self.assertGreater(mt05_limit, 1.8 * ordinary_limit)
+        self.assertGreater(overridden_limit, 1.8 * ordinary_limit)
 
-    def test_mt05_sprint_uses_heading_continuous_arc_to_goal(self):
+    def test_selected_map_sprint_uses_heading_continuous_arc_to_goal(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -342,6 +342,10 @@ class RulePlannerTest(unittest.TestCase):
         config.enable_comfort_mode()
         config.max_speed = 55.0
         config.override_map_speed_limit = True
+        config.configure_sprint(
+            enabled=True,
+            map_names="MT_05-intersection.xodr",
+        )
         planner = RuleBasedPlanner(config)
         current_ego = ego(speed=0.0)
         current_ego.theta = -math.pi / 2.0
@@ -353,15 +357,15 @@ class RulePlannerTest(unittest.TestCase):
             "MT_05-intersection.xodr",
         )
 
-        self.assertEqual(result.behavior, "MT05_SPRINT")
+        self.assertEqual(result.behavior, "SPRINT")
         self.assertAlmostEqual(
-            result.target_speed, config.mt05_sprint_speed
+            result.target_speed, config.sprint_speed
         )
         self.assertTrue(
-            planner.last_debug["mt05_sprint_active"]
+            planner.last_debug["sprint_active"]
         )
         self.assertEqual(
-            planner.last_debug["mt05_sprint_goal"],
+            planner.last_debug["sprint_goal"],
             [10.0, -10.0],
         )
         self.assertGreater(
@@ -373,7 +377,7 @@ class RulePlannerTest(unittest.TestCase):
         self.assertAlmostEqual(planner.reference.x[arc_end - 1], 10.0, places=2)
         self.assertAlmostEqual(planner.reference.y[arc_end - 1], -10.0, places=2)
 
-    def test_mt05_sprint_uses_short_acceleration_pulse(self):
+    def test_selected_map_sprint_uses_short_acceleration_pulse(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -384,6 +388,10 @@ class RulePlannerTest(unittest.TestCase):
         config.enable_comfort_mode()
         config.max_speed = 55.0
         config.override_map_speed_limit = True
+        config.configure_sprint(
+            enabled=True,
+            map_names="MT_05-intersection.xodr",
+        )
         planner = RuleBasedPlanner(config)
         controller = StableController(config)
         current_ego = ego(speed=0.0)
@@ -404,7 +412,7 @@ class RulePlannerTest(unittest.TestCase):
             path_reference_yaw=projection["yaw"],
             path_reference_curvature=projection["kappa"],
         )
-        current_ego.speed = config.mt05_sprint_speed - 0.2
+        current_ego.speed = config.sprint_speed - 0.2
         coast = controller.control(
             current_ego,
             result,
@@ -414,20 +422,20 @@ class RulePlannerTest(unittest.TestCase):
             path_reference_curvature=projection["kappa"],
         )
 
-        self.assertEqual(launch.acc, config.mt05_sprint_accel)
+        self.assertEqual(launch.acc, config.sprint_accel)
         self.assertEqual(
-            launch.speed, config.mt05_sprint_speed
+            launch.speed, config.sprint_speed
         )
         self.assertGreater(launch.steer, 0.0)
         self.assertLessEqual(
-            abs(launch.steer), config.mt05_sprint_max_steer_deg
+            abs(launch.steer), config.sprint_max_steer_deg
         )
         self.assertEqual(coast.acc, 0.0)
         self.assertTrue(
-            controller.last_debug["mt05_sprint_mode"]
+            controller.last_debug["sprint_mode"]
         )
 
-    def test_mt05_sprint_does_not_affect_other_maps(self):
+    def test_sprint_does_not_affect_unselected_maps(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -439,20 +447,52 @@ class RulePlannerTest(unittest.TestCase):
             ego(speed=0.0), [], path, "MT_06-other.xodr"
         )
 
-        self.assertNotEqual(result.behavior, "MT05_SPRINT")
+        self.assertNotEqual(result.behavior, "SPRINT")
         self.assertFalse(
-            planner.last_debug["mt05_sprint_active"]
+            planner.last_debug["sprint_active"]
         )
-        self.assertIsNone(planner._mt05_sprint_path)
+        self.assertIsNone(planner._sprint_path)
 
-    def test_mt05_sprint_keeps_collision_checks(self):
+    def test_generic_sprint_interface_enables_any_selected_map(self):
+        path = {
+            "x": [0.0, 8.0, 16.0],
+            "y": [0.0, 4.0, 8.0],
+            "frame_id": "custom_fast_map.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig().configure_sprint(
+            enabled=True,
+            map_names=["custom_fast_map.xodr"],
+            speed=22.0,
+            accel=31.0,
+            max_steer_deg=9.0,
+        )
+        planner = RuleBasedPlanner(config)
+        current_ego = ego(speed=0.0)
+        current_ego.theta = 0.0
+
+        result = planner.plan(
+            current_ego, [], path, "custom_fast_map.xodr"
+        )
+
+        self.assertEqual(result.behavior, "SPRINT")
+        self.assertAlmostEqual(result.target_speed, 22.0)
+        self.assertTrue(planner.last_debug["sprint_active"])
+        self.assertAlmostEqual(config.sprint_accel, 31.0)
+        self.assertAlmostEqual(config.sprint_max_steer_deg, 9.0)
+
+    def test_sprint_keeps_collision_checks_by_default(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
             "frame_id": "MT_05-intersection.xodr",
             "stamp": 1,
         }
-        planner = RuleBasedPlanner()
+        config = PlannerConfig().configure_sprint(
+            enabled=True,
+            map_names="MT_05-intersection.xodr",
+        )
+        planner = RuleBasedPlanner(config)
         blocking = obstacle(3.0, y=-3.0, speed=0.0)
 
         result = planner.plan(
@@ -462,12 +502,44 @@ class RulePlannerTest(unittest.TestCase):
             "MT_05-intersection.xodr",
         )
 
-        self.assertNotEqual(result.behavior, "MT05_SPRINT")
+        self.assertNotEqual(result.behavior, "SPRINT")
         self.assertEqual(
             planner.last_debug["detected_obstacle_count"], 1
         )
         self.assertFalse(
             planner.last_debug["ignore_obstacles"]
+        )
+
+    def test_generic_sprint_can_explicitly_bypass_obstacles(self):
+        path = {
+            "x": [0.0, 0.0, 5.0, 10.0],
+            "y": [0.0, -5.0, -10.0, -10.0],
+            "frame_id": "custom_fast_map.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig().configure_sprint(
+            enabled=True,
+            map_names="custom_fast_map.xodr",
+            ignore_obstacles=True,
+        )
+        planner = RuleBasedPlanner(config)
+
+        result = planner.plan(
+            ego(speed=3.0),
+            [obstacle(3.0, y=-3.0, speed=0.0)],
+            path,
+            "custom_fast_map.xodr",
+        )
+
+        self.assertEqual(result.behavior, "SPRINT")
+        self.assertTrue(
+            planner.last_debug["sprint_collision_bypass"]
+        )
+        self.assertEqual(
+            planner.last_debug["detected_obstacle_count"], 1
+        )
+        self.assertEqual(
+            planner.last_debug["planning_obstacle_count"], 0
         )
 
     def test_vehicle_restarts_after_pedestrian_leaves_clear_lane(self):
@@ -786,10 +858,10 @@ class RulePlannerTest(unittest.TestCase):
             planner.last_debug["speed_limits"]["stop_at_goal"]
         )
 
-    def test_mt05_continues_past_endpoint_without_hidden_braking(self):
+    def test_nonstopping_route_continues_past_endpoint(self):
         config = PlannerConfig()
         config.enable_comfort_mode()
-        config.mt05_direct_sprint_enabled = False
+        config.sprint_enabled = False
         planner = RuleBasedPlanner(config)
         current_ego = ego(x=123.0, speed=5.0)
         result = planner.plan(
@@ -1507,7 +1579,7 @@ class RulePlannerTest(unittest.TestCase):
             config.max_tracking_lateral_accel,
         )
 
-    def test_mt05_fast_curve_keeps_tracking_correction_reserve(self):
+    def test_fast_curve_keeps_tracking_correction_reserve(self):
         config = PlannerConfig()
         config.enable_comfort_mode()
         config.map_curve_lateral_accel_overrides[

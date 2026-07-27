@@ -179,6 +179,7 @@ from rule_based_planner import (
     RuleBasedPlanner,
     StableController,
 )
+from roundabout_controller import RoundaboutController
 from speed_limits import resolve_expected_speed
 from npc_truth import (
     decode_npc_payload,
@@ -211,7 +212,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-mt05-arc-sprint-v15"
+    "2026-07-27-roundabout-exclusive-v17"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -268,6 +269,7 @@ ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 ins_receiver_stop_event = threading.Event()
 last_rule_plan = None
+roundabout_controller = None
 last_rule_plan_wall_time = 0.0
 last_control_wall_time = None
 last_drive_plan_debug_ts = 0.0
@@ -1683,6 +1685,8 @@ def get_prepare():
             )
         rule_planner.reset(map_name)
         stable_controller.reset()
+        if roundabout_controller is not None:
+            roundabout_controller.reset(map_name)
         last_rule_plan = None
         last_rule_plan_wall_time = 0.0
         last_control_wall_time = None
@@ -2059,18 +2063,33 @@ def get_pointcloud_msg():
         or now - last_rule_plan_wall_time >= 0.20
     ):
         planning_started = time.monotonic()
-        last_rule_plan = rule_planner.plan(
-            ego=model.ego,
-            obstacles=obstacles,
-            global_path=global_plan_data,
-            map_name=map_name,
-            ego_lateral_speed=model.ego_ros_vy,
-            now=now,
-        )
+        if (
+            roundabout_controller is not None
+            and roundabout_controller.enabled
+        ):
+            last_rule_plan = roundabout_controller.plan(
+                ego=model.ego,
+                obstacles=obstacles,
+                global_path=global_plan_data,
+                map_name=map_name,
+            )
+            planning_debug_owner = roundabout_controller
+        else:
+            last_rule_plan = rule_planner.plan(
+                ego=model.ego,
+                obstacles=obstacles,
+                global_path=global_plan_data,
+                map_name=map_name,
+                ego_lateral_speed=model.ego_ros_vy,
+                now=now,
+            )
+            planning_debug_owner = rule_planner
         planning_elapsed = time.monotonic() - planning_started
         replanned = True
         last_rule_plan_wall_time = now
-        planner_debug = getattr(rule_planner, "last_debug", {}) or {}
+        planner_debug = getattr(
+            planning_debug_owner, "last_debug", {}
+        ) or {}
         projection_debug = planner_debug.get("projection") or {}
         perception_visualizer = getattr(
             model, "perception_web_visualizer", None
@@ -2101,7 +2120,7 @@ def get_pointcloud_msg():
             last_drive_plan_debug_ts = now
             projection = None
             try:
-                projection = rule_planner.reference.project(
+                projection = planning_debug_owner.reference.project(
                     float(model.ego.x), float(model.ego.y)
                 )
             except Exception:
@@ -2169,9 +2188,12 @@ def get_pointcloud_msg():
                 f"manual_rule={planner_debug.get('manual_override_name')} "
                 f"manual_target_d={float(planner_debug.get('manual_target_d') if planner_debug.get('manual_target_d') is not None else float('nan')):.3f}m "
                 f"manual_target_v={float(planner_debug.get('manual_target_speed_mps') if planner_debug.get('manual_target_speed_mps') is not None else float('nan')):.3f}m/s "
-                f"collision_bypass={bool(planner_debug.get('manual_collision_bypass', False))} "
-                f"mt05_sprint={bool(planner_debug.get('mt05_sprint_active', False))} "
-                f"sprint_goal_distance={float(planner_debug.get('mt05_sprint_goal_distance') if planner_debug.get('mt05_sprint_goal_distance') is not None else float('nan')):.3f}m "
+                f"collision_bypass={bool(planner_debug.get('manual_collision_bypass', False) or planner_debug.get('sprint_collision_bypass', False))} "
+                f"sprint={bool(planner_debug.get('sprint_active', False))} "
+                f"sprint_goal_distance={float(planner_debug.get('sprint_goal_distance') if planner_debug.get('sprint_goal_distance') is not None else float('nan')):.3f}m "
+                f"roundabout_mode={planner_debug.get('mode', 'off')} "
+                f"roundabout_lead={planner_debug.get('locked_lead_id')} "
+                f"roundabout_gap={float((planner_debug.get('lead') or {}).get('gap', float('nan'))):.3f}m "
                 f"remaining={float(planner_debug.get('remaining', float('nan'))):.3f}m "
                 f"obstacles_raw={int(planner_debug.get('raw_obstacle_count', 0))} "
                 f"obstacles_used={int(planner_debug.get('planning_obstacle_count', 0))} "
@@ -2250,7 +2272,15 @@ def get_pointcloud_msg():
     else:
         control_dt = now - last_control_wall_time
     last_control_wall_time = now
-    current_planner_debug = getattr(rule_planner, "last_debug", {}) or {}
+    roundabout_active = bool(
+        roundabout_controller is not None
+        and roundabout_controller.enabled
+    )
+    current_planner_debug = getattr(
+        roundabout_controller if roundabout_active else rule_planner,
+        "last_debug",
+        {},
+    ) or {}
     current_projection_debug = current_planner_debug.get("projection") or {}
     actual_path_lateral_offset = current_projection_debug.get("d")
     manual_target_d = current_planner_debug.get("manual_target_d")
@@ -2265,39 +2295,65 @@ def get_pointcloud_msg():
             - float(manual_target_d)
         )
     control_started = time.monotonic()
-    command = stable_controller.control(
-        model.ego,
-        last_rule_plan,
-        control_dt,
-        steering_feedback=getattr(
-            getattr(model, "vehicle_feedback", None),
-            "steering_wheel_angle",
-            None,
-        ),
-        path_lateral_offset=control_path_lateral_error,
-        path_reference_yaw=current_projection_debug.get("yaw"),
-        path_reference_curvature=current_projection_debug.get(
-            "kappa"
-        ),
+    steering_feedback = getattr(
+        getattr(model, "vehicle_feedback", None),
+        "steering_wheel_angle",
+        None,
     )
-    stable_controller.last_debug.update(
-        {
-            "actual_path_lateral_offset": (
-                actual_path_lateral_offset
+    if roundabout_active:
+        command = roundabout_controller.control(
+            ego=model.ego,
+            obstacles=obstacles,
+            global_path=global_plan_data,
+            dt=control_dt,
+            map_name=map_name,
+            steering_feedback=steering_feedback,
+        )
+        last_rule_plan = roundabout_controller.last_plan
+        current_planner_debug = (
+            roundabout_controller.last_debug
+        )
+        current_projection_debug = (
+            current_planner_debug.get("projection") or {}
+        )
+        actual_path_lateral_offset = (
+            current_projection_debug.get("d")
+        )
+    else:
+        command = stable_controller.control(
+            model.ego,
+            last_rule_plan,
+            control_dt,
+            steering_feedback=steering_feedback,
+            path_lateral_offset=control_path_lateral_error,
+            path_reference_yaw=current_projection_debug.get("yaw"),
+            path_reference_curvature=current_projection_debug.get(
+                "kappa"
             ),
-            "manual_target_d": manual_target_d,
-            "manual_control_active": bool(
-                current_planner_debug.get(
-                    "manual_control_active", False
-                )
-            ),
-            "manual_collision_bypass": bool(
-                current_planner_debug.get(
-                    "manual_collision_bypass", False
-                )
-            ),
-        }
-    )
+        )
+        stable_controller.last_debug.update(
+            {
+                "actual_path_lateral_offset": (
+                    actual_path_lateral_offset
+                ),
+                "manual_target_d": manual_target_d,
+                "manual_control_active": bool(
+                    current_planner_debug.get(
+                        "manual_control_active", False
+                    )
+                ),
+                "manual_collision_bypass": bool(
+                    current_planner_debug.get(
+                        "manual_collision_bypass", False
+                    )
+                ),
+                "sprint_collision_bypass": bool(
+                    current_planner_debug.get(
+                        "sprint_collision_bypass", False
+                    )
+                ),
+            }
+        )
     gt_startup_age = (
         float("inf")
         if first_ins_ready_ts is None
@@ -2316,13 +2372,21 @@ def get_pointcloud_msg():
             current_planner_debug.get(
                 "manual_control_active", False
             )
+            or current_planner_debug.get(
+                "sprint_collision_bypass", False
+            )
+            or roundabout_active
         )
     )
     if gt_failsafe_applied:
         command.acc = -float(rule_planner.config.max_decel)
         command.speed = 0.0
     control_elapsed = time.monotonic() - control_started
-    controller_debug = getattr(stable_controller, "last_debug", {}) or {}
+    controller_debug = getattr(
+        roundabout_controller if roundabout_active else stable_controller,
+        "last_debug",
+        {},
+    ) or {}
     if DEBUG_DRIVE and now - last_drive_control_debug_ts >= 0.5:
         last_drive_control_debug_ts = now
         print(
@@ -2366,7 +2430,7 @@ def get_pointcloud_msg():
             f"actual_path_d={float(controller_debug.get('actual_path_lateral_offset') if controller_debug.get('actual_path_lateral_offset') is not None else float('nan')):.3f}m "
             f"manual_target_d={float(controller_debug.get('manual_target_d') if controller_debug.get('manual_target_d') is not None else float('nan')):.3f}m "
             f"manual_control={bool(controller_debug.get('manual_control_active', False))} "
-            f"collision_bypass={bool(controller_debug.get('manual_collision_bypass', False))} "
+            f"collision_bypass={bool(controller_debug.get('manual_collision_bypass', False) or controller_debug.get('sprint_collision_bypass', False))} "
             f"centerline_control={bool(controller_debug.get('centerline_control_active', False))} "
             f"global_heading_error={math.degrees(float(controller_debug.get('global_heading_error', float('nan')))):.3f}deg "
             f"path_d_speed={float(controller_debug.get('estimated_path_lateral_speed', float('nan'))):.3f}m/s "
@@ -2374,9 +2438,11 @@ def get_pointcloud_msg():
             f"active_lat_acc_limit={float(controller_debug.get('active_lateral_accel_limit', float('nan'))):.3f}m/s2 "
             f"curve_authority={bool(controller_debug.get('curve_authority_active', False))} "
             f"tracking_recovery={bool(controller_debug.get('tracking_recovery_active', False))} "
-            f"sprint_mode={bool(controller_debug.get('mt05_sprint_mode', False))} "
+            f"sprint_mode={bool(controller_debug.get('sprint_mode', False))} "
             f"sprint_pulse={bool(controller_debug.get('sprint_accel_pulse_active', False))} "
             f"sprint_recovery={bool(controller_debug.get('sprint_recovery_active', False))} "
+            f"roundabout_mode={controller_debug.get('roundabout_mode', 'off')} "
+            f"roundabout_exclusive={bool(controller_debug.get('roundabout_exclusive', False))} "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "
@@ -2538,6 +2604,8 @@ def process_notify():
             model.goal = 0
             rule_planner.reset(map_name)
             stable_controller.reset()
+            if roundabout_controller is not None:
+                roundabout_controller.reset(map_name)
             last_rule_plan = None
             last_rule_plan_wall_time = 0.0
             last_control_wall_time = None
@@ -3240,6 +3308,138 @@ if __name__ == "__main__":
         action="store_true",
         help="ignore all perceived obstacles (unsafe; debugging only)",
     )
+    sprint_group = arg_parser.add_mutually_exclusive_group()
+    sprint_group.add_argument(
+        "--sprint",
+        dest="sprint_enabled",
+        action="store_true",
+        help="enable generic direct-goal sprint on --sprint_maps",
+    )
+    sprint_group.add_argument(
+        "--no_sprint",
+        "--no-sprint",
+        dest="sprint_enabled",
+        action="store_false",
+        help="disable generic direct-goal sprint",
+    )
+    arg_parser.set_defaults(sprint_enabled=None)
+    arg_parser.add_argument(
+        "--sprint_maps",
+        "--sprint-maps",
+        dest="sprint_maps",
+        type=str,
+        default=None,
+        help=(
+            "comma-separated map basenames using sprint, or '*' for all; "
+            "default comes from RULE_SPRINT_MAPS"
+        ),
+    )
+    arg_parser.add_argument(
+        "--sprint_speed",
+        "--sprint-speed",
+        dest="sprint_speed",
+        type=float,
+        default=None,
+        help="generic sprint target speed in m/s",
+    )
+    arg_parser.add_argument(
+        "--sprint_accel",
+        "--sprint-accel",
+        dest="sprint_accel",
+        type=float,
+        default=None,
+        help="generic sprint acceleration pulse in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--sprint_max_steer_deg",
+        "--sprint-max-steer-deg",
+        dest="sprint_max_steer_deg",
+        type=float,
+        default=None,
+        help="generic sprint steering-wheel angle cap in degrees",
+    )
+    arg_parser.add_argument(
+        "--sprint_recovery_speed",
+        "--sprint-recovery-speed",
+        dest="sprint_recovery_speed",
+        type=float,
+        default=None,
+        help="speed cap while recovering a divergent sprint in m/s",
+    )
+    arg_parser.add_argument(
+        "--sprint_ignore_obstacles",
+        "--sprint-ignore-obstacles",
+        dest="sprint_ignore_obstacles",
+        action="store_true",
+        default=None,
+        help="bypass obstacle and missing-GT braking only during sprint",
+    )
+    arg_parser.add_argument(
+        "--roundabout_mode",
+        "--roundabout-mode",
+        dest="roundabout_mode",
+        choices=("off", "follow", "direct"),
+        default=os.environ.get(
+            "RULE_ROUNDABOUT_MODE", "off"
+        ).strip().lower(),
+        help=(
+            "exclusive roundabout controller selected at launch: "
+            "follow locks the first nearest same-lane lead; direct ignores "
+            "traffic decisions and tracks the global path"
+        ),
+    )
+    arg_parser.add_argument(
+        "--roundabout_gap",
+        "--roundabout-gap",
+        dest="roundabout_gap",
+        type=float,
+        default=float(
+            os.environ.get("RULE_ROUNDABOUT_GAP", "1.0")
+        ),
+        help="fixed bumper-to-bumper gap in follow mode, metres",
+    )
+    arg_parser.add_argument(
+        "--roundabout_max_speed",
+        "--roundabout-max-speed",
+        dest="roundabout_max_speed",
+        type=float,
+        default=float(
+            os.environ.get("RULE_ROUNDABOUT_MAX_SPEED", "30.0")
+        ),
+        help="roundabout direct/follow speed ceiling in m/s",
+    )
+    arg_parser.add_argument(
+        "--roundabout_max_accel",
+        "--roundabout-max-accel",
+        dest="roundabout_max_accel",
+        type=float,
+        default=float(
+            os.environ.get("RULE_ROUNDABOUT_MAX_ACCEL", "20.0")
+        ),
+        help="roundabout longitudinal acceleration limit in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--roundabout_max_decel",
+        "--roundabout-max-decel",
+        dest="roundabout_max_decel",
+        type=float,
+        default=float(
+            os.environ.get("RULE_ROUNDABOUT_MAX_DECEL", "15.5")
+        ),
+        help="roundabout braking magnitude limit in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--roundabout_lane_half_width",
+        "--roundabout-lane-half-width",
+        dest="roundabout_lane_half_width",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_LANE_HALF_WIDTH", "1.75"
+            )
+        ),
+        help="maximum Frenet-d difference for initial lead locking",
+    )
     arg_parser.add_argument(
         "--pedestrian_conf",
         "--pedestrian-conf",
@@ -3547,6 +3747,38 @@ if __name__ == "__main__":
         and args.collision_margin < 0.40
     ):
         arg_parser.error("--collision_margin must be at least 0.40")
+    for sprint_name in (
+        "sprint_speed",
+        "sprint_accel",
+        "sprint_max_steer_deg",
+    ):
+        sprint_value = getattr(args, sprint_name)
+        if sprint_value is not None and sprint_value <= 0.0:
+            arg_parser.error(
+                f"--{sprint_name} must be greater than zero"
+            )
+    if (
+        args.sprint_recovery_speed is not None
+        and args.sprint_recovery_speed < 0.0
+    ):
+        arg_parser.error(
+            "--sprint_recovery_speed must be non-negative"
+        )
+    if args.sprint_maps is not None and not args.sprint_maps.strip():
+        arg_parser.error("--sprint_maps cannot be empty")
+    if args.roundabout_gap < 0.1:
+        arg_parser.error("--roundabout_gap must be at least 0.1 metre")
+    for roundabout_name in (
+        "roundabout_max_speed",
+        "roundabout_max_accel",
+        "roundabout_max_decel",
+        "roundabout_lane_half_width",
+    ):
+        roundabout_value = getattr(args, roundabout_name)
+        if roundabout_value <= 0.0:
+            arg_parser.error(
+                f"--{roundabout_name} must be greater than zero"
+            )
     for confidence_name in (
         "pedestrian_conf",
         "cyclist_conf",
@@ -3840,6 +4072,15 @@ if __name__ == "__main__":
         planner_config.collision_margin = float(args.collision_margin)
     if args.ignore_obstacles:
         planner_config.ignore_obstacles = True
+    planner_config.configure_sprint(
+        enabled=args.sprint_enabled,
+        map_names=args.sprint_maps,
+        speed=args.sprint_speed,
+        accel=args.sprint_accel,
+        max_steer_deg=args.sprint_max_steer_deg,
+        recovery_speed=args.sprint_recovery_speed,
+        ignore_obstacles=args.sprint_ignore_obstacles,
+    )
     print(
         "[planner-config] "
         f"perception_source={PERCEPTION_SOURCE.upper()} "
@@ -3880,16 +4121,17 @@ if __name__ == "__main__":
         f"follow_time_headway={planner_config.time_headway:.3f}s "
         f"minimum_gap={planner_config.minimum_gap:.3f}m "
         f"ignore_obstacles={planner_config.ignore_obstacles} "
-        f"mt05_direct_sprint="
-        f"{planner_config.mt05_direct_sprint_enabled} "
-        f"mt05_sprint_speed="
-        f"{planner_config.mt05_sprint_speed:.3f}m/s "
-        f"mt05_sprint_accel="
-        f"{planner_config.mt05_sprint_accel:.3f}m/s2 "
-        f"mt05_sprint_steer_cap="
-        f"{planner_config.mt05_sprint_max_steer_deg:.3f}deg "
-        f"mt05_sprint_recovery_speed="
-        f"{planner_config.mt05_sprint_recovery_speed:.3f}m/s "
+        f"sprint_enabled={planner_config.sprint_enabled} "
+        f"sprint_maps="
+        f"{','.join(sorted(planner_config.sprint_map_names)) or 'none'} "
+        f"sprint_speed={planner_config.sprint_speed:.3f}m/s "
+        f"sprint_accel={planner_config.sprint_accel:.3f}m/s2 "
+        f"sprint_steer_cap="
+        f"{planner_config.sprint_max_steer_deg:.3f}deg "
+        f"sprint_recovery_speed="
+        f"{planner_config.sprint_recovery_speed:.3f}m/s "
+        f"sprint_ignore_obstacles="
+        f"{planner_config.sprint_ignore_obstacles} "
         f"avoidance_speed={planner_config.static_avoidance_speed:.3f}m/s "
         f"avoidance_half_width={planner_config.avoidance_half_width:.3f}m "
         f"minimum_bypass_shift="
@@ -3912,6 +4154,30 @@ if __name__ == "__main__":
     )
     rule_planner = RuleBasedPlanner(planner_config)
     stable_controller = StableController(rule_planner.config)
+    roundabout_controller = RoundaboutController(
+        mode=args.roundabout_mode,
+        desired_gap=args.roundabout_gap,
+        max_speed=args.roundabout_max_speed,
+        max_accel=args.roundabout_max_accel,
+        max_decel=args.roundabout_max_decel,
+        lane_half_width=args.roundabout_lane_half_width,
+        wheelbase=planner_config.controller_wheelbase,
+        steering_ratio=planner_config.steering_ratio,
+        max_steer_deg=min(
+            28.0, planner_config.max_steering_wheel_deg
+        ),
+    )
+    print(
+        "[roundabout-config] "
+        f"mode={roundabout_controller.mode} "
+        f"exclusive={roundabout_controller.enabled} "
+        f"gap={roundabout_controller.desired_gap:.3f}m "
+        f"max_speed={roundabout_controller.max_speed:.3f}m/s "
+        f"max_accel={roundabout_controller.max_accel:.3f}m/s2 "
+        f"max_decel={roundabout_controller.max_decel:.3f}m/s2 "
+        f"lane_half_width="
+        f"{roundabout_controller.lane_half_width:.3f}m"
+    )
     pre_map_name = None
     map_name = None
     ins_receiver_thread = start_ins_receiver_thread()
