@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+*.onnx
+*.mp4
+
+terminal_logs/
+drive_traces/
+npc_truth/
+global_plan_vis/
+global_route_cache/
+epre_dsac/
+maps/
+maps3/
+model/
+tests/

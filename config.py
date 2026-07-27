@@ -1,0 +1,27 @@
+class Config(object):
+    lr = 0.00001
+    lr_min = 0.00001
+    model_save = 30
+    discount_factor = 0.995
+    reply_buffer_size = 30000
+    total_episode = 80000
+    update_target_frequency = 500
+    initial_epsilon = 0
+    min_epsilon = 0.01
+    epsilon_decay = 0.998
+    batch_size = 64
+    initial_observe_episode = 200
+    maximum_model = 5
+    state_size = 53
+    lr_update = 500
+    tau = 0.005
+    epsilon_update_frequency = 1
+    epsilon_decay2 = 2E5
+    PREFERENCE_FREQ = 1
+    lr_p = 0.0001
+    alpha = 0.95
+    eps = 0.01
+    action_size = 2
+    action_dim = 2
+    action_low_limit = [0.0, -5.0]
+    action_high_limit = [8.0, 5.0]
