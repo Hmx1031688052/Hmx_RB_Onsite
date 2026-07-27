@@ -212,7 +212,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-roundabout-exclusive-v17"
+    "2026-07-27-roundabout-follow-stable-v18"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -3429,6 +3429,30 @@ if __name__ == "__main__":
         help="roundabout braking magnitude limit in m/s^2",
     )
     arg_parser.add_argument(
+        "--roundabout_follow_max_accel",
+        "--roundabout-follow-max-accel",
+        dest="roundabout_follow_max_accel",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_FOLLOW_MAX_ACCEL", "8.0"
+            )
+        ),
+        help="follow-mode acceleration limit in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--roundabout_catchup_speed",
+        "--roundabout-catchup-speed",
+        dest="roundabout_catchup_speed",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_CATCHUP_SPEED", "6.0"
+            )
+        ),
+        help="maximum speed above the fixed lead while closing a gap",
+    )
+    arg_parser.add_argument(
         "--roundabout_lane_half_width",
         "--roundabout-lane-half-width",
         dest="roundabout_lane_half_width",
@@ -3772,6 +3796,8 @@ if __name__ == "__main__":
         "roundabout_max_speed",
         "roundabout_max_accel",
         "roundabout_max_decel",
+        "roundabout_follow_max_accel",
+        "roundabout_catchup_speed",
         "roundabout_lane_half_width",
     ):
         roundabout_value = getattr(args, roundabout_name)
@@ -4160,6 +4186,8 @@ if __name__ == "__main__":
         max_speed=args.roundabout_max_speed,
         max_accel=args.roundabout_max_accel,
         max_decel=args.roundabout_max_decel,
+        follow_max_accel=args.roundabout_follow_max_accel,
+        catchup_speed=args.roundabout_catchup_speed,
         lane_half_width=args.roundabout_lane_half_width,
         wheelbase=planner_config.controller_wheelbase,
         steering_ratio=planner_config.steering_ratio,
@@ -4174,6 +4202,10 @@ if __name__ == "__main__":
         f"gap={roundabout_controller.desired_gap:.3f}m "
         f"max_speed={roundabout_controller.max_speed:.3f}m/s "
         f"max_accel={roundabout_controller.max_accel:.3f}m/s2 "
+        f"follow_max_accel="
+        f"{roundabout_controller.follow_max_accel:.3f}m/s2 "
+        f"catchup_speed="
+        f"{roundabout_controller.catchup_speed:.3f}m/s "
         f"max_decel={roundabout_controller.max_decel:.3f}m/s2 "
         f"lane_half_width="
         f"{roundabout_controller.lane_half_width:.3f}m"
