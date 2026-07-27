@@ -211,7 +211,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-curve-tracking-v11"
+    "2026-07-27-mt05-fast-curve-v12"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2159,6 +2159,8 @@ def get_pointcloud_msg():
                 f"path:{3.6 * float(speed_limit_debug.get('path_limit_mps', float('nan'))):.1f},"
                 f"curve:{3.6 * float(speed_limit_debug.get('curve_limit_mps', float('nan'))):.1f},"
                 f"goal:{3.6 * float(speed_limit_debug.get('goal_limit_mps', float('nan'))):.1f} "
+                f"curve_lat_budget={float(speed_limit_debug.get('curve_lateral_accel_budget_mps2', float('nan'))):.2f}m/s2 "
+                f"map_curve_override={bool(speed_limit_debug.get('map_curve_override_active', False))} "
                 f"map_override={bool(speed_limit_debug.get('override_map_speed_limit', False))} "
                 f"respect_path_cap={bool(speed_limit_debug.get('respect_path_speed_limit', False))} "
                 f"stop_at_goal={bool(speed_limit_debug.get('stop_at_goal', False))} "

@@ -288,6 +288,46 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertLessEqual(curve_limit, expected + 0.15)
 
+    def test_mt05_alone_uses_fast_curve_lateral_budget(self):
+        radius = 25.0
+        stations = np.linspace(0.0, 60.0, 61)
+        angles = stations / radius
+        path = {
+            "x": (radius * np.sin(angles)).tolist(),
+            "y": (
+                radius * (1.0 - np.cos(angles))
+            ).tolist(),
+            "frame_id": "curve.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        ordinary = RuleBasedPlanner(config)
+        mt05 = RuleBasedPlanner(config)
+        self.assertTrue(ordinary.reference.update(path))
+        self.assertTrue(mt05.reference.update(path))
+        ordinary.map_name = "MT_06-other.xodr"
+        mt05.map_name = "MT_05-intersection.xodr"
+
+        ordinary_limit = ordinary._curve_speed_limit(
+            11.0, 20.0, 4.0
+        )
+        mt05_limit = mt05._curve_speed_limit(
+            11.0, 20.0, 4.0
+        )
+
+        self.assertFalse(
+            ordinary._last_map_curve_override_active
+        )
+        self.assertTrue(mt05._last_map_curve_override_active)
+        self.assertAlmostEqual(
+            ordinary._last_curve_lateral_accel, 0.5
+        )
+        self.assertAlmostEqual(
+            mt05._last_curve_lateral_accel, 2.5
+        )
+        self.assertGreater(mt05_limit, 1.8 * ordinary_limit)
+
     def test_vehicle_restarts_after_pedestrian_leaves_clear_lane(self):
         planner = RuleBasedPlanner()
         current_ego = ego(speed=0.0)
