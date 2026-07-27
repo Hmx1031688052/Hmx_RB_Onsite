@@ -1,0 +1,66 @@
+<OpenDRIVE>
+  <header revMajor="1" revMinor="4" name="Untitled" version="1" date="2024-07-28T06:03:55.482Z" north="1" south="0" east="0" west="0" vendor="Truevision.ai"></header>
+  <road name="Road1" length="210" id="1" junction="-1" rule="RHT">
+    <type s="0" type="town">
+      <speed max="40" unit="mph"></speed>
+    </type>
+    <link></link>
+    <planView>
+      <geometry s="0.0000000000000000e+0" x="-6.0000000000000000e+1" y="0.0000000000000000e+0" hdg="0.0000000000000000e+0" length="2.1000000000000000e+2">
+        <line/>
+      </geometry>
+    </planView>
+    <elevationProfile>
+      <elevation s="0" a="0" b="0" c="0" d="0"></elevation>
+      <elevation s="210" a="0" b="0" c="0" d="0"></elevation>
+    </elevationProfile>
+    <lanes>
+      <laneOffset s="0" a="0" b="0" c="0" d="0"></laneOffset>
+      <laneSection s="0">
+        <left>
+          <lane id="3" type="biking" level="true">
+            <link></link>
+            <width sOffset="0" a="9" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0.20786244304143228" type="solid" weight="standard" color="standard" width="0.15" laneChange="none" height="0"></roadMark>
+            <height sOffset="0" inner="0.12" outer="0.12"></height>
+          </lane>
+          <lane id="2" type="driving" level="true">
+            <link></link>
+            <width sOffset="0" a="3.5" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0.10752905938378382" type="solid" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+          <lane id="1" type="driving" level="false">
+            <link></link>
+            <width sOffset="0" a="3.5" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0" type="broken" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+        </left>
+        <center>
+          <lane id="0" type="driving" level="false">
+            <link></link>
+            <roadMark sOffset="0" type="solid" weight="standard" color="yellow" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+        </center>
+        <right>
+          <lane id="-1" type="driving" level="false">
+            <link></link>
+            <width sOffset="0" a="3.5" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0" type="broken" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+          <lane id="-2" type="driving" level="true">
+            <link></link>
+            <width sOffset="0" a="2.8" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0.004158223444448438" type="solid" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+          <lane id="-3" type="biking" level="true">
+            <link></link>
+            <width sOffset="0" a="2" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0.22309843363085663" type="solid" weight="standard" color="standard" width="0.15" laneChange="none" height="0"></roadMark>
+            <height sOffset="0" inner="0.12" outer="0.12"></height>
+          </lane>
+        </right>
+      </laneSection>
+    </lanes>
+    <objects></objects>
+  </road>
+</OpenDRIVE>

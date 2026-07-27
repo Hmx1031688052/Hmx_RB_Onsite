@@ -1,0 +1,46 @@
+<OpenDRIVE>
+  <header revMajor="1" revMinor="4" name="Untitled" version="1" date="2024-07-29T02:39:04.549Z" north="1" south="0" east="0" west="0" vendor="Truevision.ai"></header>
+  <road name="Road1" length="200" id="1" junction="-1" rule="RHT">
+    <type s="0" type="town">
+      <speed max="40" unit="mph"></speed>
+    </type>
+    <link></link>
+    <planView>
+      <geometry s="0.0000000000000000e+0" x="-5.0000000000000000e+1" y="-4.5999999999999996e+0" hdg="0.0000000000000000e+0" length="2.0000000000000000e+2">
+        <line/>
+      </geometry>
+    </planView>
+    <elevationProfile>
+      <elevation s="0" a="0" b="0" c="0" d="0"></elevation>
+      <elevation s="200" a="0" b="0" c="0" d="0"></elevation>
+    </elevationProfile>
+    <lanes>
+      <laneOffset s="0" a="0" b="0" c="0" d="0"></laneOffset>
+      <laneOffset s="0" a="0" b="0" c="0" d="0"></laneOffset>
+      <laneOffset s="0" a="0" b="0" c="0" d="0"></laneOffset>
+      <laneSection s="0">
+        <left>
+          <lane id="1" type="driving" level="false">
+            <link></link>
+            <width sOffset="0" a="4.6" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0" type="solid" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+        </left>
+        <center>
+          <lane id="0" type="driving" level="false">
+            <link></link>
+            <roadMark sOffset="0" type="broken" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+        </center>
+        <right>
+          <lane id="-1" type="driving" level="false">
+            <link></link>
+            <width sOffset="0" a="5.6" b="0" c="0" d="0"></width>
+            <roadMark sOffset="0" type="solid" weight="standard" color="white" width="0.15" laneChange="none" height="0"></roadMark>
+          </lane>
+        </right>
+      </laneSection>
+    </lanes>
+    <objects></objects>
+  </road>
+</OpenDRIVE>

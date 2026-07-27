@@ -10,8 +10,5 @@ drive_traces/
 npc_truth/
 global_plan_vis/
 global_route_cache/
-epre_dsac/
-maps/
 maps3/
 model/
-tests/
