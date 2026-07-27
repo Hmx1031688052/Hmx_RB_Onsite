@@ -214,7 +214,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-ins-auto-reexec-v30"
+    "2026-07-27-channel-connect-retry-v28"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 PREPARE_RESULT_REPEAT = max(
@@ -238,19 +238,6 @@ prepare_sent_ts = None
 prepare_not_before_ts = None
 first_ins_ready = False
 first_ins_ready_ts = None
-start_test_received_ts = None
-last_ins_watchdog_log_ts = 0.0
-auto_comm_restart_enabled = (
-    os.environ.get("E2E_AUTO_COMM_RESTART", "1") == "1"
-)
-auto_comm_restart_timeout = max(
-    1.0,
-    float(os.environ.get("E2E_AUTO_COMM_RESTART_TIMEOUT", "5.0")),
-)
-auto_comm_restart_limit = max(
-    0,
-    int(os.environ.get("E2E_AUTO_COMM_RESTART_LIMIT", "3")),
-)
 first_pointcloud_ready = False
 first_pointcloud_ready_ts = None
 first_control_sent = False
@@ -1175,124 +1162,10 @@ def hold_until_global_plan_ready():
     return True
 
 
-def _restart_for_missing_ins(elapsed):
-    """Replace the process so the multicast library recreates all sockets."""
-    restart_count = int(
-        os.environ.get("E2E_COMM_RESTART_COUNT", "0") or 0
-    )
-    if restart_count >= auto_comm_restart_limit:
-        return False
-
-    restart_count += 1
-    os.environ["E2E_COMM_RESTART_COUNT"] = str(restart_count)
-    print(
-        "[communication-watchdog][RESTART] "
-        f"START_TEST received but no valid INS for {elapsed:.3f}s; "
-        f"automatic_restart={restart_count}/{auto_comm_restart_limit} "
-        "reason=stale multicast/INS receiver state"
-    )
-    print(
-        "[communication-watchdog][RESTART] "
-        "re-executing run.py with the same command-line arguments"
-    )
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-
-    executable = sys.executable
-    script_path = os.path.abspath(__file__)
-    try:
-        # Native libMulticastNetwork descriptors are not guaranteed to carry
-        # FD_CLOEXEC.  Keeping one of those sockets across exec would recreate
-        # the exact stale receiver that this watchdog is trying to remove.
-        # Preserve only stdin/stdout/stderr; the new process reopens its log,
-        # web server, ROS bridge, and every multicast channel from scratch.
-        if os.name == "posix":
-            try:
-                import resource
-
-                open_file_limit = resource.getrlimit(
-                    resource.RLIMIT_NOFILE
-                )[0]
-                if open_file_limit == resource.RLIM_INFINITY:
-                    open_file_limit = 65536
-                os.closerange(
-                    3,
-                    max(3, min(int(open_file_limit), 1048576)),
-                )
-            except Exception as close_exc:
-                warning = (
-                    "[communication-watchdog][WARN] "
-                    "failed to close inherited descriptors before re-exec: "
-                    f"{type(close_exc).__name__}: {close_exc}\n"
-                )
-                try:
-                    os.write(2, warning.encode("utf-8", errors="replace"))
-                except Exception:
-                    pass
-        os.execv(
-            executable,
-            [executable, script_path] + list(sys.argv[1:]),
-        )
-    except OSError as exc:
-        print(
-            "[communication-watchdog][ERROR] "
-            f"process re-exec failed: {type(exc).__name__}: {exc}"
-        )
-        return False
-    return True
-
-
-def check_first_ins_watchdog():
-    global last_ins_watchdog_log_ts
-    global start_test_received_ts
-
-    if (
-        not auto_comm_restart_enabled
-        or not recv_prepare
-        or not start_test
-        or first_ins_ready
-        or start_test_received_ts is None
-    ):
-        return
-
-    now = time.time()
-    elapsed = max(0.0, now - start_test_received_ts)
-    if now - last_ins_watchdog_log_ts >= 1.0:
-        last_ins_watchdog_log_ts = now
-        restart_count = int(
-            os.environ.get("E2E_COMM_RESTART_COUNT", "0") or 0
-        )
-        print(
-            "[communication-watchdog][INS-WAIT] "
-            f"elapsed={elapsed:.3f}s "
-            f"timeout={auto_comm_restart_timeout:.3f}s "
-            f"restart_count={restart_count}/"
-            f"{auto_comm_restart_limit}"
-        )
-
-    if elapsed < auto_comm_restart_timeout:
-        return
-
-    if _restart_for_missing_ins(elapsed):
-        return
-
-    # Do not spam once the bounded recovery budget is exhausted.
-    start_test_received_ts = now
-    print(
-        "[communication-watchdog][ERROR] "
-        f"automatic restart limit reached "
-        f"({auto_comm_restart_limit}); continuing zero-speed hold"
-    )
-
-
 def hold_until_ego_ready():
     if first_ins_ready and model.ego is not None:
         return False
 
-    check_first_ins_watchdog()
     send_control_cmd(0.0, 0.0, 0.0)
     return True
 
@@ -1744,8 +1617,6 @@ def get_prepare():
     global prepare_not_before_ts
     global first_ins_ready
     global first_ins_ready_ts
-    global start_test_received_ts
-    global last_ins_watchdog_log_ts
     global first_pointcloud_ready
     global first_pointcloud_ready_ts
     global first_control_sent
@@ -1787,8 +1658,6 @@ def get_prepare():
         prepare_not_before_ts = None
         first_ins_ready = False
         first_ins_ready_ts = None
-        start_test_received_ts = None
-        last_ins_watchdog_log_ts = 0.0
         first_pointcloud_ready = False
         first_pointcloud_ready_ts = None
         first_control_sent = False
@@ -2783,8 +2652,6 @@ def process_notify():
     global last_rule_plan
     global last_rule_plan_wall_time
     global last_control_wall_time
-    global start_test_received_ts
-    global last_ins_watchdog_log_ts
     ret, msg = notify_channel.get()
     if msg is None:
         return
@@ -2817,8 +2684,6 @@ def process_notify():
             model.time_out = False
             start_test = False
             recv_prepare = False
-            start_test_received_ts = None
-            last_ins_watchdog_log_ts = 0.0
             plan_start_check_remaining = 0
             plan_start_check_xy = None
             plan_start_check_map = ""
@@ -2854,18 +2719,7 @@ def process_notify():
             last_control_wall_time = None
 
         elif notify.type == NT_START_TEST:
-            if not start_test or start_test_received_ts is None:
-                start_test_received_ts = time.time()
-                last_ins_watchdog_log_ts = 0.0
-                print(
-                    "start session "
-                    f"wall_time={start_test_received_ts:.3f}"
-                )
-            else:
-                print(
-                    "[communication-watchdog] duplicate START_TEST "
-                    "received; preserve original INS timeout deadline"
-                )
+            print("start session")
             start_test = True
             model.start = 1
             # DriveSim holds the chassis brake while a prepared scenario is
@@ -2996,7 +2850,6 @@ def get_vehicle_pose():
     if not first_ins_ready:
         first_ins_ready = True
         first_ins_ready_ts = time.time()
-        os.environ["E2E_COMM_RESTART_COUNT"] = "0"
         print(
             "[prepare-timing] first_ins_ready "
             f"wall_time={first_ins_ready_ts:.3f} "
@@ -3278,33 +3131,6 @@ if __name__ == "__main__":
             os.environ.get("E2E_CHANNEL_RETRY_MAX_SEC", "5.0")
         ),
         help="maximum retry delay for interface/config-center startup",
-    )
-    arg_parser.add_argument(
-        "--auto_comm_restart_timeout",
-        type=float,
-        default=float(
-            os.environ.get(
-                "E2E_AUTO_COMM_RESTART_TIMEOUT",
-                "5.0",
-            )
-        ),
-        help=(
-            "restart run.py automatically if START_TEST is followed "
-            "by no valid INS for this many seconds"
-        ),
-    )
-    arg_parser.add_argument(
-        "--auto_comm_restart_limit",
-        type=int,
-        default=int(
-            os.environ.get("E2E_AUTO_COMM_RESTART_LIMIT", "3")
-        ),
-        help="maximum consecutive automatic communication restarts",
-    )
-    arg_parser.add_argument(
-        "--disable_auto_comm_restart",
-        action="store_true",
-        help="wait at zero speed instead of restarting on missing INS",
     )
     arg_parser.add_argument(
         "--max_speed",
@@ -4078,17 +3904,6 @@ if __name__ == "__main__":
         ),
     )
     args = arg_parser.parse_args()
-    auto_comm_restart_enabled = not bool(
-        args.disable_auto_comm_restart
-    )
-    auto_comm_restart_timeout = max(
-        1.0,
-        float(args.auto_comm_restart_timeout),
-    )
-    auto_comm_restart_limit = max(
-        0,
-        int(args.auto_comm_restart_limit),
-    )
     if args.max_speed is not None and args.max_speed <= 0.0:
         arg_parser.error("--max_speed must be greater than zero")
     if args.max_speed_kmh is not None and args.max_speed_kmh <= 0.0:
@@ -4372,12 +4187,6 @@ if __name__ == "__main__":
     print(
         "[algorithm-policy] "
         f"version={ALGORITHM_POLICY_VERSION}"
-    )
-    print(
-        "[communication-watchdog] "
-        f"enabled={auto_comm_restart_enabled} "
-        f"missing_ins_timeout={auto_comm_restart_timeout:.3f}s "
-        f"restart_limit={auto_comm_restart_limit}"
     )
     if args.gt_track_hold_seconds is not None:
         gt_obstacle_adapter.track_hold_seconds = float(
