@@ -214,7 +214,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-channel-connect-retry-v28"
+    "2026-07-27-episode-speed-reset-v27"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 PREPARE_RESULT_REPEAT = max(
@@ -3011,127 +3011,11 @@ def main():
             time.sleep(cycle_remaining)
 
 
-def _retry_delay(attempt, initial_sec, max_sec):
-    """Return a bounded exponential backoff without making recovery sluggish."""
-    exponent = min(max(0, int(attempt) - 1), 8)
-    return min(float(max_sec), float(initial_sec) * (1.7 ** exponent))
-
-
-def _wait_for_interface_ip(interface_name, initial_sec=0.5, max_sec=5.0):
-    """Wait until the simulator-facing interface has a usable IPv4 address."""
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            local_ip = str(get_ip_address(interface_name) or "").strip()
-            if local_ip and local_ip != "0.0.0.0":
-                if attempt > 1:
-                    print(
-                        "[multicast-connect] interface ready "
-                        f"name={interface_name!r} local_ip={local_ip!r} "
-                        f"attempt={attempt}"
-                    )
-                return local_ip
-            error_text = "empty IPv4 address"
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
-
-        delay = _retry_delay(attempt, initial_sec, max_sec)
-        print(
-            "[multicast-connect][WAIT] "
-            f"interface={interface_name!r} has no usable IPv4 address; "
-            f"error={error_text}; retry_in={delay:.2f}s"
-        )
-        time.sleep(delay)
-
-
-def _create_channels_with_retry(
-    param,
-    required_channel_names,
-    initial_sec=0.5,
-    max_sec=5.0,
-):
-    """Register with the config center until all channels needed by this run exist."""
-    required = tuple(sorted(set(required_channel_names)))
-    attempt = 0
-    while True:
-        attempt += 1
-        channels = libMulticastNetwork.ChannelPtrVector()
-        channel_map = {}
-        ret = None
-        error_text = ""
-        try:
-            ret = libMulticastNetwork.create_channels(param, channels)
-            if not ret:
-                for channel in channels:
-                    channel_map[channel.name()] = channel
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
-
-        missing = [
-            name for name in required
-            if name not in channel_map
-        ]
-        if not ret and not error_text and not missing:
-            print(
-                "[multicast-connect] connected "
-                f"attempt={attempt} channels={len(channel_map)}"
-            )
-            for channel in channels:
-                print(
-                    "message channel name: {}, id: {}".format(
-                        channel.name(),
-                        channel.id(),
-                    )
-                )
-            return channels, channel_map
-
-        delay = _retry_delay(attempt, initial_sec, max_sec)
-        details = []
-        if ret:
-            details.append(f"ret={ret}")
-        if error_text:
-            details.append(f"error={error_text}")
-        if missing:
-            details.append(f"missing={missing}")
-        if not details:
-            details.append("unknown registration failure")
-        print(
-            "[multicast-connect][WAIT] "
-            f"attempt={attempt} {' '.join(details)} "
-            f"retry_in={delay:.2f}s"
-        )
-        # Release a partial vector before attempting a fresh registration.
-        del channel_map
-        del channels
-        time.sleep(delay)
-
-
 if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("--config_center", type=str, default="47.110.233.70:52009")
     arg_parser.add_argument("--field_id", type=str, default="field-zd-test1-22-0331134113-888")
     arg_parser.add_argument("--net_interface", type=str, default="usb0")
-    arg_parser.add_argument(
-        "--channel_retry_initial_sec",
-        type=float,
-        default=float(
-            os.environ.get("E2E_CHANNEL_RETRY_INITIAL_SEC", "0.5")
-        ),
-        help="initial retry delay for interface/config-center startup",
-    )
-    arg_parser.add_argument(
-        "--channel_retry_max_sec",
-        type=float,
-        default=float(
-            os.environ.get("E2E_CHANNEL_RETRY_MAX_SEC", "5.0")
-        ),
-        help="maximum retry delay for interface/config-center startup",
-    )
     arg_parser.add_argument(
         "--max_speed",
         "--max-speed",
@@ -4217,20 +4101,9 @@ if __name__ == "__main__":
         confidence_value = getattr(args, confidence_name)
         if confidence_value is not None:
             os.environ[env_name] = str(float(confidence_value))
-    channel_retry_initial_sec = max(
-        0.05,
-        float(args.channel_retry_initial_sec),
-    )
-    channel_retry_max_sec = max(
-        channel_retry_initial_sec,
-        float(args.channel_retry_max_sec),
-    )
-    local_ip = _wait_for_interface_ip(
-        args.net_interface,
-        initial_sec=channel_retry_initial_sec,
-        max_sec=channel_retry_max_sec,
-    )
     param = libMulticastNetwork.CreateChannelsParam()
+
+    local_ip = get_ip_address(args.net_interface)
 
     #######################################################
     ###################### 需要修改 ########################
@@ -4246,30 +4119,17 @@ if __name__ == "__main__":
     param.client_name = "apollo_testee"
     param.recv_self_msg = False
     session_id = ""
-    print(
-        "[multicast-connect] registering "
-        f"client={param.client_name!r} "
-        f"config_center={args.config_center!r} "
-        f"field_id={args.field_id!r} "
-        f"interface={args.net_interface!r} "
-        f"local_ip={local_ip!r}"
-    )
-    required_channel_names = {
-        "lidar",
-        "notify",
-        "vehiclecontrol",
-        "prepare",
-        "ins",
-        "camera",
-    }
-    if PERCEPTION_SOURCE == "gt":
-        required_channel_names.add("npc")
-    channels, channel_map = _create_channels_with_retry(
-        param,
-        required_channel_names,
-        initial_sec=channel_retry_initial_sec,
-        max_sec=channel_retry_max_sec,
-    )
+
+    channels = libMulticastNetwork.ChannelPtrVector()
+    ret = libMulticastNetwork.create_channels(param, channels)
+    if ret:
+        print("create channels failed, ret: {}".format(ret))
+        sys.exit(1)
+    channel_map = {}
+    # 不同的组播消息通道，用于接收和发送消息
+    for c in channels:
+        print("message channel name: {}, id: {}".format(c.name(), c.id()))
+        channel_map[c.name()] = c
 
     pointcloud_channel = channel_map["lidar"]
     notify_channel = channel_map["notify"]
@@ -4278,6 +4138,12 @@ if __name__ == "__main__":
     ins_channel = channel_map["ins"]
     image_channel = channel_map["camera"]
     npc_channel = channel_map.get("npc")
+    if PERCEPTION_SOURCE == "gt" and npc_channel is None:
+        print(
+            "[perception][FATAL] GT planning requested but channel "
+            "'npc' is unavailable"
+        )
+        sys.exit(2)
     if args.dump_npc_truth:
         if npc_channel is None:
             print(
@@ -4295,13 +4161,8 @@ if __name__ == "__main__":
             )
 
     if not libMulticastNetwork.InitImageDecoder(6,1600,900):
-        # The current control loop does not consume camera frames.  A local
-        # decoder failure must not tear down otherwise healthy multicast
-        # channels and force the operator to restart every process.
-        print(
-            "[image-decoder][WARN] initialization failed; "
-            "camera decoding disabled, planning/control continue"
-        )
+        print("image decoder init error")
+        sys.exit(1)
 
     img_id = 0
     save_results = False
