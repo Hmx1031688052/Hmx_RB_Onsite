@@ -211,7 +211,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-mt05-fast-track-v13"
+    "2026-07-27-mt05-direct-sprint-v14"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2170,6 +2170,8 @@ def get_pointcloud_msg():
                 f"manual_target_d={float(planner_debug.get('manual_target_d') if planner_debug.get('manual_target_d') is not None else float('nan')):.3f}m "
                 f"manual_target_v={float(planner_debug.get('manual_target_speed_mps') if planner_debug.get('manual_target_speed_mps') is not None else float('nan')):.3f}m/s "
                 f"collision_bypass={bool(planner_debug.get('manual_collision_bypass', False))} "
+                f"mt05_sprint={bool(planner_debug.get('mt05_sprint_active', False))} "
+                f"sprint_goal_distance={float(planner_debug.get('mt05_sprint_goal_distance') if planner_debug.get('mt05_sprint_goal_distance') is not None else float('nan')):.3f}m "
                 f"remaining={float(planner_debug.get('remaining', float('nan'))):.3f}m "
                 f"obstacles_raw={int(planner_debug.get('raw_obstacle_count', 0))} "
                 f"obstacles_used={int(planner_debug.get('planning_obstacle_count', 0))} "
@@ -2372,6 +2374,8 @@ def get_pointcloud_msg():
             f"active_lat_acc_limit={float(controller_debug.get('active_lateral_accel_limit', float('nan'))):.3f}m/s2 "
             f"curve_authority={bool(controller_debug.get('curve_authority_active', False))} "
             f"tracking_recovery={bool(controller_debug.get('tracking_recovery_active', False))} "
+            f"sprint_mode={bool(controller_debug.get('mt05_sprint_mode', False))} "
+            f"sprint_pulse={bool(controller_debug.get('sprint_accel_pulse_active', False))} "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "
@@ -3875,6 +3879,12 @@ if __name__ == "__main__":
         f"follow_time_headway={planner_config.time_headway:.3f}s "
         f"minimum_gap={planner_config.minimum_gap:.3f}m "
         f"ignore_obstacles={planner_config.ignore_obstacles} "
+        f"mt05_direct_sprint="
+        f"{planner_config.mt05_direct_sprint_enabled} "
+        f"mt05_sprint_speed="
+        f"{planner_config.mt05_sprint_speed:.3f}m/s "
+        f"mt05_sprint_accel="
+        f"{planner_config.mt05_sprint_accel:.3f}m/s2 "
         f"avoidance_speed={planner_config.static_avoidance_speed:.3f}m/s "
         f"avoidance_half_width={planner_config.avoidance_half_width:.3f}m "
         f"minimum_bypass_shift="

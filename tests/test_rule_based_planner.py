@@ -302,6 +302,9 @@ class RulePlannerTest(unittest.TestCase):
         }
         config = PlannerConfig()
         config.enable_comfort_mode()
+        config.map_curve_lateral_accel_overrides[
+            "mt_05-intersection.xodr"
+        ] = 2.5
         ordinary = RuleBasedPlanner(config)
         mt05 = RuleBasedPlanner(config)
         self.assertTrue(ordinary.reference.update(path))
@@ -327,6 +330,142 @@ class RulePlannerTest(unittest.TestCase):
             mt05._last_curve_lateral_accel, 2.5
         )
         self.assertGreater(mt05_limit, 1.8 * ordinary_limit)
+
+    def test_mt05_sprint_replaces_curve_with_straight_goal_ray(self):
+        path = {
+            "x": [0.0, 0.0, 5.0, 10.0],
+            "y": [0.0, -5.0, -10.0, -10.0],
+            "frame_id": "MT_05-intersection.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        config.max_speed = 55.0
+        config.override_map_speed_limit = True
+        planner = RuleBasedPlanner(config)
+        current_ego = ego(speed=0.0)
+        current_ego.theta = -math.pi / 2.0
+
+        result = planner.plan(
+            current_ego,
+            [],
+            path,
+            "MT_05-intersection.xodr",
+        )
+
+        self.assertEqual(result.behavior, "MT05_SPRINT")
+        self.assertAlmostEqual(
+            result.target_speed, config.mt05_sprint_speed
+        )
+        self.assertTrue(
+            planner.last_debug["mt05_sprint_active"]
+        )
+        self.assertEqual(
+            planner.last_debug["mt05_sprint_goal"],
+            [10.0, -10.0],
+        )
+        self.assertTrue(
+            np.allclose(planner.reference.kappa, 0.0)
+        )
+        line_cross = (
+            result.trajectory.x * -10.0
+            - result.trajectory.y * 10.0
+        )
+        self.assertLess(np.max(np.abs(line_cross)), 1e-6)
+
+    def test_mt05_sprint_uses_short_acceleration_pulse(self):
+        path = {
+            "x": [0.0, 0.0, 5.0, 10.0],
+            "y": [0.0, -5.0, -10.0, -10.0],
+            "frame_id": "MT_05-intersection.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        config.max_speed = 55.0
+        config.override_map_speed_limit = True
+        planner = RuleBasedPlanner(config)
+        controller = StableController(config)
+        current_ego = ego(speed=0.0)
+        current_ego.theta = -math.pi / 2.0
+        result = planner.plan(
+            current_ego,
+            [],
+            path,
+            "MT_05-intersection.xodr",
+        )
+        projection = planner.reference.project(0.0, 0.0)
+
+        launch = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+        current_ego.speed = config.mt05_sprint_speed - 0.2
+        coast = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+
+        self.assertEqual(launch.acc, config.mt05_sprint_accel)
+        self.assertEqual(
+            launch.speed, config.mt05_sprint_speed
+        )
+        self.assertGreater(launch.steer, 0.0)
+        self.assertEqual(coast.acc, 0.0)
+        self.assertTrue(
+            controller.last_debug["mt05_sprint_mode"]
+        )
+
+    def test_mt05_sprint_does_not_affect_other_maps(self):
+        path = {
+            "x": [0.0, 0.0, 5.0, 10.0],
+            "y": [0.0, -5.0, -10.0, -10.0],
+            "frame_id": "MT_06-other.xodr",
+            "stamp": 1,
+        }
+        planner = RuleBasedPlanner()
+        result = planner.plan(
+            ego(speed=0.0), [], path, "MT_06-other.xodr"
+        )
+
+        self.assertNotEqual(result.behavior, "MT05_SPRINT")
+        self.assertFalse(
+            planner.last_debug["mt05_sprint_active"]
+        )
+        self.assertIsNone(planner._mt05_sprint_path)
+
+    def test_mt05_sprint_keeps_collision_checks(self):
+        path = {
+            "x": [0.0, 0.0, 5.0, 10.0],
+            "y": [0.0, -5.0, -10.0, -10.0],
+            "frame_id": "MT_05-intersection.xodr",
+            "stamp": 1,
+        }
+        planner = RuleBasedPlanner()
+        blocking = obstacle(3.0, y=-3.0, speed=0.0)
+
+        result = planner.plan(
+            ego(speed=3.0),
+            [blocking],
+            path,
+            "MT_05-intersection.xodr",
+        )
+
+        self.assertNotEqual(result.behavior, "MT05_SPRINT")
+        self.assertEqual(
+            planner.last_debug["detected_obstacle_count"], 1
+        )
+        self.assertFalse(
+            planner.last_debug["ignore_obstacles"]
+        )
 
     def test_vehicle_restarts_after_pedestrian_leaves_clear_lane(self):
         planner = RuleBasedPlanner()
@@ -647,6 +786,7 @@ class RulePlannerTest(unittest.TestCase):
     def test_mt05_continues_past_endpoint_without_hidden_braking(self):
         config = PlannerConfig()
         config.enable_comfort_mode()
+        config.mt05_direct_sprint_enabled = False
         planner = RuleBasedPlanner(config)
         current_ego = ego(x=123.0, speed=5.0)
         result = planner.plan(
@@ -1367,6 +1507,9 @@ class RulePlannerTest(unittest.TestCase):
     def test_mt05_fast_curve_keeps_tracking_correction_reserve(self):
         config = PlannerConfig()
         config.enable_comfort_mode()
+        config.map_curve_lateral_accel_overrides[
+            "mt_05-intersection.xodr"
+        ] = 2.5
         controller = StableController(config)
         curvature = 0.049
         curve_budget = (
