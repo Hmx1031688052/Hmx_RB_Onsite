@@ -192,11 +192,15 @@ DEBUG_DRIVE = os.environ.get("E2E_DEBUG_DRIVE", "0") == "1"
 PERCEPTION_SOURCE = os.environ.get(
     "E2E_PERCEPTION_SOURCE", "gt"
 ).strip().lower()
+GT_STARTUP_GRACE_SECONDS = max(
+    0.0,
+    float(os.environ.get("E2E_GT_STARTUP_GRACE_SECONDS", "0.50")),
+)
 EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-expected-speed-route-cache-v5"
+    "2026-07-27-damped-global-tracking-v6"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -1712,6 +1716,9 @@ def get_prepare():
                         "gt_track_hold_seconds": (
                             gt_obstacle_adapter.track_hold_seconds
                         ),
+                        "gt_startup_grace_seconds": (
+                            GT_STARTUP_GRACE_SECONDS
+                        ),
                         "gt_track_innovation_gate_m": (
                             gt_obstacle_adapter.innovation_gate_m
                         ),
@@ -1748,6 +1755,14 @@ def get_prepare():
                         ),
                         "centerline_feedback_gain": (
                             rule_planner.config.centerline_feedback_gain
+                        ),
+                        "centerline_natural_frequency": (
+                            rule_planner.config
+                            .centerline_natural_frequency
+                        ),
+                        "centerline_damping_ratio": (
+                            rule_planner.config
+                            .centerline_damping_ratio
                         ),
                         "centerline_safety_stop_enabled": (
                             rule_planner.config
@@ -2210,9 +2225,25 @@ def get_pointcloud_msg():
             None,
         ),
         path_lateral_offset=current_projection_debug.get("d"),
+        path_reference_yaw=current_projection_debug.get("yaw"),
+        path_reference_curvature=current_projection_debug.get(
+            "kappa"
+        ),
+    )
+    gt_startup_age = (
+        float("inf")
+        if first_ins_ready_ts is None
+        else max(0.0, time.time() - first_ins_ready_ts)
+    )
+    gt_startup_grace_active = bool(
+        PERCEPTION_SOURCE == "gt"
+        and not gt_ready
+        and gt_startup_age <= GT_STARTUP_GRACE_SECONDS
     )
     gt_failsafe_applied = (
-        PERCEPTION_SOURCE == "gt" and not gt_ready
+        PERCEPTION_SOURCE == "gt"
+        and not gt_ready
+        and not gt_startup_grace_active
     )
     if gt_failsafe_applied:
         command.acc = -float(rule_planner.config.max_decel)
@@ -2253,9 +2284,14 @@ def get_pointcloud_msg():
             f"steer_tracking_error={float(controller_debug.get('steering_tracking_error') if controller_debug.get('steering_tracking_error') is not None else float('nan')):.3f}deg "
             f"steer_limit={float(controller_debug.get('steering_limit', float('nan'))):.3f}deg "
             f"trajectory_comfort_cap={float(controller_debug.get('trajectory_comfort_speed_cap', float('nan'))):.3f}m/s "
+            f"trajectory_comfort_cap_applied={bool(controller_debug.get('trajectory_comfort_cap_applied', False))} "
             f"alignment_speed_cap={float(controller_debug.get('alignment_speed_cap', float('nan'))):.3f}m/s "
             f"strict_alignment_guard={bool(controller_debug.get('strict_alignment_speed_guard', False))} "
             f"path_d={float(controller_debug.get('path_lateral_offset', float('nan'))):.3f}m "
+            f"centerline_control={bool(controller_debug.get('centerline_control_active', False))} "
+            f"global_heading_error={math.degrees(float(controller_debug.get('global_heading_error', float('nan')))):.3f}deg "
+            f"path_d_speed={float(controller_debug.get('estimated_path_lateral_speed', float('nan'))):.3f}m/s "
+            f"centerline_lat_acc={float(controller_debug.get('centerline_lat_accel_command', float('nan'))):.3f}m/s2 "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "
@@ -2278,6 +2314,13 @@ def get_pointcloud_msg():
                 "fresh_gt": fresh_gt,
                 "gt_ready": gt_ready,
                 "gt_age": gt_age,
+                "gt_startup_age": gt_startup_age,
+                "gt_startup_grace_seconds": (
+                    GT_STARTUP_GRACE_SECONDS
+                ),
+                "gt_startup_grace_active": (
+                    gt_startup_grace_active
+                ),
                 "gt_failsafe_applied": gt_failsafe_applied,
                 "perception_source": PERCEPTION_SOURCE,
                 "replanned": replanned,
@@ -2937,6 +2980,27 @@ if __name__ == "__main__":
         help="direct global-path lateral feedback gain",
     )
     arg_parser.add_argument(
+        "--centerline_natural_frequency",
+        "--centerline-natural-frequency",
+        dest="centerline_natural_frequency",
+        type=float,
+        default=None,
+        help=(
+            "global-path lateral recovery frequency in rad/s; "
+            "higher values return to d=0 faster"
+        ),
+    )
+    arg_parser.add_argument(
+        "--centerline_damping_ratio",
+        "--centerline-damping-ratio",
+        dest="centerline_damping_ratio",
+        type=float,
+        default=None,
+        help=(
+            "global-path lateral damping ratio; 1.0 is critically damped"
+        ),
+    )
+    arg_parser.add_argument(
         "--enable_centerline_safety_stop",
         "--enable-centerline-safety-stop",
         dest="enable_centerline_safety_stop",
@@ -3094,6 +3158,17 @@ if __name__ == "__main__":
         ),
     )
     arg_parser.add_argument(
+        "--gt_startup_grace_seconds",
+        "--gt-startup-grace-seconds",
+        dest="gt_startup_grace_seconds",
+        type=float,
+        default=GT_STARTUP_GRACE_SECONDS,
+        help=(
+            "allow this many seconds after first INS for the first GT "
+            "frame before applying the missing-GT brake"
+        ),
+    )
+    arg_parser.add_argument(
         "--gt_innovation_gate_m",
         "--gt-innovation-gate-m",
         dest="gt_innovation_gate_m",
@@ -3235,6 +3310,20 @@ if __name__ == "__main__":
             "--centerline_feedback_gain must be between 0.0 and 5.0"
         )
     if (
+        args.centerline_natural_frequency is not None
+        and not 0.10 <= args.centerline_natural_frequency <= 2.00
+    ):
+        arg_parser.error(
+            "--centerline_natural_frequency must be between 0.10 and 2.00"
+        )
+    if (
+        args.centerline_damping_ratio is not None
+        and not 0.40 <= args.centerline_damping_ratio <= 3.00
+    ):
+        arg_parser.error(
+            "--centerline_damping_ratio must be between 0.40 and 3.00"
+        )
+    if (
         args.curve_speed_factor is not None
         and not 0.1 <= args.curve_speed_factor <= 5.0
     ):
@@ -3244,6 +3333,7 @@ if __name__ == "__main__":
     if args.trace_period < 0.02:
         arg_parser.error("--trace_period must be at least 0.02 seconds")
     for gt_tracking_name in (
+        "gt_startup_grace_seconds",
         "gt_track_hold_seconds",
         "gt_innovation_gate_m",
         "gt_innovation_gate_speed",
@@ -3367,6 +3457,9 @@ if __name__ == "__main__":
         print("[drive-debug] enabled by --debug")
     PERCEPTION_SOURCE = args.perception_source
     os.environ["E2E_PERCEPTION_SOURCE"] = PERCEPTION_SOURCE
+    GT_STARTUP_GRACE_SECONDS = float(
+        args.gt_startup_grace_seconds
+    )
     EXPECTED_SPEED_CLI_MPS = (
         None
         if args.expected_speed_kmh is None
@@ -3394,6 +3487,7 @@ if __name__ == "__main__":
         )
     print(
         "[gt-tracker-config] "
+        f"startup_grace={GT_STARTUP_GRACE_SECONDS:.3f}s "
         f"hold={gt_obstacle_adapter.track_hold_seconds:.3f}s "
         f"innovation_gate="
         f"{gt_obstacle_adapter.innovation_gate_m:.3f}m+"
@@ -3546,6 +3640,14 @@ if __name__ == "__main__":
         planner_config.centerline_feedback_gain = float(
             args.centerline_feedback_gain
         )
+    if args.centerline_natural_frequency is not None:
+        planner_config.centerline_natural_frequency = float(
+            args.centerline_natural_frequency
+        )
+    if args.centerline_damping_ratio is not None:
+        planner_config.centerline_damping_ratio = float(
+            args.centerline_damping_ratio
+        )
     if args.enable_centerline_safety_stop:
         planner_config.centerline_safety_stop_enabled = True
     if args.avoidance_speed is not None:
@@ -3616,6 +3718,10 @@ if __name__ == "__main__":
         f"{planner_config.curve_speed_factor:.3f} "
         f"centerline_feedback_gain="
         f"{planner_config.centerline_feedback_gain:.3f} "
+        f"centerline_natural_frequency="
+        f"{planner_config.centerline_natural_frequency:.3f}rad/s "
+        f"centerline_damping_ratio="
+        f"{planner_config.centerline_damping_ratio:.3f} "
         f"centerline_safety_stop_enabled="
         f"{planner_config.centerline_safety_stop_enabled} "
         f"follow_time_headway={planner_config.time_headway:.3f}s "

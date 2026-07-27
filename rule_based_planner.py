@@ -326,6 +326,29 @@ class PlannerConfig(object):
                 )
             ),
         )
+        # For ordinary lane keeping, control global Frenet d directly with a
+        # critically damped second-order law.  Reusing the repeatedly rebuilt
+        # local RECOVER trajectory here made the steering reverse too late:
+        # the ego crossed the centreline, generated a bend in the opposite
+        # direction, and then repeated the same motion.
+        self.centerline_natural_frequency = _clip(
+            float(
+                os.environ.get(
+                    "RULE_CENTERLINE_NATURAL_FREQUENCY", "0.45"
+                )
+            ),
+            0.10,
+            2.00,
+        )
+        self.centerline_damping_ratio = _clip(
+            float(
+                os.environ.get(
+                    "RULE_CENTERLINE_DAMPING_RATIO", "1.05"
+                )
+            ),
+            0.40,
+            3.00,
+        )
         self.centerline_safety_stop_enabled = (
             os.environ.get(
                 "RULE_CENTERLINE_SAFETY_STOP", "0"
@@ -1443,7 +1466,9 @@ class RuleBasedPlanner(object):
         trajectory.ignored_rear_ids = []
 
         for obstacle in obstacles:
-            if self._is_non_blocking_rear_follower(ego, obstacle):
+            if self._is_non_blocking_rear_follower(
+                ego, obstacle, trajectory=trajectory
+            ):
                 trajectory.ignored_rear_ids.append(obstacle.get("id"))
                 continue
             obs_x = obstacle["x"] + obstacle["vx"] * times
@@ -1582,15 +1607,18 @@ class RuleBasedPlanner(object):
         trajectory.closest_collision_time = closest_time
         return True
 
-    def _is_non_blocking_rear_follower(self, ego, obstacle):
+    def _is_non_blocking_rear_follower(
+        self, ego, obstacle, trajectory=None
+    ):
         """Return whether replay traffic is following in the ego's lane.
 
         A replayed rear vehicle cannot yield or brake for the ego.  Treating
         its predicted rear-end impact as an ego planning constraint creates a
         positive feedback loop: the rear car gets closer, every candidate is
-        rejected, and the ego brakes harder.  Only a vehicle whose centre is
-        behind and close to the ego's current lateral centre is exempted.
-        Vehicles beside the ego or in an adjacent lane are still checked.
+        rejected, and the ego brakes harder.  Same-lane rear followers are
+        always exempted.  An adjacent-lane rear vehicle is exempted only for a
+        candidate which stays in place or moves away from it; a candidate
+        merging toward that vehicle must still pass the full collision check.
         """
         if not self.config.non_yielding_replay_traffic:
             return False
@@ -1603,11 +1631,32 @@ class RuleBasedPlanner(object):
         dy = obstacle["y"] - _finite(ego.get("y", 0.0))
         longitudinal = dx * cos_yaw + dy * sin_yaw
         lateral = -dx * sin_yaw + dy * cos_yaw
-        return (
-            longitudinal < 0.0
-            and abs(lateral)
-            <= self.config.rear_follow_lateral_tolerance
+        if longitudinal >= 0.0:
+            return False
+        if abs(lateral) <= self.config.rear_follow_lateral_tolerance:
+            return True
+        if trajectory is None or not hasattr(trajectory, "d"):
+            return False
+        candidate_d = np.asarray(trajectory.d, dtype=float)
+        if candidate_d.size == 0 or not np.all(np.isfinite(candidate_d)):
+            return False
+        obstacle_d = _finite(obstacle.get("d"), float("nan"))
+        if not math.isfinite(obstacle_d):
+            return False
+        start_d = float(candidate_d[0])
+        obstacle_side = obstacle_d - start_d
+        if abs(obstacle_side) <= self.config.rear_follow_lateral_tolerance:
+            return False
+        # Positive means that some point of the candidate moves toward the
+        # adjacent rear car.  A small tolerance ignores replanning noise but
+        # keeps genuine lane changes collision-constrained.
+        toward_motion = float(
+            np.max(
+                math.copysign(1.0, obstacle_side)
+                * (candidate_d - start_d)
+            )
         )
+        return toward_motion <= 0.25
 
     def _rear_pressure(self, ego, obstacles):
         """Describe the most urgent non-yielding rear follower, if any."""
@@ -2771,6 +2820,8 @@ class StableController(object):
         dt,
         steering_feedback=None,
         path_lateral_offset=None,
+        path_reference_yaw=None,
+        path_reference_curvature=None,
         centerline_feedback=False,
     ):
         cfg = self.config
@@ -2795,8 +2846,8 @@ class StableController(object):
         # steering reversals.
         ref_yaw = float(trajectory.yaw[nearest])
         ref_kappa = float(trajectory.kappa[target])
-        heading_error = _wrap(ref_yaw - yaw)
-        lateral_error = (
+        local_heading_error = _wrap(ref_yaw - yaw)
+        local_lateral_error = (
             -math.sin(ref_yaw) * (x - nearest_x)
             + math.cos(ref_yaw) * (y - nearest_y)
         )
@@ -2805,8 +2856,10 @@ class StableController(object):
         stanley_gain = 0.75 if speed < 8.0 else 0.45
         front_stanley = (
             front_ff
-            + 0.70 * heading_error
-            - math.atan2(stanley_gain * lateral_error, speed + 1.5)
+            + 0.70 * local_heading_error
+            - math.atan2(
+                stanley_gain * local_lateral_error, speed + 1.5
+            )
         )
         centerline_front_feedback = 0.0
         global_offset = _finite(
@@ -2827,6 +2880,78 @@ class StableController(object):
             2.0 * cfg.controller_wheelbase * math.sin(alpha), max(lookahead, 0.5)
         )
         front_angle = 0.55 * front_stanley + 0.45 * front_pure_pursuit
+        global_reference_yaw = _finite(
+            path_reference_yaw, float("nan")
+        )
+        global_reference_curvature = _finite(
+            path_reference_curvature, float("nan")
+        )
+        centerline_control_active = bool(
+            centerline_feedback
+            and speed >= 2.0
+            and math.isfinite(global_offset)
+            and math.isfinite(global_reference_yaw)
+            and math.isfinite(global_reference_curvature)
+        )
+        global_heading_error = float("nan")
+        estimated_path_lateral_speed = float("nan")
+        centerline_lat_accel_ff = float("nan")
+        centerline_lat_accel_feedback = float("nan")
+        centerline_lat_accel_command = float("nan")
+        heading_error = local_heading_error
+        lateral_error = local_lateral_error
+        if centerline_control_active:
+            # d is positive to the left of the route.  With heading_error
+            # defined as path_yaw - ego_yaw, d_dot is -v*sin(error).
+            global_heading_error = _wrap(
+                global_reference_yaw - yaw
+            )
+            estimated_path_lateral_speed = (
+                -speed * math.sin(global_heading_error)
+            )
+            omega = cfg.centerline_natural_frequency
+            damping = cfg.centerline_damping_ratio
+            centerline_lat_accel_ff = (
+                speed * speed * global_reference_curvature
+            )
+            centerline_lat_accel_feedback = (
+                -cfg.centerline_feedback_gain
+                * omega
+                * omega
+                * global_offset
+                - 2.0
+                * damping
+                * omega
+                * estimated_path_lateral_speed
+            )
+            lateral_accel_limit = max(
+                0.05, cfg.max_lateral_accel
+            )
+            if math.isfinite(cfg.max_yaw_rate):
+                lateral_accel_limit = min(
+                    lateral_accel_limit,
+                    max(0.05, speed * cfg.max_yaw_rate),
+                )
+            centerline_lat_accel_command = _clip(
+                centerline_lat_accel_ff
+                + centerline_lat_accel_feedback,
+                -lateral_accel_limit,
+                lateral_accel_limit,
+            )
+            front_angle = math.atan2(
+                centerline_lat_accel_command
+                * cfg.controller_wheelbase,
+                max(speed * speed, EPS),
+            )
+            centerline_front_feedback = (
+                front_angle
+                - math.atan(
+                    cfg.controller_wheelbase
+                    * global_reference_curvature
+                )
+            )
+            heading_error = global_heading_error
+            lateral_error = global_offset
         model_front_angle_deg = math.degrees(front_angle)
         raw_wheel = (
             cfg.steering_command_sign
@@ -2907,12 +3032,36 @@ class StableController(object):
                 "reference_curvature": ref_kappa,
                 "heading_error": heading_error,
                 "lateral_error": lateral_error,
+                "local_heading_error": local_heading_error,
+                "local_lateral_error": local_lateral_error,
                 "front_feedforward": front_ff,
                 "front_stanley": front_stanley,
                 "centerline_front_feedback": (
                     centerline_front_feedback
                 ),
                 "front_pure_pursuit": front_pure_pursuit,
+                "centerline_control_active": (
+                    centerline_control_active
+                ),
+                "global_reference_yaw": (
+                    global_reference_yaw
+                ),
+                "global_reference_curvature": (
+                    global_reference_curvature
+                ),
+                "global_heading_error": global_heading_error,
+                "estimated_path_lateral_speed": (
+                    estimated_path_lateral_speed
+                ),
+                "centerline_lat_accel_ff": (
+                    centerline_lat_accel_ff
+                ),
+                "centerline_lat_accel_feedback": (
+                    centerline_lat_accel_feedback
+                ),
+                "centerline_lat_accel_command": (
+                    centerline_lat_accel_command
+                ),
                 "model_front_angle_deg": model_front_angle_deg,
                 "steering_command_sign": cfg.steering_command_sign,
                 "raw_steer": raw_wheel,
@@ -3080,6 +3229,8 @@ class StableController(object):
         dt,
         steering_feedback=None,
         path_lateral_offset=None,
+        path_reference_yaw=None,
+        path_reference_curvature=None,
     ):
         self.last_debug = {}
         dt = _clip(_finite(dt, 0.05), 0.01, 0.25)
@@ -3125,11 +3276,24 @@ class StableController(object):
             _finite(getattr(ego, "x", 0.0)),
             _finite(getattr(ego, "y", 0.0)),
         )
-        trajectory_comfort_speed_cap = (
-            self._trajectory_comfort_speed_limit(
-                trajectory, nearest, target_speed
-            )
+        behavior = str(getattr(plan_result, "behavior", ""))
+        centerline_tracking = behavior in (
+            "KEEP_LANE", "RECOVER", "FOLLOW"
         )
+        # RECOVER is rebuilt from the current Frenet state every plan cycle.
+        # Its temporary S bend is a control reference, not road geometry.
+        # Applying a comfort curvature limit to that bend caused unexplained
+        # braking on a straight global route.  Global-route curve speed is
+        # already applied by RuleBasedPlanner._curve_speed_limit().
+        trajectory_comfort_cap_applied = not centerline_tracking
+        if trajectory_comfort_cap_applied:
+            trajectory_comfort_speed_cap = (
+                self._trajectory_comfort_speed_limit(
+                    trajectory, nearest, target_speed
+                )
+            )
+        else:
+            trajectory_comfort_speed_cap = target_speed
         target_speed = min(
             target_speed, trajectory_comfort_speed_cap
         )
@@ -3139,10 +3303,9 @@ class StableController(object):
             dt,
             steering_feedback=steering_feedback,
             path_lateral_offset=path_lateral_offset,
-            centerline_feedback=(
-                str(getattr(plan_result, "behavior", ""))
-                in ("KEEP_LANE", "RECOVER", "FOLLOW")
-            ),
+            path_reference_yaw=path_reference_yaw,
+            path_reference_curvature=path_reference_curvature,
+            centerline_feedback=centerline_tracking,
         )
         # Do not continue accelerating while the vehicle is no longer aligned
         # with the selected trajectory.  This is the last-resort stability
@@ -3215,6 +3378,9 @@ class StableController(object):
                 "preview_target_speed": target_speed,
                 "trajectory_comfort_speed_cap": (
                     trajectory_comfort_speed_cap
+                ),
+                "trajectory_comfort_cap_applied": (
+                    trajectory_comfort_cap_applied
                 ),
                 "alignment_speed_cap": alignment_speed_cap,
                 "strict_alignment_speed_guard": (

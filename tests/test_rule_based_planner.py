@@ -845,6 +845,36 @@ class RulePlannerTest(unittest.TestCase):
             )
         )
 
+    def test_adjacent_rear_vehicle_only_blocks_merge_toward_it(self):
+        planner = RuleBasedPlanner()
+        planner.plan(
+            ego(speed=5.0), [], straight_path(), "intersection.xodr"
+        )
+        prepared = planner._prepare_obstacles(
+            [obstacle(-10.0, y=4.9, speed=20.0)]
+        )[0]
+        current_ego = planner._ego_values(ego(speed=5.0), 0.0)
+        keep = self._straight_trajectory(speed=5.0)
+        self.assertTrue(
+            planner._is_non_blocking_rear_follower(
+                current_ego, prepared, trajectory=keep
+            )
+        )
+
+        merge = self._straight_trajectory(speed=5.0)
+        merge.d = np.array([0.0, 2.5, 4.9])
+        merge.y = merge.d.copy()
+        self.assertFalse(
+            planner._is_non_blocking_rear_follower(
+                current_ego, prepared, trajectory=merge
+            )
+        )
+        self.assertFalse(
+            planner._collision_free(
+                merge, current_ego, [prepared]
+            )
+        )
+
     def test_same_lane_replay_rear_does_not_stop_clear_ego(self):
         planner = RuleBasedPlanner()
         rear = obstacle(-6.0, y=-1.30, speed=4.0)
@@ -1003,6 +1033,75 @@ class RulePlannerTest(unittest.TestCase):
         self.assertLess(abs(current_ego.y), 0.05)
         self.assertLess(maximum_lateral_error, 0.5)
 
+    def test_global_centerline_control_is_damped_at_high_speed(self):
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        controller = StableController(config)
+        count = 1001
+        zeros = np.zeros(count)
+        trajectory = Trajectory(
+            t=np.linspace(0.0, 20.0, count),
+            s=np.linspace(0.0, 500.0, count),
+            d=zeros,
+            speed=np.full(count, 25.0),
+            accel=zeros,
+            d_speed=zeros,
+            d_accel=zeros,
+            d_jerk=zeros,
+        )
+        trajectory.x = np.linspace(0.0, 500.0, count)
+        trajectory.y = zeros.copy()
+        trajectory.yaw = zeros.copy()
+        trajectory.kappa = zeros.copy()
+        result = PlanResult(
+            trajectory=trajectory,
+            target_speed=25.0,
+            behavior="RECOVER",
+        )
+        current_ego = ego(y=1.0, speed=20.0)
+        current_ego.theta = math.radians(1.5)
+        actual_steer = 0.0
+        offsets = []
+
+        for _ in range(300):
+            command = controller.control(
+                current_ego,
+                result,
+                0.05,
+                steering_feedback=actual_steer,
+                path_lateral_offset=current_ego.y,
+                path_reference_yaw=0.0,
+                path_reference_curvature=0.0,
+            )
+            actual_steer += (
+                (command.steer - actual_steer) / 0.15 * 0.05
+            )
+            front_angle = math.radians(actual_steer)
+            current_ego.theta += (
+                current_ego.speed
+                / config.controller_wheelbase
+                * math.tan(front_angle)
+                * 0.05
+            )
+            current_ego.x += (
+                current_ego.speed
+                * math.cos(current_ego.theta)
+                * 0.05
+            )
+            current_ego.y += (
+                current_ego.speed
+                * math.sin(current_ego.theta)
+                * 0.05
+            )
+            offsets.append(current_ego.y)
+
+        self.assertTrue(
+            controller.last_debug["centerline_control_active"]
+        )
+        self.assertLess(abs(offsets[-1]), 0.01)
+        self.assertLess(max(offsets), 1.50)
+        self.assertTrue(all(value > 0.0 for value in offsets))
+
     def test_stationary_emergency_does_not_leave_negative_acceleration(self):
         controller = StableController()
         stopped_ego = ego(speed=0.0)
@@ -1158,10 +1257,34 @@ class RulePlannerTest(unittest.TestCase):
             abs(controller.last_debug["estimated_yaw_rate"]),
             0.5 + 1e-6,
         )
-        self.assertLess(
+        self.assertFalse(
             controller.last_debug[
-                "trajectory_comfort_speed_cap"
-            ],
+                "trajectory_comfort_cap_applied"
+            ]
+        )
+        self.assertEqual(
+            controller.last_debug["trajectory_comfort_speed_cap"],
+            40.0,
+        )
+
+        avoid_result = PlanResult(
+            trajectory=trajectory,
+            target_speed=40.0,
+            behavior="AVOID_LEFT",
+        )
+        controller.control(
+            ego(speed=40.0),
+            avoid_result,
+            0.1,
+            path_lateral_offset=0.0,
+        )
+        self.assertTrue(
+            controller.last_debug[
+                "trajectory_comfort_cap_applied"
+            ]
+        )
+        self.assertLess(
+            controller.last_debug["trajectory_comfort_speed_cap"],
             40.0,
         )
 
