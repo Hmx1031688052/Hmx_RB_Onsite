@@ -324,7 +324,7 @@ class PlannerConfig(object):
             0.5,
             float(
                 os.environ.get(
-                    "RULE_MAX_TRACKING_LAT_ACCEL", "2.5"
+                    "RULE_MAX_TRACKING_LAT_ACCEL", "4.0"
                 )
             ),
         )

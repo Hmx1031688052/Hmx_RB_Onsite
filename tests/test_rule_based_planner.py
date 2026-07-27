@@ -644,6 +644,35 @@ class RulePlannerTest(unittest.TestCase):
             planner.last_debug["speed_limits"]["stop_at_goal"]
         )
 
+    def test_mt05_continues_past_endpoint_without_hidden_braking(self):
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        planner = RuleBasedPlanner(config)
+        current_ego = ego(x=123.0, speed=5.0)
+        result = planner.plan(
+            current_ego,
+            [],
+            straight_path(),
+            "MT_05-intersection.xodr",
+        )
+        projection = planner.reference.project(
+            current_ego.x, current_ego.y
+        )
+        command = StableController(config).control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+
+        self.assertFalse(result.emergency)
+        self.assertGreaterEqual(result.target_speed, 5.0)
+        self.assertGreater(command.speed, 5.0)
+        self.assertGreater(command.acc, 0.0)
+        self.assertGreater(float(result.trajectory.x[-1]), 123.0)
+
     def test_endpoint_stop_can_be_restored(self):
         config = PlannerConfig()
         config.stop_at_goal = True
@@ -1333,6 +1362,107 @@ class RulePlannerTest(unittest.TestCase):
         self.assertLessEqual(
             controller.last_debug["active_lateral_accel_limit"],
             config.max_tracking_lateral_accel,
+        )
+
+    def test_mt05_fast_curve_keeps_tracking_correction_reserve(self):
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        controller = StableController(config)
+        curvature = 0.049
+        curve_budget = (
+            config.map_curve_lateral_accel_overrides[
+                "mt_05-intersection.xodr"
+            ]
+        )
+        speed = math.sqrt(curve_budget / curvature)
+        stations = np.linspace(0.0, 80.0, 1601)
+        angles = curvature * stations
+        zeros = np.zeros_like(stations)
+        trajectory = Trajectory(
+            t=stations / speed,
+            s=stations,
+            d=zeros,
+            speed=np.full_like(stations, speed),
+            accel=zeros,
+            d_speed=zeros,
+            d_accel=zeros,
+            d_jerk=zeros,
+        )
+        trajectory.x = np.sin(angles) / curvature
+        trajectory.y = (
+            1.0 - np.cos(angles)
+        ) / curvature
+        trajectory.yaw = angles
+        trajectory.kappa = np.full_like(
+            stations, curvature
+        )
+        result = PlanResult(
+            trajectory=trajectory,
+            target_speed=speed,
+            behavior="RECOVER",
+        )
+        current_ego = ego(y=0.685, speed=speed)
+        current_ego.theta = math.radians(-1.4)
+        actual_steer = 0.0
+        offsets = []
+
+        for _ in range(140):
+            nearest = int(
+                np.argmin(
+                    (trajectory.x - current_ego.x) ** 2
+                    + (trajectory.y - current_ego.y) ** 2
+                )
+            )
+            dx = current_ego.x - trajectory.x[nearest]
+            dy = current_ego.y - trajectory.y[nearest]
+            path_yaw = trajectory.yaw[nearest]
+            offset = (
+                -math.sin(path_yaw) * dx
+                + math.cos(path_yaw) * dy
+            )
+            command = controller.control(
+                current_ego,
+                result,
+                0.05,
+                steering_feedback=actual_steer,
+                path_lateral_offset=offset,
+                path_reference_yaw=path_yaw,
+                path_reference_curvature=curvature,
+            )
+            actual_steer += (
+                (command.steer - actual_steer) / 0.15 * 0.05
+            )
+            front_angle = math.radians(
+                actual_steer / config.steering_ratio
+            )
+            current_ego.theta += (
+                current_ego.speed
+                / config.controller_wheelbase
+                * math.tan(front_angle)
+                * 0.05
+            )
+            current_ego.x += (
+                current_ego.speed
+                * math.cos(current_ego.theta)
+                * 0.05
+            )
+            current_ego.y += (
+                current_ego.speed
+                * math.sin(current_ego.theta)
+                * 0.05
+            )
+            offsets.append(offset)
+
+        self.assertGreater(
+            config.max_tracking_lateral_accel,
+            curve_budget,
+        )
+        self.assertLess(max(abs(value) for value in offsets), 0.75)
+        self.assertLess(abs(offsets[-1]), 0.10)
+        self.assertTrue(
+            math.isinf(
+                controller.last_debug["alignment_speed_cap"]
+            )
         )
 
     def test_cam6_steering_ratio_tracks_logged_merge_curve(self):
