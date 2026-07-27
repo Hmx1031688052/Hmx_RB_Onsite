@@ -412,6 +412,27 @@ class PlannerConfig(object):
                 )
             ),
         )
+        # The control loop runs faster than DriveSim's chassis consumer.  A
+        # single 20 ms publication can therefore be overwritten by the next
+        # zero-acceleration command before the simulator samples it.  Repeat
+        # the same logical pulse for at least one chassis sampling interval
+        # and stop it as soon as INS confirms that the vehicle moved.
+        self.sprint_pulse_min_duration = max(
+            0.01,
+            float(
+                os.environ.get(
+                    "RULE_SPRINT_PULSE_MIN_DURATION", "0.08"
+                )
+            ),
+        )
+        self.sprint_pulse_ack_speed = max(
+            0.01,
+            float(
+                os.environ.get(
+                    "RULE_SPRINT_PULSE_ACK_SPEED", "0.10"
+                )
+            ),
+        )
         # The direct-goal route begins with the current vehicle heading.
         # Keep its steering authority deliberately small: a 42 degree wheel
         # command at 30 m/s makes the kinematic chassis unrecoverable.
@@ -588,6 +609,8 @@ class PlannerConfig(object):
         speed=None,
         accel=None,
         alignment_duration=None,
+        pulse_min_duration=None,
+        pulse_ack_speed=None,
         max_steer_deg=None,
         steer_rate_deg_s=None,
         recovery_heading_deg=None,
@@ -613,6 +636,14 @@ class PlannerConfig(object):
         if alignment_duration is not None:
             self.sprint_alignment_duration = max(
                 0.0, float(alignment_duration)
+            )
+        if pulse_min_duration is not None:
+            self.sprint_pulse_min_duration = max(
+                0.01, float(pulse_min_duration)
+            )
+        if pulse_ack_speed is not None:
+            self.sprint_pulse_ack_speed = max(
+                0.01, float(pulse_ack_speed)
             )
         if max_steer_deg is not None:
             self.sprint_max_steer_deg = _clip(
@@ -3444,8 +3475,11 @@ class StableController(object):
         self.last_abs_path_offset = None
         self.path_divergence_count = 0
         self.sprint_elapsed = 0.0
+        self.sprint_pulse_elapsed = 0.0
         self.sprint_pulse_sent = False
+        self.sprint_pulse_acknowledged = False
         self.sprint_phase = "INACTIVE"
+        self.last_reported_sprint_phase = "INACTIVE"
         self.last_debug = {}
 
     def reset(self):
@@ -3457,8 +3491,11 @@ class StableController(object):
         self.last_abs_path_offset = None
         self.path_divergence_count = 0
         self.sprint_elapsed = 0.0
+        self.sprint_pulse_elapsed = 0.0
         self.sprint_pulse_sent = False
+        self.sprint_pulse_acknowledged = False
         self.sprint_phase = "INACTIVE"
+        self.last_reported_sprint_phase = "INACTIVE"
         self.last_debug = {}
 
     def _steering_limit(self, speed, lateral_accel_limit=None):
@@ -4164,8 +4201,11 @@ class StableController(object):
         sprint_mode = behavior == "SPRINT"
         if not sprint_mode:
             self.sprint_elapsed = 0.0
+            self.sprint_pulse_elapsed = 0.0
             self.sprint_pulse_sent = False
+            self.sprint_pulse_acknowledged = False
             self.sprint_phase = "INACTIVE"
+            self.last_reported_sprint_phase = "INACTIVE"
         centerline_tracking = behavior in (
             "KEEP_LANE",
             "RECOVER",
@@ -4271,7 +4311,8 @@ class StableController(object):
         ):
             # Sprint is an explicit three-stage state machine:
             # 1. hold speed/acceleration at zero while steering aligns;
-            # 2. emit exactly one acceleration frame;
+            # 2. publish one logical acceleration pulse until a chassis-rate
+            #    sampling window has elapsed and INS confirms motion;
             # 3. coast with acceleration fixed at zero for the session.
             if (
                 self.sprint_elapsed
@@ -4285,10 +4326,21 @@ class StableController(object):
                 target_speed = 0.0
                 planned_accel = 0.0
                 acc = 0.0
-            elif not self.sprint_pulse_sent:
+            elif not self.sprint_pulse_acknowledged:
                 self.sprint_phase = "PULSE"
                 self.sprint_pulse_sent = True
-                acc = self.config.sprint_accel
+                self.sprint_pulse_elapsed += dt
+                if (
+                    self.sprint_pulse_elapsed
+                    >= self.config.sprint_pulse_min_duration - EPS
+                    and ego_speed
+                    >= self.config.sprint_pulse_ack_speed
+                ):
+                    self.sprint_pulse_acknowledged = True
+                    self.sprint_phase = "COAST"
+                    acc = 0.0
+                else:
+                    acc = self.config.sprint_accel
             else:
                 self.sprint_phase = "COAST"
                 acc = 0.0
@@ -4307,6 +4359,18 @@ class StableController(object):
                         self.config.sprint_alignment_duration
                     ),
                     "sprint_pulse_sent": self.sprint_pulse_sent,
+                    "sprint_pulse_elapsed": (
+                        self.sprint_pulse_elapsed
+                    ),
+                    "sprint_pulse_min_duration": (
+                        self.config.sprint_pulse_min_duration
+                    ),
+                    "sprint_pulse_ack_speed": (
+                        self.config.sprint_pulse_ack_speed
+                    ),
+                    "sprint_pulse_acknowledged": (
+                        self.sprint_pulse_acknowledged
+                    ),
                     "sprint_accel_pulse_active": (
                         self.sprint_phase == "PULSE"
                     ),
@@ -4358,9 +4422,46 @@ class StableController(object):
                     self.config.sprint_alignment_duration
                 ),
                 "sprint_pulse_sent": self.sprint_pulse_sent,
+                "sprint_pulse_elapsed": self.sprint_pulse_elapsed,
+                "sprint_pulse_min_duration": (
+                    self.config.sprint_pulse_min_duration
+                ),
+                "sprint_pulse_ack_speed": (
+                    self.config.sprint_pulse_ack_speed
+                ),
+                "sprint_pulse_acknowledged": (
+                    self.sprint_pulse_acknowledged
+                ),
                 "sprint_recovery_active": sprint_recovery_active,
                 "output_acc": acc,
                 "output_steer": steer,
             }
         )
+        if (
+            sprint_mode
+            and self.sprint_phase
+            != self.last_reported_sprint_phase
+        ):
+            self.last_reported_sprint_phase = self.sprint_phase
+            print(
+                "[sprint-control] "
+                "phase={} elapsed={:.3f}/{:.3f}s "
+                "ego_v={:.3f}m/s target_v={:.3f}m/s "
+                "acc={:.3f}m/s2 steer={:.3f}deg "
+                "dt={:.3f}s pulse={:.3f}/{:.3f}s "
+                "pulse_sent={} pulse_ack={}".format(
+                    self.sprint_phase,
+                    self.sprint_elapsed,
+                    self.config.sprint_alignment_duration,
+                    ego_speed,
+                    target_speed,
+                    acc,
+                    steer,
+                    dt,
+                    self.sprint_pulse_elapsed,
+                    self.config.sprint_pulse_min_duration,
+                    self.sprint_pulse_sent,
+                    self.sprint_pulse_acknowledged,
+                )
+            )
         return ControlOutput(acc, target_speed, steer)

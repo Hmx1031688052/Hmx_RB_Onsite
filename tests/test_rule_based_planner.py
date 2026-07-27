@@ -396,7 +396,7 @@ class RulePlannerTest(unittest.TestCase):
         self.assertAlmostEqual(planner.reference.x[arc_end - 1], 10.0, places=2)
         self.assertAlmostEqual(planner.reference.y[arc_end - 1], -10.0, places=2)
 
-    def test_selected_map_sprint_aligns_then_pulses_one_frame_and_coasts(self):
+    def test_selected_map_sprint_waits_for_chassis_ack_then_coasts(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -448,6 +448,15 @@ class RulePlannerTest(unittest.TestCase):
             path_reference_yaw=projection["yaw"],
             path_reference_curvature=projection["kappa"],
         )
+        pulse_retry = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+        current_ego.speed = 0.2
         coast_1 = controller.control(
             current_ego,
             result,
@@ -475,6 +484,8 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertEqual(pulse.acc, config.sprint_accel)
         self.assertEqual(pulse.speed, config.sprint_speed)
+        self.assertEqual(pulse_retry.acc, config.sprint_accel)
+        self.assertEqual(pulse_retry.speed, config.sprint_speed)
         self.assertEqual(coast_1.acc, 0.0)
         self.assertEqual(coast_2.acc, 0.0)
         self.assertTrue(
@@ -485,6 +496,9 @@ class RulePlannerTest(unittest.TestCase):
         )
         self.assertTrue(
             controller.last_debug["sprint_pulse_sent"]
+        )
+        self.assertTrue(
+            controller.last_debug["sprint_pulse_acknowledged"]
         )
 
     def test_sprint_does_not_affect_unselected_maps(self):

@@ -213,7 +213,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-sprint-direct-fallback-v22"
+    "2026-07-27-sprint-chassis-ack-v24"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2467,6 +2467,10 @@ def get_pointcloud_msg():
             f"sprint_elapsed={float(controller_debug.get('sprint_elapsed', 0.0)):.3f}s "
             f"sprint_alignment_duration={float(controller_debug.get('sprint_alignment_duration', 0.0)):.3f}s "
             f"sprint_pulse_sent={bool(controller_debug.get('sprint_pulse_sent', False))} "
+            f"sprint_pulse_elapsed={float(controller_debug.get('sprint_pulse_elapsed', 0.0)):.3f}s "
+            f"sprint_pulse_min_duration={float(controller_debug.get('sprint_pulse_min_duration', 0.0)):.3f}s "
+            f"sprint_pulse_ack_speed={float(controller_debug.get('sprint_pulse_ack_speed', 0.0)):.3f}m/s "
+            f"sprint_pulse_ack={bool(controller_debug.get('sprint_pulse_acknowledged', False))} "
             f"sprint_pulse={bool(controller_debug.get('sprint_accel_pulse_active', False))} "
             f"sprint_recovery={bool(controller_debug.get('sprint_recovery_active', False))} "
             f"roundabout_mode={controller_debug.get('roundabout_mode', 'off')} "
@@ -3399,6 +3403,27 @@ if __name__ == "__main__":
         ),
     )
     arg_parser.add_argument(
+        "--sprint_pulse_min_duration",
+        "--sprint-pulse-min-duration",
+        dest="sprint_pulse_min_duration",
+        type=float,
+        default=None,
+        help=(
+            "minimum time to republish the logical sprint pulse so the "
+            "chassis consumes it, seconds"
+        ),
+    )
+    arg_parser.add_argument(
+        "--sprint_pulse_ack_speed",
+        "--sprint-pulse-ack-speed",
+        dest="sprint_pulse_ack_speed",
+        type=float,
+        default=None,
+        help=(
+            "INS speed that acknowledges sprint pulse consumption, m/s"
+        ),
+    )
+    arg_parser.add_argument(
         "--sprint_max_steer_deg",
         "--sprint-max-steer-deg",
         dest="sprint_max_steer_deg",
@@ -3868,6 +3893,8 @@ if __name__ == "__main__":
     for sprint_name in (
         "sprint_speed",
         "sprint_accel",
+        "sprint_pulse_min_duration",
+        "sprint_pulse_ack_speed",
         "sprint_max_steer_deg",
     ):
         sprint_value = getattr(args, sprint_name)
@@ -4209,6 +4236,8 @@ if __name__ == "__main__":
         speed=args.sprint_speed,
         accel=args.sprint_accel,
         alignment_duration=args.sprint_alignment_duration,
+        pulse_min_duration=args.sprint_pulse_min_duration,
+        pulse_ack_speed=args.sprint_pulse_ack_speed,
         max_steer_deg=args.sprint_max_steer_deg,
         recovery_speed=args.sprint_recovery_speed,
         ignore_obstacles=args.sprint_ignore_obstacles,
@@ -4260,6 +4289,10 @@ if __name__ == "__main__":
         f"sprint_accel={planner_config.sprint_accel:.3f}m/s2 "
         f"sprint_alignment_duration="
         f"{planner_config.sprint_alignment_duration:.3f}s "
+        f"sprint_pulse_min_duration="
+        f"{planner_config.sprint_pulse_min_duration:.3f}s "
+        f"sprint_pulse_ack_speed="
+        f"{planner_config.sprint_pulse_ack_speed:.3f}m/s "
         f"sprint_steer_cap="
         f"{planner_config.sprint_max_steer_deg:.3f}deg "
         f"sprint_recovery_speed="
