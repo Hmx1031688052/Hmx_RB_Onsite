@@ -200,7 +200,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-damped-global-tracking-v6"
+    "2026-07-27-manual-scenario-override-v8"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -1764,6 +1764,13 @@ def get_prepare():
                             rule_planner.config
                             .centerline_damping_ratio
                         ),
+                        "steering_ratio": (
+                            rule_planner.config.steering_ratio
+                        ),
+                        "scenario_overrides_path": (
+                            rule_planner.config
+                            .scenario_overrides_path
+                        ),
                         "centerline_safety_stop_enabled": (
                             rule_planner.config
                             .centerline_safety_stop_enabled
@@ -2134,6 +2141,11 @@ def get_pointcloud_msg():
                 f"respect_path_cap={bool(speed_limit_debug.get('respect_path_speed_limit', False))} "
                 f"stop_at_goal={bool(speed_limit_debug.get('stop_at_goal', False))} "
                 f"expected_speed_source={speed_limit_debug.get('expected_speed_source', 'unknown')} "
+                f"manual_control={bool(planner_debug.get('manual_control_active', False))} "
+                f"manual_rule={planner_debug.get('manual_override_name')} "
+                f"manual_target_d={float(planner_debug.get('manual_target_d') if planner_debug.get('manual_target_d') is not None else float('nan')):.3f}m "
+                f"manual_target_v={float(planner_debug.get('manual_target_speed_mps') if planner_debug.get('manual_target_speed_mps') is not None else float('nan')):.3f}m/s "
+                f"collision_bypass={bool(planner_debug.get('manual_collision_bypass', False))} "
                 f"remaining={float(planner_debug.get('remaining', float('nan'))):.3f}m "
                 f"obstacles_raw={int(planner_debug.get('raw_obstacle_count', 0))} "
                 f"obstacles_used={int(planner_debug.get('planning_obstacle_count', 0))} "
@@ -2214,6 +2226,18 @@ def get_pointcloud_msg():
     last_control_wall_time = now
     current_planner_debug = getattr(rule_planner, "last_debug", {}) or {}
     current_projection_debug = current_planner_debug.get("projection") or {}
+    actual_path_lateral_offset = current_projection_debug.get("d")
+    manual_target_d = current_planner_debug.get("manual_target_d")
+    control_path_lateral_error = actual_path_lateral_offset
+    if (
+        current_planner_debug.get("manual_control_active", False)
+        and actual_path_lateral_offset is not None
+        and manual_target_d is not None
+    ):
+        control_path_lateral_error = (
+            float(actual_path_lateral_offset)
+            - float(manual_target_d)
+        )
     control_started = time.monotonic()
     command = stable_controller.control(
         model.ego,
@@ -2224,11 +2248,29 @@ def get_pointcloud_msg():
             "steering_wheel_angle",
             None,
         ),
-        path_lateral_offset=current_projection_debug.get("d"),
+        path_lateral_offset=control_path_lateral_error,
         path_reference_yaw=current_projection_debug.get("yaw"),
         path_reference_curvature=current_projection_debug.get(
             "kappa"
         ),
+    )
+    stable_controller.last_debug.update(
+        {
+            "actual_path_lateral_offset": (
+                actual_path_lateral_offset
+            ),
+            "manual_target_d": manual_target_d,
+            "manual_control_active": bool(
+                current_planner_debug.get(
+                    "manual_control_active", False
+                )
+            ),
+            "manual_collision_bypass": bool(
+                current_planner_debug.get(
+                    "manual_collision_bypass", False
+                )
+            ),
+        }
     )
     gt_startup_age = (
         float("inf")
@@ -2244,6 +2286,11 @@ def get_pointcloud_msg():
         PERCEPTION_SOURCE == "gt"
         and not gt_ready
         and not gt_startup_grace_active
+        and not bool(
+            current_planner_debug.get(
+                "manual_control_active", False
+            )
+        )
     )
     if gt_failsafe_applied:
         command.acc = -float(rule_planner.config.max_decel)
@@ -2288,6 +2335,10 @@ def get_pointcloud_msg():
             f"alignment_speed_cap={float(controller_debug.get('alignment_speed_cap', float('nan'))):.3f}m/s "
             f"strict_alignment_guard={bool(controller_debug.get('strict_alignment_speed_guard', False))} "
             f"path_d={float(controller_debug.get('path_lateral_offset', float('nan'))):.3f}m "
+            f"actual_path_d={float(controller_debug.get('actual_path_lateral_offset') if controller_debug.get('actual_path_lateral_offset') is not None else float('nan')):.3f}m "
+            f"manual_target_d={float(controller_debug.get('manual_target_d') if controller_debug.get('manual_target_d') is not None else float('nan')):.3f}m "
+            f"manual_control={bool(controller_debug.get('manual_control_active', False))} "
+            f"collision_bypass={bool(controller_debug.get('manual_collision_bypass', False))} "
             f"centerline_control={bool(controller_debug.get('centerline_control_active', False))} "
             f"global_heading_error={math.degrees(float(controller_debug.get('global_heading_error', float('nan')))):.3f}deg "
             f"path_d_speed={float(controller_debug.get('estimated_path_lateral_speed', float('nan'))):.3f}m/s "
@@ -2789,6 +2840,23 @@ if __name__ == "__main__":
         help="persistent XODR and parsed global-route cache directory",
     )
     arg_parser.add_argument(
+        "--scenario_overrides",
+        "--scenario-overrides",
+        dest="scenario_overrides",
+        type=str,
+        default=os.environ.get(
+            "RULE_SCENARIO_OVERRIDES",
+            os.path.join(
+                os.path.dirname(__file__),
+                "scenario_overrides.json",
+            ),
+        ),
+        help=(
+            "JSON file containing enabled per-map/per-s manual d/v "
+            "overrides; active rules bypass planning collision checks"
+        ),
+    )
+    arg_parser.add_argument(
         "--no_route_cache",
         "--no-route-cache",
         dest="no_route_cache",
@@ -2998,6 +3066,17 @@ if __name__ == "__main__":
         default=None,
         help=(
             "global-path lateral damping ratio; 1.0 is critically damped"
+        ),
+    )
+    arg_parser.add_argument(
+        "--steering_ratio",
+        "--steering-ratio",
+        dest="steering_ratio",
+        type=float,
+        default=None,
+        help=(
+            "DriveSim steering-wheel command to effective front-wheel "
+            "angle ratio; Cam6 default is 1.65"
         ),
     )
     arg_parser.add_argument(
@@ -3324,6 +3403,13 @@ if __name__ == "__main__":
             "--centerline_damping_ratio must be between 0.40 and 3.00"
         )
     if (
+        args.steering_ratio is not None
+        and not 0.50 <= args.steering_ratio <= 30.00
+    ):
+        arg_parser.error(
+            "--steering_ratio must be between 0.50 and 30.00"
+        )
+    if (
         args.curve_speed_factor is not None
         and not 0.1 <= args.curve_speed_factor <= 5.0
     ):
@@ -3590,6 +3676,9 @@ if __name__ == "__main__":
         f"dir={os.path.abspath(args.route_cache_dir)}"
     )
     planner_config = PlannerConfig()
+    planner_config.scenario_overrides_path = os.path.abspath(
+        os.path.expanduser(args.scenario_overrides)
+    )
     if args.comfort_mode:
         # Apply the scoring profile first; explicit command-line dynamics
         # below remain valid expert overrides.
@@ -3647,6 +3736,10 @@ if __name__ == "__main__":
     if args.centerline_damping_ratio is not None:
         planner_config.centerline_damping_ratio = float(
             args.centerline_damping_ratio
+        )
+    if args.steering_ratio is not None:
+        planner_config.steering_ratio = float(
+            args.steering_ratio
         )
     if args.enable_centerline_safety_stop:
         planner_config.centerline_safety_stop_enabled = True
@@ -3722,6 +3815,9 @@ if __name__ == "__main__":
         f"{planner_config.centerline_natural_frequency:.3f}rad/s "
         f"centerline_damping_ratio="
         f"{planner_config.centerline_damping_ratio:.3f} "
+        f"steering_ratio={planner_config.steering_ratio:.3f} "
+        f"scenario_overrides="
+        f"{planner_config.scenario_overrides_path} "
         f"centerline_safety_stop_enabled="
         f"{planner_config.centerline_safety_stop_enabled} "
         f"follow_time_headway={planner_config.time_headway:.3f}s "

@@ -18,6 +18,8 @@ lane changes.  Without explicit map road boundaries it stays inside a
 configurable corridor around the global path and stops if no safe path exists.
 """
 
+import fnmatch
+import json
 import math
 import os
 import time
@@ -118,6 +120,13 @@ class PlannerConfig(object):
         )
         self.ignore_obstacles = (
             os.environ.get("RULE_IGNORE_OBSTACLES", "0") == "1"
+        )
+        self.scenario_overrides_path = os.environ.get(
+            "RULE_SCENARIO_OVERRIDES",
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "scenario_overrides.json",
+            ),
         )
         self.max_decel = float(
             os.environ.get("RULE_MAX_DECEL", "15.5")
@@ -365,11 +374,14 @@ class PlannerConfig(object):
             os.environ.get("RULE_WHEELBASE_M", "3.38")
         )
         self.steering_ratio = float(
-            # The kinematic chassis consumes the angle directly even though
-            # the protobuf field is named steering_wheel_angle.  Multiplying
-            # by a passenger-car steering ratio made every small heading
-            # correction saturate at 42 degrees.
-            os.environ.get("RULE_STEERING_RATIO", "1.0")
+            # Cam6's DriveSim kinematic chassis does not consume
+            # ``steering_wheel_angle`` as a 1:1 front-wheel angle.  Replaying
+            # steady portions of INS yaw, speed, and steering feedback gives
+            # an effective ratio of about 1.6--1.8.  Using 1.0 made the
+            # comfort limiter believe it commanded 0.5 m/s^2 while the
+            # chassis produced only about 0.3 m/s^2, so the ego drifted
+            # monotonically outside a bend.
+            os.environ.get("RULE_STEERING_RATIO", "1.65")
         )
         self.steering_command_sign = -1.0 if float(
             # DriveSim's kinematic chassis uses the same sign as the model
@@ -683,6 +695,12 @@ class RuleBasedPlanner(object):
         self.avoidance_obstacle_id = None
         self.avoidance_origin_d = None
         self._last_speed_limit_debug = {}
+        self._scenario_override_mtime_ns = None
+        self._scenario_override_rules = []
+        self._scenario_override_error = ""
+        self._active_manual_override = None
+        self._active_manual_override_key = None
+        self._load_scenario_overrides(force=True)
 
     def reset(self, map_name=""):
         self.reference = ReferencePath()
@@ -695,6 +713,166 @@ class RuleBasedPlanner(object):
         self.avoidance_obstacle_id = None
         self.avoidance_origin_d = None
         self._last_speed_limit_debug = {}
+        self._active_manual_override = None
+        self._active_manual_override_key = None
+
+    def _load_scenario_overrides(self, force=False):
+        """Load enabled manual-control rules and support live JSON edits."""
+        path = os.path.abspath(
+            os.path.expanduser(
+                str(self.config.scenario_overrides_path or "")
+            )
+        )
+        try:
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError as exc:
+            if force:
+                self._scenario_override_rules = []
+                self._scenario_override_error = str(exc)
+            return
+        if (
+            not force
+            and mtime_ns == self._scenario_override_mtime_ns
+        ):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                document = json.load(stream)
+            raw_rules = (
+                document.get("scenarios", [])
+                if isinstance(document, dict)
+                else document
+            )
+            if not isinstance(raw_rules, list):
+                raise ValueError("'scenarios' must be a list")
+            rules = []
+            for index, raw_rule in enumerate(raw_rules):
+                if (
+                    not isinstance(raw_rule, dict)
+                    or not bool(raw_rule.get("enabled", False))
+                ):
+                    continue
+                target_d = _finite(
+                    raw_rule.get("target_d"), float("nan")
+                )
+                if "target_speed_mps" in raw_rule:
+                    target_speed = _finite(
+                        raw_rule.get("target_speed_mps"),
+                        float("nan"),
+                    )
+                else:
+                    target_speed = (
+                        _finite(
+                            raw_rule.get("target_speed_kmh"),
+                            float("nan"),
+                        )
+                        / 3.6
+                    )
+                if (
+                    not math.isfinite(target_d)
+                    or not math.isfinite(target_speed)
+                    or target_speed < 0.0
+                ):
+                    raise ValueError(
+                        "enabled rule {} requires finite target_d and "
+                        "non-negative target_speed_mps or "
+                        "target_speed_kmh".format(index)
+                    )
+                s_start = _finite(
+                    raw_rule.get("s_start", -float("inf")),
+                    -float("inf"),
+                )
+                s_end = _finite(
+                    raw_rule.get("s_end", float("inf")),
+                    float("inf"),
+                )
+                if s_end < s_start:
+                    raise ValueError(
+                        "rule {} has s_end below s_start".format(index)
+                    )
+                rules.append(
+                    {
+                        "index": index,
+                        "name": str(
+                            raw_rule.get(
+                                "name", "manual-rule-{}".format(index)
+                            )
+                        ),
+                        "map": str(
+                            raw_rule.get("map", "*") or "*"
+                        ),
+                        "s_start": s_start,
+                        "s_end": s_end,
+                        "target_d": target_d,
+                        "target_speed_mps": target_speed,
+                        # Manual mode is intentionally unconditional per the
+                        # operator request: perceived obstacles remain
+                        # visible/logged, but cannot affect planning.
+                        "ignore_collisions": True,
+                    }
+                )
+            self._scenario_override_rules = rules
+            self._scenario_override_mtime_ns = mtime_ns
+            self._scenario_override_error = ""
+            print(
+                "[scenario-override] loaded "
+                "path={} enabled_rules={}".format(path, len(rules))
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._scenario_override_rules = []
+            self._scenario_override_mtime_ns = mtime_ns
+            self._scenario_override_error = str(exc)
+            print(
+                "[scenario-override][WARN] disabled path={} error={}".format(
+                    path, exc
+                )
+            )
+
+    def _match_scenario_override(self, projection):
+        self._load_scenario_overrides()
+        map_basename = os.path.basename(str(self.map_name or ""))
+        station = float(projection["s"])
+        matched = next(
+            (
+                dict(rule)
+                for rule in self._scenario_override_rules
+                if (
+                    fnmatch.fnmatchcase(map_basename, rule["map"])
+                    and rule["s_start"] <= station < rule["s_end"]
+                )
+            ),
+            None,
+        )
+        key = (
+            None
+            if matched is None
+            else (
+                matched["index"],
+                matched["name"],
+                map_basename,
+            )
+        )
+        if key != self._active_manual_override_key:
+            self._active_manual_override_key = key
+            if matched is None:
+                print("[scenario-override] inactive")
+            else:
+                print(
+                    "[scenario-override][UNSAFE] active "
+                    "name={} map={} s=[{:.3f},{:.3f}) "
+                    "target_d={:.3f}m target_v={:.3f}m/s "
+                    "collision_detection=BYPASSED".format(
+                        matched["name"],
+                        map_basename,
+                        matched["s_start"],
+                        matched["s_end"],
+                        matched["target_d"],
+                        matched["target_speed_mps"],
+                    )
+                )
+        self._active_manual_override = matched
+        return matched
 
     def _ego_values(self, ego, ego_lateral_speed):
         return {
@@ -1899,8 +2077,15 @@ class RuleBasedPlanner(object):
         self.avoidance_side = 0
         self.avoidance_obstacle_id = None
         self.avoidance_origin_d = None
+        manual_override = self._active_manual_override
         behavior = (
-            "RECOVER" if abs(projection["d"]) > 0.25 else "KEEP_LANE"
+            "MANUAL_OVERRIDE"
+            if manual_override is not None
+            else (
+                "RECOVER"
+                if abs(projection["d"]) > 0.25
+                else "KEEP_LANE"
+            )
         )
         trajectory.cost = 0.0
         trajectory.cost_components = {}
@@ -1916,7 +2101,9 @@ class RuleBasedPlanner(object):
                 "accepted_candidates": 1,
                 "collision_rejected": 0,
                 "hard_rejections": {},
-                "lateral_targets": [0.0],
+                "lateral_targets": [
+                    float(trajectory.d[-1])
+                ],
                 "speed_targets": [desired_speed],
                 "selected_target_d": self.previous_target_d,
                 "selected_cost": 0.0,
@@ -1989,10 +2176,14 @@ class RuleBasedPlanner(object):
             }
             return PlanResult(None, 0.0, "STOP", True, "ego is too far from global path")
 
+        manual_override = self._match_scenario_override(projection)
         detected_obstacle_count = len(obstacles or [])
         prepared_obstacles = (
             []
-            if self.config.ignore_obstacles
+            if (
+                self.config.ignore_obstacles
+                or manual_override is not None
+            )
             else self._prepare_obstacles(obstacles)
         )
         planning_obstacles = self._planning_obstacles(
@@ -2004,6 +2195,21 @@ class RuleBasedPlanner(object):
         desired_speed, lead, behavior, immediate_emergency = self._rule_target(
             ego_values, projection, planning_obstacles, self.map_name
         )
+        if manual_override is not None:
+            desired_speed = float(
+                manual_override["target_speed_mps"]
+            )
+            behavior = "MANUAL_OVERRIDE"
+            immediate_emergency = False
+            self._last_speed_limit_debug.update(
+                {
+                    "manual_override": True,
+                    "manual_target_speed_mps": desired_speed,
+                    "manual_target_d": float(
+                        manual_override["target_d"]
+                    ),
+                }
+            )
         self.last_debug = {
             "projection": dict(projection),
             "heading_error": _wrap(projection["yaw"] - ego_values["yaw"]),
@@ -2018,6 +2224,35 @@ class RuleBasedPlanner(object):
             "raw_obstacle_count": len(prepared_obstacles),
             "planning_obstacle_count": len(planning_obstacles),
             "ignore_obstacles": bool(self.config.ignore_obstacles),
+            "manual_control_active": (
+                manual_override is not None
+            ),
+            "manual_override_name": (
+                None
+                if manual_override is None
+                else manual_override["name"]
+            ),
+            "manual_target_d": (
+                None
+                if manual_override is None
+                else float(manual_override["target_d"])
+            ),
+            "manual_target_speed_mps": (
+                None
+                if manual_override is None
+                else float(
+                    manual_override["target_speed_mps"]
+                )
+            ),
+            "manual_collision_bypass": (
+                manual_override is not None
+            ),
+            "scenario_overrides_path": os.path.abspath(
+                str(self.config.scenario_overrides_path)
+            ),
+            "scenario_override_error": (
+                self._scenario_override_error
+            ),
             "non_yielding_replay_traffic": bool(
                 self.config.non_yielding_replay_traffic
             ),
@@ -2070,8 +2305,16 @@ class RuleBasedPlanner(object):
         # Normal case: if the current lane and the smooth recovery corridor are
         # clear, drive the global path directly.  Sampling is reserved for a
         # path actually blocked by an obstacle.
+        direct_target_d = (
+            0.0
+            if manual_override is None
+            else float(manual_override["target_d"])
+        )
         direct_trajectory = self._direct_clear_lane_trajectory(
-            ego_values, projection, desired_speed
+            ego_values,
+            projection,
+            desired_speed,
+            target_d=direct_target_d,
         )
         direct_lane_obstacles = self._direct_lane_obstacles(
             ego_values,
@@ -3167,7 +3410,12 @@ class StableController(object):
     ):
         """Stop when normal lane keeping persistently moves away from d=0."""
         offset = _finite(path_lateral_offset, float("nan"))
-        active = str(behavior) in ("KEEP_LANE", "RECOVER", "FOLLOW")
+        active = str(behavior) in (
+            "KEEP_LANE",
+            "RECOVER",
+            "FOLLOW",
+            "MANUAL_OVERRIDE",
+        )
         if not math.isfinite(offset):
             self.last_debug.update(
                 {
@@ -3278,7 +3526,10 @@ class StableController(object):
         )
         behavior = str(getattr(plan_result, "behavior", ""))
         centerline_tracking = behavior in (
-            "KEEP_LANE", "RECOVER", "FOLLOW"
+            "KEEP_LANE",
+            "RECOVER",
+            "FOLLOW",
+            "MANUAL_OVERRIDE",
         )
         # RECOVER is rebuilt from the current Frenet state every plan cycle.
         # Its temporary S bend is a control reference, not road geometry.

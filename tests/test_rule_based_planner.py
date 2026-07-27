@@ -1,6 +1,8 @@
 import math
 import os
 import sys
+import json
+import tempfile
 import unittest
 
 import numpy as np
@@ -65,6 +67,103 @@ def obstacle(x, y=0.0, speed=0.0):
 
 
 class RulePlannerTest(unittest.TestCase):
+    def test_enabled_scenario_override_forces_d_v_and_ignores_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            override_path = os.path.join(
+                directory, "scenario_overrides.json"
+            )
+            with open(override_path, "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "scenarios": [
+                            {
+                                "name": "manual-test",
+                                "enabled": True,
+                                "map": "intersection.xodr",
+                                "s_start": 0.0,
+                                "s_end": 1000.0,
+                                "target_d": 1.2,
+                                "target_speed_kmh": 72.0,
+                            }
+                        ]
+                    },
+                    stream,
+                )
+            config = PlannerConfig()
+            config.scenario_overrides_path = override_path
+            planner = RuleBasedPlanner(config)
+            blocking_vehicle = obstacle(
+                3.0, y=0.0, speed=0.0
+            )
+
+            result = planner.plan(
+                ego(speed=4.0),
+                [blocking_vehicle],
+                straight_path(),
+                "intersection.xodr",
+            )
+
+            self.assertFalse(result.emergency)
+            self.assertEqual("MANUAL_OVERRIDE", result.behavior)
+            self.assertAlmostEqual(20.0, result.target_speed)
+            self.assertAlmostEqual(
+                1.2, float(result.trajectory.d[-1]), places=2
+            )
+            self.assertTrue(
+                planner.last_debug["manual_control_active"]
+            )
+            self.assertTrue(
+                planner.last_debug["manual_collision_bypass"]
+            )
+            self.assertEqual(
+                1, planner.last_debug["detected_obstacle_count"]
+            )
+            self.assertEqual(
+                0, planner.last_debug["planning_obstacle_count"]
+            )
+
+    def test_disabled_scenario_override_leaves_collision_safety_active(self):
+        config = PlannerConfig()
+        config.scenario_overrides_path = os.path.join(
+            SAMPLE_DIR, "scenario_overrides.json"
+        )
+        planner = RuleBasedPlanner(config)
+        result = planner.plan(
+            ego(speed=0.0),
+            [obstacle(3.0, speed=0.0)],
+            straight_path(),
+            "intersection.xodr",
+        )
+        self.assertTrue(result.emergency)
+        self.assertFalse(
+            planner.last_debug["manual_control_active"]
+        )
+
+    def test_manual_behavior_tracks_nonzero_d_reference(self):
+        controller = StableController()
+        result = PlanResult(
+            trajectory=self._straight_trajectory(speed=8.0),
+            target_speed=8.0,
+            behavior="MANUAL_OVERRIDE",
+        )
+        command = controller.control(
+            ego(y=0.0, speed=5.0),
+            result,
+            0.1,
+            path_lateral_offset=-1.0,
+            path_reference_yaw=0.0,
+            path_reference_curvature=0.0,
+        )
+        self.assertTrue(
+            controller.last_debug["centerline_control_active"]
+        )
+        self.assertFalse(
+            controller.last_debug[
+                "trajectory_comfort_cap_applied"
+            ]
+        )
+        self.assertGreater(command.steer, 0.0)
+
     def test_stationary_offset_ego_has_forward_candidate(self):
         planner = RuleBasedPlanner()
         result = planner.plan(
@@ -1076,7 +1175,9 @@ class RulePlannerTest(unittest.TestCase):
             actual_steer += (
                 (command.steer - actual_steer) / 0.15 * 0.05
             )
-            front_angle = math.radians(actual_steer)
+            front_angle = math.radians(
+                actual_steer / config.steering_ratio
+            )
             current_ego.theta += (
                 current_ego.speed
                 / config.controller_wheelbase
@@ -1101,6 +1202,93 @@ class RulePlannerTest(unittest.TestCase):
         self.assertLess(abs(offsets[-1]), 0.01)
         self.assertLess(max(offsets), 1.50)
         self.assertTrue(all(value > 0.0 for value in offsets))
+
+    def test_cam6_steering_ratio_tracks_logged_merge_curve(self):
+        """Reproduce the v6 MT_14 drift with the real chassis ratio.
+
+        The logged episode starts at 24.653 m/s, d=0.009 m and an outward
+        heading error of 0.177 degrees on a roughly -0.0005 1/m bend.  A
+        controller ratio of 1.0 reaches more than four metres of offset when
+        the chassis actually divides its steering-wheel command by 1.65.
+        """
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        self.assertAlmostEqual(config.steering_ratio, 1.65)
+        controller = StableController(config)
+        count = 1001
+        zeros = np.zeros(count)
+        trajectory = Trajectory(
+            t=np.linspace(0.0, 20.0, count),
+            s=np.linspace(0.0, 500.0, count),
+            d=zeros,
+            speed=np.full(count, 40.0),
+            accel=zeros,
+            d_speed=zeros,
+            d_accel=zeros,
+            d_jerk=zeros,
+        )
+        trajectory.x = np.linspace(0.0, 500.0, count)
+        trajectory.y = zeros.copy()
+        trajectory.yaw = zeros.copy()
+        trajectory.kappa = zeros.copy()
+        result = PlanResult(
+            trajectory=trajectory,
+            target_speed=40.0,
+            behavior="KEEP_LANE",
+        )
+        station = 7.8
+        lateral_offset = 0.009
+        vehicle_minus_path_yaw = math.radians(0.177)
+        speed = 24.653
+        steering_feedback = 0.0
+        offsets = []
+
+        for _ in range(400):
+            path_curvature = (
+                -0.0005 if station < 175.0 else 0.0
+            )
+            current_ego = ego(
+                x=station, y=lateral_offset, speed=speed
+            )
+            current_ego.theta = vehicle_minus_path_yaw
+            command = controller.control(
+                current_ego,
+                result,
+                0.02,
+                steering_feedback=steering_feedback,
+                path_lateral_offset=lateral_offset,
+                path_reference_yaw=0.0,
+                path_reference_curvature=path_curvature,
+            )
+            steering_feedback += (
+                (command.steer - steering_feedback)
+                / 0.08
+                * 0.02
+            )
+            actual_front_angle = math.radians(
+                steering_feedback / 1.65
+            )
+            vehicle_minus_path_yaw += (
+                speed
+                / config.controller_wheelbase
+                * math.tan(actual_front_angle)
+                - speed * path_curvature
+            ) * 0.02
+            lateral_offset += (
+                speed
+                * math.sin(vehicle_minus_path_yaw)
+                * 0.02
+            )
+            station += (
+                speed
+                * math.cos(vehicle_minus_path_yaw)
+                * 0.02
+            )
+            speed = min(31.6, speed + 3.0 * 0.02)
+            offsets.append(lateral_offset)
+
+        self.assertLess(max(abs(value) for value in offsets), 0.20)
+        self.assertLess(abs(offsets[-1]), 0.10)
 
     def test_stationary_emergency_does_not_leave_negative_acceleration(self):
         controller = StableController()

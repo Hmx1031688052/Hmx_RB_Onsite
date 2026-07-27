@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "_instructions": {
+    "enabled": "Only rules with enabled=true can take control.",
+    "map": "Match the XODR basename. Wildcards such as MT_14-*.xodr are supported.",
+    "station": "s_start is inclusive and s_end is exclusive, in metres along the global path.",
+    "lateral": "target_d is the final offset from the complete global path in metres: positive=left, negative=right.",
+    "lane_change": "For a parallel adjacent lane, use its centre-to-centre separation (commonly about +/-3.5m), not a small edge offset such as +/-0.3m.",
+    "speed": "Use target_speed_kmh or target_speed_mps.",
+    "safety": "An active rule deliberately bypasses all planning obstacle and collision checks."
+  },
+  "scenarios": [
+    {
+      "name": "MT_14 example: global-path centre",
+      "enabled": false,
+      "map": "MT_14-merge.xodr",
+      "s_start": 0.0,
+      "s_end": 170.0,
+      "target_d": 0.0,
+      "target_speed_kmh": 108.0
+    },
+    {
+      "name": "MT_14 example: small right offset (not a lane change)",
+      "enabled": false,
+      "map": "MT_14-merge.xodr",
+      "s_start": 170.0,
+      "s_end": 1000.0,
+      "target_d": -0.3,
+      "target_speed_kmh": 137.0
+    }
+  ]
+}
