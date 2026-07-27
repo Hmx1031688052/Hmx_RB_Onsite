@@ -213,9 +213,15 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-sprint-any-map-v25"
+    "2026-07-27-sprint-fast-prepare-v26"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
+PREPARE_RESULT_REPEAT = max(
+    1, int(os.environ.get("E2E_PREPARE_RESULT_REPEAT", "3"))
+)
+PREPARE_RESULT_INTERVAL = max(
+    0.0, float(os.environ.get("E2E_PREPARE_RESULT_INTERVAL", "0.03"))
+)
 loop_count = 0
 last_ins_sequence = None
 last_ins_position = None
@@ -1378,15 +1384,7 @@ def build_global_plan_directly(brief_data, testee_index=0):
         goal_state = testee.get("target_state") or {}
 
         reset_global_plan_wait(map_id, start_state["x"], start_state["y"])
-        try:
-            route = global_route_planner.plan(
-                start_state=start_state,
-                goal_state=goal_state,
-                map_ref=map_id,
-            )
-        except RoutePlanningError as exc:
-            if not rule_planner.config.sprint_applies_to(map_id):
-                raise
+        if rule_planner.config.sprint_applies_to(map_id):
             route = build_direct_sprint_route(
                 start_state=start_state,
                 goal_state=goal_state,
@@ -1394,10 +1392,16 @@ def build_global_plan_directly(brief_data, testee_index=0):
                 speed_limit=rule_planner.config.sprint_speed,
             )
             print(
-                "[direct-global-plan][SPRINT-FALLBACK] "
-                f"lane route unavailable: {exc}; "
-                f"using direct start-to-goal seed points="
-                f"{len(route['x'])}"
+                "[direct-global-plan][SPRINT-DIRECT] "
+                "skip XODR lane graph and A*; "
+                f"map={_xodr_frame_id(map_id)} "
+                f"seed_points={len(route['x'])}"
+            )
+        else:
+            route = global_route_planner.plan(
+                start_state=start_state,
+                goal_state=goal_state,
+                map_ref=map_id,
             )
         first_x = float(route["x"][0])
         first_y = float(route["y"][0])
@@ -1444,7 +1448,12 @@ def build_global_plan_directly(brief_data, testee_index=0):
             "note=score_uses_actual_ego_distance"
         )
         route_cache = route.get("_persistent_cache") or {}
-        if route_cache.get("hit") and getattr(
+        if route.get("_sprint_direct_fallback"):
+            print(
+                "[global-plan-vis] skip XODR background render for "
+                "sprint-direct route"
+            )
+        elif route_cache.get("hit") and getattr(
             global_route_planner, "opendrive", None
         ) is None:
             print(
@@ -1538,9 +1547,28 @@ def prepare(result=True):
     send_prepare_result.result = bool(result)
     data = send_prepare_result.SerializeToString()
     length = len(data)
-    ret = prepare_channel.put(MT_ACTOR_PREPARE_RESULT, length, data)
-    if ret != 0:
-        print("send prepare msg error")
+    successful_copies = 0
+    for copy_index in range(PREPARE_RESULT_REPEAT):
+        ret = prepare_channel.put(
+            MT_ACTOR_PREPARE_RESULT, length, data
+        )
+        if ret == 0:
+            successful_copies += 1
+        else:
+            print(
+                "send prepare msg error "
+                f"copy={copy_index + 1}/{PREPARE_RESULT_REPEAT}"
+            )
+        if (
+            copy_index + 1 < PREPARE_RESULT_REPEAT
+            and PREPARE_RESULT_INTERVAL > 0.0
+        ):
+            time.sleep(PREPARE_RESULT_INTERVAL)
+    print(
+        "[prepare-timing] prepare_result_copies "
+        f"successful={successful_copies}/{PREPARE_RESULT_REPEAT} "
+        f"interval={PREPARE_RESULT_INTERVAL:.3f}s"
+    )
 
 
 def get_prepare():
@@ -1647,12 +1675,22 @@ def get_prepare():
         #print('change_map')
         model.change_map(brief_data["zjl_odv_file"])
         map_name = brief_data["zjl_odv_file"]
-        try:
-            expected_xodr_path = (
-                global_route_planner.resolve_map_path(map_name)
-            )
-        except Exception:
+        if rule_planner.config.sprint_applies_to(map_name):
+            # Sprint ignores map limits and topology.  Parsing a large AITOWN
+            # XODR here only for diagnostic speed statistics delayed the
+            # prepare handshake by roughly half a second.
             expected_xodr_path = None
+            print(
+                "[expected-speed][SPRINT-FAST] "
+                "skip XODR speed scan during prepare"
+            )
+        else:
+            try:
+                expected_xodr_path = (
+                    global_route_planner.resolve_map_path(map_name)
+                )
+            except Exception:
+                expected_xodr_path = None
         current_expected_speed = resolve_expected_speed(
             brief_data,
             map_name,
