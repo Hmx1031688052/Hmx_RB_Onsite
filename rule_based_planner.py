@@ -60,6 +60,54 @@ def _unique(values, tolerance=1e-4):
     return result
 
 
+def build_direct_sprint_route(
+    start_state,
+    goal_state,
+    frame_id,
+    speed_limit=30.0,
+    spacing=1.0,
+):
+    """Build a straight start-to-goal seed when lane routing is impossible.
+
+    This is intentionally for explicitly selected sprint scenarios only.
+    RuleBasedPlanner subsequently replaces this seed with its
+    heading-continuous sprint reference, so the seed's primary purpose is to
+    preserve the exact episode goal without requiring an A* lane connection.
+    """
+    try:
+        start_x = float(start_state["x"])
+        start_y = float(start_state["y"])
+        goal_x = float(goal_state["x"])
+        goal_y = float(goal_state["y"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "sprint fallback requires finite start/goal x/y"
+        ) from exc
+    values = (start_x, start_y, goal_x, goal_y)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError(
+            "sprint fallback requires finite start/goal x/y"
+        )
+    distance = math.hypot(goal_x - start_x, goal_y - start_y)
+    if distance <= EPS:
+        raise ValueError("sprint fallback start and goal are identical")
+    count = max(
+        2, int(math.ceil(distance / max(0.1, float(spacing)))) + 1
+    )
+    xs = np.linspace(start_x, goal_x, count)
+    ys = np.linspace(start_y, goal_y, count)
+    speed = max(0.1, float(speed_limit))
+    return {
+        "x": xs.tolist(),
+        "y": ys.tolist(),
+        "kappa": [0.0] * count,
+        "speed_limit": [speed] * count,
+        "frame_id": str(frame_id or ""),
+        "stamp": time.time(),
+        "_sprint_direct_fallback": True,
+    }
+
+
 class PlannerConfig(object):
     """Central tuning values for the rule planner and controller."""
 
@@ -350,7 +398,17 @@ class PlannerConfig(object):
             3.0,
             float(
                 os.environ.get(
-                    "RULE_SPRINT_ACCEL", "40.0"
+                    # At the default 20 ms control period, 1500 m/s^2
+                    # represents a 30 m/s single-frame delta-v.
+                    "RULE_SPRINT_ACCEL", "1500.0"
+                )
+            ),
+        )
+        self.sprint_alignment_duration = max(
+            0.0,
+            float(
+                os.environ.get(
+                    "RULE_SPRINT_ALIGNMENT_DURATION", "2.0"
                 )
             ),
         )
@@ -529,6 +587,7 @@ class PlannerConfig(object):
         map_names=None,
         speed=None,
         accel=None,
+        alignment_duration=None,
         max_steer_deg=None,
         steer_rate_deg_s=None,
         recovery_heading_deg=None,
@@ -551,6 +610,10 @@ class PlannerConfig(object):
             self.sprint_speed = max(0.1, float(speed))
         if accel is not None:
             self.sprint_accel = max(0.1, float(accel))
+        if alignment_duration is not None:
+            self.sprint_alignment_duration = max(
+                0.0, float(alignment_duration)
+            )
         if max_steer_deg is not None:
             self.sprint_max_steer_deg = _clip(
                 float(max_steer_deg),
@@ -3380,6 +3443,9 @@ class StableController(object):
         self.filtered_steer = 0.0
         self.last_abs_path_offset = None
         self.path_divergence_count = 0
+        self.sprint_elapsed = 0.0
+        self.sprint_pulse_sent = False
+        self.sprint_phase = "INACTIVE"
         self.last_debug = {}
 
     def reset(self):
@@ -3390,6 +3456,9 @@ class StableController(object):
         self.filtered_steer = 0.0
         self.last_abs_path_offset = None
         self.path_divergence_count = 0
+        self.sprint_elapsed = 0.0
+        self.sprint_pulse_sent = False
+        self.sprint_phase = "INACTIVE"
         self.last_debug = {}
 
     def _steering_limit(self, speed, lateral_accel_limit=None):
@@ -4093,6 +4162,10 @@ class StableController(object):
         )
         behavior = str(getattr(plan_result, "behavior", ""))
         sprint_mode = behavior == "SPRINT"
+        if not sprint_mode:
+            self.sprint_elapsed = 0.0
+            self.sprint_pulse_sent = False
+            self.sprint_phase = "INACTIVE"
         centerline_tracking = behavior in (
             "KEEP_LANE",
             "RECOVER",
@@ -4196,22 +4269,29 @@ class StableController(object):
             and not plan_result.emergency
             and not centerline_safety_stop
         ):
-            # Deliberately concentrate the evaluator-threshold violation into
-            # a short pulse, then coast. This is isolated to explicitly
-            # selected sprint maps and avoids spending the whole case near
-            # the acceleration threshold.
-            if sprint_recovery_active:
-                acc = (
-                    -self.config.sprint_recovery_decel
-                    if ego_speed > target_speed + 0.5
-                    else 0.0
+            # Sprint is an explicit three-stage state machine:
+            # 1. hold speed/acceleration at zero while steering aligns;
+            # 2. emit exactly one acceleration frame;
+            # 3. coast with acceleration fixed at zero for the session.
+            if (
+                self.sprint_elapsed
+                < self.config.sprint_alignment_duration - EPS
+            ):
+                self.sprint_phase = "ALIGN"
+                self.sprint_elapsed = min(
+                    self.config.sprint_alignment_duration,
+                    self.sprint_elapsed + dt,
                 )
+                target_speed = 0.0
+                planned_accel = 0.0
+                acc = 0.0
+            elif not self.sprint_pulse_sent:
+                self.sprint_phase = "PULSE"
+                self.sprint_pulse_sent = True
+                acc = self.config.sprint_accel
             else:
-                acc = (
-                    self.config.sprint_accel
-                    if ego_speed < target_speed - 0.5
-                    else 0.0
-                )
+                self.sprint_phase = "COAST"
+                acc = 0.0
             self.last_acc = acc
             self.speed_integral = 0.0
             self.last_debug.update(
@@ -4221,7 +4301,15 @@ class StableController(object):
                     "planned_accel": planned_accel,
                     "actual_accel_command_jerk": float("nan"),
                     "accel_command_jerk": None,
-                    "sprint_accel_pulse_active": acc > 0.0,
+                    "sprint_phase": self.sprint_phase,
+                    "sprint_elapsed": self.sprint_elapsed,
+                    "sprint_alignment_duration": (
+                        self.config.sprint_alignment_duration
+                    ),
+                    "sprint_pulse_sent": self.sprint_pulse_sent,
+                    "sprint_accel_pulse_active": (
+                        self.sprint_phase == "PULSE"
+                    ),
                     "sprint_recovery_active": sprint_recovery_active,
                 }
             )
@@ -4233,7 +4321,11 @@ class StableController(object):
                 plan_result.emergency or centerline_safety_stop,
                 planned_accel=planned_accel,
             )
-        if ego_speed < 0.08 and target_speed < 0.05:
+        if (
+            ego_speed < 0.08
+            and target_speed < 0.05
+            and not sprint_mode
+        ):
             acc = 0.0
             self.last_acc = 0.0
             self.speed_integral = 0.0
@@ -4260,6 +4352,12 @@ class StableController(object):
                 ),
                 "centerline_safety_stop": centerline_safety_stop,
                 "sprint_mode": sprint_mode,
+                "sprint_phase": self.sprint_phase,
+                "sprint_elapsed": self.sprint_elapsed,
+                "sprint_alignment_duration": (
+                    self.config.sprint_alignment_duration
+                ),
+                "sprint_pulse_sent": self.sprint_pulse_sent,
                 "sprint_recovery_active": sprint_recovery_active,
                 "output_acc": acc,
                 "output_steer": steer,

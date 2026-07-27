@@ -178,6 +178,7 @@ from rule_based_planner import (
     PlannerConfig,
     RuleBasedPlanner,
     StableController,
+    build_direct_sprint_route,
 )
 from roundabout_controller import RoundaboutController
 from speed_limits import resolve_expected_speed
@@ -212,7 +213,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-roundabout-idm-ins-fix-v20"
+    "2026-07-27-sprint-direct-fallback-v22"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -1377,11 +1378,27 @@ def build_global_plan_directly(brief_data, testee_index=0):
         goal_state = testee.get("target_state") or {}
 
         reset_global_plan_wait(map_id, start_state["x"], start_state["y"])
-        route = global_route_planner.plan(
-            start_state=start_state,
-            goal_state=goal_state,
-            map_ref=map_id,
-        )
+        try:
+            route = global_route_planner.plan(
+                start_state=start_state,
+                goal_state=goal_state,
+                map_ref=map_id,
+            )
+        except RoutePlanningError as exc:
+            if not rule_planner.config.sprint_applies_to(map_id):
+                raise
+            route = build_direct_sprint_route(
+                start_state=start_state,
+                goal_state=goal_state,
+                frame_id=_xodr_frame_id(map_id),
+                speed_limit=rule_planner.config.sprint_speed,
+            )
+            print(
+                "[direct-global-plan][SPRINT-FALLBACK] "
+                f"lane route unavailable: {exc}; "
+                f"using direct start-to-goal seed points="
+                f"{len(route['x'])}"
+            )
         first_x = float(route["x"][0])
         first_y = float(route["y"][0])
         start_dist = math.hypot(
@@ -2446,6 +2463,10 @@ def get_pointcloud_msg():
             f"curve_authority={bool(controller_debug.get('curve_authority_active', False))} "
             f"tracking_recovery={bool(controller_debug.get('tracking_recovery_active', False))} "
             f"sprint_mode={bool(controller_debug.get('sprint_mode', False))} "
+            f"sprint_phase={controller_debug.get('sprint_phase', 'INACTIVE')} "
+            f"sprint_elapsed={float(controller_debug.get('sprint_elapsed', 0.0)):.3f}s "
+            f"sprint_alignment_duration={float(controller_debug.get('sprint_alignment_duration', 0.0)):.3f}s "
+            f"sprint_pulse_sent={bool(controller_debug.get('sprint_pulse_sent', False))} "
             f"sprint_pulse={bool(controller_debug.get('sprint_accel_pulse_active', False))} "
             f"sprint_recovery={bool(controller_debug.get('sprint_recovery_active', False))} "
             f"roundabout_mode={controller_debug.get('roundabout_mode', 'off')} "
@@ -3367,6 +3388,17 @@ if __name__ == "__main__":
         help="generic sprint acceleration pulse in m/s^2",
     )
     arg_parser.add_argument(
+        "--sprint_alignment_duration",
+        "--sprint-alignment-duration",
+        dest="sprint_alignment_duration",
+        type=float,
+        default=None,
+        help=(
+            "stationary steering-alignment duration before the one-frame "
+            "sprint acceleration pulse, seconds"
+        ),
+    )
+    arg_parser.add_argument(
         "--sprint_max_steer_deg",
         "--sprint-max-steer-deg",
         dest="sprint_max_steer_deg",
@@ -3850,6 +3882,13 @@ if __name__ == "__main__":
         arg_parser.error(
             "--sprint_recovery_speed must be non-negative"
         )
+    if (
+        args.sprint_alignment_duration is not None
+        and args.sprint_alignment_duration < 0.0
+    ):
+        arg_parser.error(
+            "--sprint_alignment_duration must be non-negative"
+        )
     if args.sprint_maps is not None and not args.sprint_maps.strip():
         arg_parser.error("--sprint_maps cannot be empty")
     if args.roundabout_gap < 0.1:
@@ -4169,6 +4208,7 @@ if __name__ == "__main__":
         map_names=args.sprint_maps,
         speed=args.sprint_speed,
         accel=args.sprint_accel,
+        alignment_duration=args.sprint_alignment_duration,
         max_steer_deg=args.sprint_max_steer_deg,
         recovery_speed=args.sprint_recovery_speed,
         ignore_obstacles=args.sprint_ignore_obstacles,
@@ -4218,6 +4258,8 @@ if __name__ == "__main__":
         f"{','.join(sorted(planner_config.sprint_map_names)) or 'none'} "
         f"sprint_speed={planner_config.sprint_speed:.3f}m/s "
         f"sprint_accel={planner_config.sprint_accel:.3f}m/s2 "
+        f"sprint_alignment_duration="
+        f"{planner_config.sprint_alignment_duration:.3f}s "
         f"sprint_steer_cap="
         f"{planner_config.sprint_max_steer_deg:.3f}deg "
         f"sprint_recovery_speed="

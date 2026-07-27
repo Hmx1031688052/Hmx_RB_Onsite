@@ -18,6 +18,7 @@ from rule_based_planner import (
     RuleBasedPlanner,
     StableController,
     Trajectory,
+    build_direct_sprint_route,
 )
 
 
@@ -67,6 +68,24 @@ def obstacle(x, y=0.0, speed=0.0):
 
 
 class RulePlannerTest(unittest.TestCase):
+    def test_direct_sprint_route_preserves_opposite_lane_goal(self):
+        route = build_direct_sprint_route(
+            {"x": 103.64, "y": 5.17},
+            {"x": -1.74, "y": 3.5},
+            "MT_19-non-motorized.xodr",
+            speed_limit=30.0,
+        )
+
+        self.assertTrue(route["_sprint_direct_fallback"])
+        self.assertAlmostEqual(route["x"][0], 103.64)
+        self.assertAlmostEqual(route["y"][0], 5.17)
+        self.assertAlmostEqual(route["x"][-1], -1.74)
+        self.assertAlmostEqual(route["y"][-1], 3.5)
+        self.assertGreater(len(route["x"]), 100)
+        self.assertEqual(
+            len(route["speed_limit"]), len(route["x"])
+        )
+
     def test_enabled_scenario_override_forces_d_v_and_ignores_collision(self):
         with tempfile.TemporaryDirectory() as directory:
             override_path = os.path.join(
@@ -377,7 +396,7 @@ class RulePlannerTest(unittest.TestCase):
         self.assertAlmostEqual(planner.reference.x[arc_end - 1], 10.0, places=2)
         self.assertAlmostEqual(planner.reference.y[arc_end - 1], -10.0, places=2)
 
-    def test_selected_map_sprint_uses_short_acceleration_pulse(self):
+    def test_selected_map_sprint_aligns_then_pulses_one_frame_and_coasts(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],
             "y": [0.0, -5.0, -10.0, -10.0],
@@ -391,6 +410,7 @@ class RulePlannerTest(unittest.TestCase):
         config.configure_sprint(
             enabled=True,
             map_names="MT_05-intersection.xodr",
+            alignment_duration=0.10,
         )
         planner = RuleBasedPlanner(config)
         controller = StableController(config)
@@ -404,7 +424,7 @@ class RulePlannerTest(unittest.TestCase):
         )
         projection = planner.reference.project(0.0, 0.0)
 
-        launch = controller.control(
+        align_1 = controller.control(
             current_ego,
             result,
             0.05,
@@ -412,8 +432,31 @@ class RulePlannerTest(unittest.TestCase):
             path_reference_yaw=projection["yaw"],
             path_reference_curvature=projection["kappa"],
         )
-        current_ego.speed = config.sprint_speed - 0.2
-        coast = controller.control(
+        align_2 = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+        pulse = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+        coast_1 = controller.control(
+            current_ego,
+            result,
+            0.05,
+            path_lateral_offset=projection["d"],
+            path_reference_yaw=projection["yaw"],
+            path_reference_curvature=projection["kappa"],
+        )
+        coast_2 = controller.control(
             current_ego,
             result,
             0.05,
@@ -422,17 +465,26 @@ class RulePlannerTest(unittest.TestCase):
             path_reference_curvature=projection["kappa"],
         )
 
-        self.assertEqual(launch.acc, config.sprint_accel)
-        self.assertEqual(
-            launch.speed, config.sprint_speed
-        )
-        self.assertGreater(launch.steer, 0.0)
+        self.assertEqual(align_1.acc, 0.0)
+        self.assertEqual(align_1.speed, 0.0)
+        self.assertEqual(align_2.acc, 0.0)
+        self.assertEqual(align_2.speed, 0.0)
+        self.assertGreater(align_1.steer, 0.0)
         self.assertLessEqual(
-            abs(launch.steer), config.sprint_max_steer_deg
+            abs(align_1.steer), config.sprint_max_steer_deg
         )
-        self.assertEqual(coast.acc, 0.0)
+        self.assertEqual(pulse.acc, config.sprint_accel)
+        self.assertEqual(pulse.speed, config.sprint_speed)
+        self.assertEqual(coast_1.acc, 0.0)
+        self.assertEqual(coast_2.acc, 0.0)
         self.assertTrue(
             controller.last_debug["sprint_mode"]
+        )
+        self.assertEqual(
+            controller.last_debug["sprint_phase"], "COAST"
+        )
+        self.assertTrue(
+            controller.last_debug["sprint_pulse_sent"]
         )
 
     def test_sprint_does_not_affect_unselected_maps(self):
