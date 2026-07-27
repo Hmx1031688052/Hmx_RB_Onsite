@@ -338,7 +338,7 @@ class PlannerConfig(object):
                 0.5,
                 float(
                     os.environ.get(
-                        "RULE_MT05_CURVE_LAT_ACCEL", "2.5"
+                        "RULE_MT05_CURVE_LAT_ACCEL", "4.5"
                     )
                 ),
             )
