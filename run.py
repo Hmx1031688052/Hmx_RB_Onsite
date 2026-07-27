@@ -179,6 +179,7 @@ from rule_based_planner import (
     RuleBasedPlanner,
     StableController,
     build_direct_sprint_route,
+    session_startup_speed,
 )
 from roundabout_controller import RoundaboutController
 from speed_limits import resolve_expected_speed
@@ -213,7 +214,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-sprint-fast-prepare-v26"
+    "2026-07-27-episode-speed-reset-v27"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 PREPARE_RESULT_REPEAT = max(
@@ -1571,6 +1572,38 @@ def prepare(result=True):
     )
 
 
+def reset_episode_ego_state(reason):
+    """Drop pose, speed, and feedback state that cannot cross sessions."""
+    previous_speed = float(
+        getattr(getattr(model, "ego", None), "speed", 0.0) or 0.0
+    )
+    model.ego = None
+    model.last_ego = None
+    model.ego_ros_speed = 0.0
+    model.ego_ros_vy = 0.0
+    model.ego_ros_yawrate = 0.0
+    model.ego_ros_acc = 0.0
+    model.ego_ros_ax = 0.0
+    model.ego_ros_ay = 0.0
+    model.ego_lon_acc = 0.0
+    model.ego_lat_acc = 0.0
+    model.ego_ros_heading_deg = None
+    model.ego_ros_sequence = None
+    model.last_ego_update_wall_time = None
+    model.last_ego_update_sequence = None
+    model.previous_ego_yaw = None
+    model.previous_ego_yaw_wall_time = None
+    model.last_ego_speed_pose = None
+    model.last_ego_speed_pose_wall_time = 0.0
+    model.vehicle_feedback.steering_wheel_angle = 0.0
+    model.vehicle_feedback.accelerator_pedal_position = 0.0
+    model.vehicle_feedback.brake_pedal_position = 0.0
+    print(
+        "[episode-reset] ego state cleared "
+        f"reason={reason} previous_speed={previous_speed:.3f}m/s"
+    )
+
+
 def get_prepare():
     global recv_prepare
     global session_id
@@ -1662,11 +1695,9 @@ def get_prepare():
         invalid_ins_count = 0
         last_invalid_ins_warn_ts = 0.0
         reset_ins_start_gate()
-        model.last_ego = None
+        reset_episode_ego_state("prepare")
         model.invalid_ego_sample_count = 0
         model.last_invalid_ego_sample_warn_wall_time = 0.0
-        model.last_ego_speed_pose = None
-        model.last_ego_speed_pose_wall_time = 0.0
 
         brief_data = json.loads(prepare_msg.archive_info.brief_data)
         weather =  brief_data["environment"]['weather']
@@ -2667,11 +2698,9 @@ def process_notify():
             model.step = 0
             model.reset_perception_state()
             model.last_pointclouds = []
-            model.last_ego = None
+            reset_episode_ego_state("finish")
             model.invalid_ego_sample_count = 0
             model.last_invalid_ego_sample_warn_wall_time = 0.0
-            model.last_ego_speed_pose = None
-            model.last_ego_speed_pose_wall_time = 0.0
             model.ok = 0
             model.last_steer = 0
             model.time_out = False
@@ -2700,21 +2729,16 @@ def process_notify():
             # releases that inherited brake without requesting a speed step.
             stable_controller.reset()
             last_control_wall_time = None
-            startup_speed = max(
-                0.0,
-                float(
-                    getattr(
-                        getattr(model, "ego", None),
-                        "speed",
-                        0.0,
-                    )
-                    or 0.0
-                ),
+            startup_speed = session_startup_speed(
+                first_ins_ready,
+                getattr(model, "ego", None),
             )
             send_control_cmd(0.0, startup_speed, 0.0)
             print(
                 "[startup-control] neutral brake release "
-                f"speed={startup_speed:.3f}m/s"
+                f"speed={startup_speed:.3f}m/s "
+                f"source="
+                f"{'session-ins' if first_ins_ready else 'zero-no-session-ins'}"
             )
             if drive_trace_logger is not None:
                 drive_trace_logger.record_event(

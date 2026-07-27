@@ -19,6 +19,7 @@ from rule_based_planner import (
     StableController,
     Trajectory,
     build_direct_sprint_route,
+    session_startup_speed,
 )
 
 
@@ -68,6 +69,17 @@ def obstacle(x, y=0.0, speed=0.0):
 
 
 class RulePlannerTest(unittest.TestCase):
+    def test_startup_speed_rejects_stale_ego_without_session_ins(self):
+        stale_ego = ego(speed=40.0)
+
+        self.assertEqual(
+            session_startup_speed(False, stale_ego), 0.0
+        )
+        self.assertEqual(session_startup_speed(True, None), 0.0)
+        self.assertEqual(
+            session_startup_speed(True, stale_ego), 40.0
+        )
+
     def test_direct_sprint_route_preserves_opposite_lane_goal(self):
         route = build_direct_sprint_route(
             {"x": 103.64, "y": 5.17},
