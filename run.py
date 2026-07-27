@@ -211,7 +211,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-xodr-spiral-v10"
+    "2026-07-27-curve-tracking-v11"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2367,6 +2367,9 @@ def get_pointcloud_msg():
             f"global_heading_error={math.degrees(float(controller_debug.get('global_heading_error', float('nan')))):.3f}deg "
             f"path_d_speed={float(controller_debug.get('estimated_path_lateral_speed', float('nan'))):.3f}m/s "
             f"centerline_lat_acc={float(controller_debug.get('centerline_lat_accel_command', float('nan'))):.3f}m/s2 "
+            f"active_lat_acc_limit={float(controller_debug.get('active_lateral_accel_limit', float('nan'))):.3f}m/s2 "
+            f"curve_authority={bool(controller_debug.get('curve_authority_active', False))} "
+            f"tracking_recovery={bool(controller_debug.get('tracking_recovery_active', False))} "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "

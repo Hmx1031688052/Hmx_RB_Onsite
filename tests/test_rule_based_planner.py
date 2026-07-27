@@ -260,6 +260,34 @@ class RulePlannerTest(unittest.TestCase):
             fast.target_speed, slow.target_speed
         )
 
+    def test_comfort_curve_cap_includes_current_sparse_path_position(self):
+        radius = 25.0
+        stations = np.linspace(0.0, 60.0, 31)
+        angles = stations / radius
+        path = {
+            "x": (radius * np.sin(angles)).tolist(),
+            "y": (
+                radius * (1.0 - np.cos(angles))
+            ).tolist(),
+            "frame_id": "sparse_curve.xodr",
+            "stamp": 1,
+        }
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        planner = RuleBasedPlanner(config)
+        self.assertTrue(planner.reference.update(path))
+
+        curve_limit = planner._curve_speed_limit(
+            ego_s=11.0,
+            base_limit=20.0,
+            ego_speed=4.3,
+        )
+
+        expected = math.sqrt(
+            config.max_lateral_accel / (1.0 / radius)
+        )
+        self.assertLessEqual(curve_limit, expected + 0.15)
+
     def test_vehicle_restarts_after_pedestrian_leaves_clear_lane(self):
         planner = RuleBasedPlanner()
         current_ego = ego(speed=0.0)
@@ -1208,6 +1236,64 @@ class RulePlannerTest(unittest.TestCase):
         self.assertLess(abs(offsets[-1]), 0.01)
         self.assertLess(max(offsets), 1.50)
         self.assertTrue(all(value > 0.0 for value in offsets))
+
+    def test_curve_tracking_recovery_can_exceed_comfort_steer_cap(self):
+        """A comfort threshold must not become a run-off-road limit."""
+        config = PlannerConfig()
+        config.enable_comfort_mode()
+        controller = StableController(config)
+        count = 101
+        zeros = np.zeros(count)
+        trajectory = Trajectory(
+            t=np.linspace(0.0, 10.0, count),
+            s=np.linspace(0.0, 50.0, count),
+            d=zeros,
+            speed=np.full(count, 4.3),
+            accel=zeros,
+            d_speed=zeros,
+            d_accel=zeros,
+            d_jerk=zeros,
+        )
+        trajectory.x = np.linspace(0.0, 50.0, count)
+        trajectory.y = zeros.copy()
+        trajectory.yaw = zeros.copy()
+        trajectory.kappa = np.full(count, 0.04)
+        result = PlanResult(
+            trajectory=trajectory,
+            target_speed=4.3,
+            behavior="RECOVER",
+        )
+        current_ego = ego(y=-1.3, speed=4.3)
+        current_ego.theta = math.radians(-12.0)
+
+        for _ in range(12):
+            controller.control(
+                current_ego,
+                result,
+                0.05,
+                path_lateral_offset=-1.3,
+                path_reference_yaw=0.0,
+                path_reference_curvature=0.04,
+            )
+
+        self.assertTrue(
+            controller.last_debug["tracking_recovery_active"]
+        )
+        self.assertTrue(
+            controller.last_debug["curve_authority_active"]
+        )
+        self.assertGreater(
+            controller.last_debug["active_lateral_accel_limit"],
+            config.max_lateral_accel,
+        )
+        self.assertGreater(
+            abs(controller.last_debug["estimated_lateral_accel"]),
+            config.max_lateral_accel,
+        )
+        self.assertLessEqual(
+            controller.last_debug["active_lateral_accel_limit"],
+            config.max_tracking_lateral_accel,
+        )
 
     def test_cam6_steering_ratio_tracks_logged_merge_curve(self):
         """Reproduce the v6 MT_14 drift with the real chassis ratio.

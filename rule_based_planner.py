@@ -314,6 +314,20 @@ class PlannerConfig(object):
         self.max_lateral_accel = float(
             os.environ.get("RULE_MAX_CARTESIAN_LAT_ACCEL", "10.0")
         )
+        # Comfort scoring uses 0.5 m/s^2, but treating that score threshold as
+        # an unconditional steering-authority limit makes a vehicle already
+        # above the curve speed physically unable to follow the road.  This
+        # higher limit is used only for curve feedforward and active
+        # centreline recovery; ordinary tracking remains at
+        # ``max_lateral_accel``.
+        self.max_tracking_lateral_accel = max(
+            0.5,
+            float(
+                os.environ.get(
+                    "RULE_MAX_TRACKING_LAT_ACCEL", "2.5"
+                )
+            ),
+        )
         # ``comfort_mode`` is deliberately opt-in at the library level so
         # existing users of PlannerConfig keep their tuning.  run.py enables
         # it by default for the scored DriveSim entrypoint.
@@ -1177,6 +1191,30 @@ class RuleBasedPlanner(object):
             )
             stations = stations[valid]
             signed_curvature = signed_curvature[valid]
+            # ``reference.s`` may be spaced roughly one metre apart.  If the
+            # ego lies between two samples, the first retained curve point is
+            # in the future and the braking back-propagation incorrectly
+            # grants extra speed even though the ego is already in the bend.
+            # Insert the interpolated curvature at exactly ego_s so the
+            # steady-curve comfort cap is applied without a sampling gap.
+            current_curvature = float(
+                np.interp(
+                    float(ego_s),
+                    self.reference.s,
+                    self.reference.kappa,
+                )
+            )
+            if (
+                math.isfinite(current_curvature)
+                and abs(current_curvature) <= 0.30
+            ):
+                future = stations > float(ego_s) + 1e-6
+                stations = np.concatenate(
+                    ([float(ego_s)], stations[future])
+                )
+                signed_curvature = np.concatenate(
+                    ([current_curvature], signed_curvature[future])
+                )
             if signed_curvature.size == 0:
                 return base_limit
 
@@ -2963,12 +3001,16 @@ class StableController(object):
         self.path_divergence_count = 0
         self.last_debug = {}
 
-    def _steering_limit(self, speed):
+    def _steering_limit(self, speed, lateral_accel_limit=None):
         cfg = self.config
         if speed < 1.0:
             return cfg.max_steering_wheel_deg
+        if lateral_accel_limit is None:
+            lateral_accel_limit = cfg.max_lateral_accel
         front_limit = math.atan(
-            cfg.max_lateral_accel * cfg.controller_wheelbase / max(speed * speed, EPS)
+            max(0.05, float(lateral_accel_limit))
+            * cfg.controller_wheelbase
+            / max(speed * speed, EPS)
         )
         return min(
             cfg.max_steering_wheel_deg,
@@ -3152,6 +3194,11 @@ class StableController(object):
         centerline_lat_accel_ff = float("nan")
         centerline_lat_accel_feedback = float("nan")
         centerline_lat_accel_command = float("nan")
+        active_lateral_accel_limit = max(
+            0.05, cfg.max_lateral_accel
+        )
+        curve_authority_active = False
+        tracking_recovery_active = False
         heading_error = local_heading_error
         lateral_error = local_lateral_error
         if centerline_control_active:
@@ -3186,9 +3233,54 @@ class StableController(object):
                     lateral_accel_limit,
                     max(0.05, speed * cfg.max_yaw_rate),
                 )
-            centerline_lat_accel_command = _clip(
+            combined_lateral_accel = (
                 centerline_lat_accel_ff
-                + centerline_lat_accel_feedback,
+                + centerline_lat_accel_feedback
+            )
+            curve_authority_active = bool(
+                cfg.comfort_mode
+                and abs(centerline_lat_accel_ff)
+                > lateral_accel_limit + 0.02
+            )
+            tracking_recovery_active = bool(
+                cfg.comfort_mode
+                and (
+                    abs(global_offset) > 0.35
+                    or abs(global_heading_error)
+                    > math.radians(4.0)
+                )
+            )
+            if curve_authority_active:
+                # At least supply the road-curvature feedforward.  Otherwise
+                # an overspeeding ego is guaranteed to run wide even with
+                # zero tracking error.
+                lateral_accel_limit = max(
+                    lateral_accel_limit,
+                    min(
+                        cfg.max_tracking_lateral_accel,
+                        abs(centerline_lat_accel_ff),
+                    ),
+                )
+            if tracking_recovery_active:
+                # Once d/heading starts diverging, temporarily allow the
+                # complete damped feedback command.  The cap remains far
+                # below the physical steering limit and drops back to the
+                # comfort threshold as soon as alignment is recovered.
+                lateral_accel_limit = max(
+                    lateral_accel_limit,
+                    min(
+                        cfg.max_tracking_lateral_accel,
+                        abs(combined_lateral_accel),
+                    ),
+                )
+            if math.isfinite(cfg.max_yaw_rate):
+                lateral_accel_limit = min(
+                    lateral_accel_limit,
+                    max(0.05, speed * cfg.max_yaw_rate),
+                )
+            active_lateral_accel_limit = lateral_accel_limit
+            centerline_lat_accel_command = _clip(
+                combined_lateral_accel,
                 -lateral_accel_limit,
                 lateral_accel_limit,
             )
@@ -3226,7 +3318,11 @@ class StableController(object):
                 else cfg.steering_rate_high
             )
         )
-        if cfg.comfort_mode and speed >= 1.0:
+        if (
+            cfg.comfort_mode
+            and speed >= 1.0
+            and not tracking_recovery_active
+        ):
             # da_lat/dt ~= v^2/L * d(delta)/dt.  Limit steering slew so a
             # command transition itself cannot exceed lateral jerk 1 m/s^3.
             comfort_rate = math.degrees(
@@ -3241,7 +3337,10 @@ class StableController(object):
             self.last_steer - rate * dt,
             self.last_steer + rate * dt,
         )
-        limit = self._steering_limit(speed)
+        limit = self._steering_limit(
+            speed,
+            lateral_accel_limit=active_lateral_accel_limit,
+        )
         steer = _clip(rate_limited, -limit, limit)
         previous_steer = self.last_steer
         steer_rate = (steer - previous_steer) / max(dt, EPS)
@@ -3315,6 +3414,15 @@ class StableController(object):
                 ),
                 "centerline_lat_accel_command": (
                     centerline_lat_accel_command
+                ),
+                "active_lateral_accel_limit": (
+                    active_lateral_accel_limit
+                ),
+                "curve_authority_active": (
+                    curve_authority_active
+                ),
+                "tracking_recovery_active": (
+                    tracking_recovery_active
                 ),
                 "model_front_angle_deg": model_front_angle_deg,
                 "steering_command_sign": cfg.steering_command_sign,
