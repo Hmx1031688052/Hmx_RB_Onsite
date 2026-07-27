@@ -213,7 +213,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-sprint-chassis-ack-v24"
+    "2026-07-27-sprint-any-map-v25"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -3354,7 +3354,10 @@ if __name__ == "__main__":
         "--sprint",
         dest="sprint_enabled",
         action="store_true",
-        help="enable generic direct-goal sprint on --sprint_maps",
+        help=(
+            "force unrestricted direct-goal sprint on every map and bypass "
+            "obstacle decisions"
+        ),
     )
     sprint_group.add_argument(
         "--no_sprint",
@@ -3372,7 +3375,8 @@ if __name__ == "__main__":
         default=None,
         help=(
             "comma-separated map basenames using sprint, or '*' for all; "
-            "default comes from RULE_SPRINT_MAPS"
+            "used only by environment/library selective mode; --sprint "
+            "always forces '*'"
         ),
     )
     arg_parser.add_argument(
@@ -4241,7 +4245,13 @@ if __name__ == "__main__":
         max_steer_deg=args.sprint_max_steer_deg,
         recovery_speed=args.sprint_recovery_speed,
         ignore_obstacles=args.sprint_ignore_obstacles,
+        unrestricted=(args.sprint_enabled is True),
     )
+    if args.sprint_enabled is True:
+        print(
+            "[sprint-config][UNRESTRICTED] --sprint active: "
+            "maps=* obstacle_decisions=BYPASSED"
+        )
     print(
         "[planner-config] "
         f"perception_source={PERCEPTION_SOURCE.upper()} "

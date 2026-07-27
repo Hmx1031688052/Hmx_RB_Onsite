@@ -547,6 +547,37 @@ class RulePlannerTest(unittest.TestCase):
         self.assertAlmostEqual(config.sprint_accel, 31.0)
         self.assertAlmostEqual(config.sprint_max_steer_deg, 9.0)
 
+    def test_unrestricted_sprint_applies_to_every_map_and_bypasses_obstacles(self):
+        config = PlannerConfig().configure_sprint(
+            enabled=True,
+            map_names="only-this-map.xodr",
+            ignore_obstacles=False,
+            unrestricted=True,
+        )
+
+        self.assertEqual(config.sprint_map_names, {"*"})
+        self.assertTrue(config.sprint_ignore_obstacles)
+        self.assertTrue(config.sprint_applies_to("arbitrary-map.xodr"))
+
+        path = {
+            "x": [0.0, 5.0, 10.0],
+            "y": [0.0, 0.0, 0.0],
+            "frame_id": "arbitrary-map.xodr",
+            "stamp": 1,
+        }
+        planner = RuleBasedPlanner(config)
+        result = planner.plan(
+            ego(speed=3.0),
+            [obstacle(3.0, y=0.0, speed=0.0)],
+            path,
+            "arbitrary-map.xodr",
+        )
+
+        self.assertEqual(result.behavior, "SPRINT")
+        self.assertTrue(
+            planner.last_debug["sprint_collision_bypass"]
+        )
+
     def test_sprint_keeps_collision_checks_by_default(self):
         path = {
             "x": [0.0, 0.0, 5.0, 10.0],

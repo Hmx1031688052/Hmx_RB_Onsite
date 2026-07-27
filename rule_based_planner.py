@@ -618,6 +618,7 @@ class PlannerConfig(object):
         recovery_speed=None,
         recovery_decel=None,
         ignore_obstacles=None,
+        unrestricted=None,
     ):
         """Configure the generic direct-goal sprint controller.
 
@@ -673,6 +674,14 @@ class PlannerConfig(object):
             )
         if ignore_obstacles is not None:
             self.sprint_ignore_obstacles = bool(ignore_obstacles)
+        if unrestricted:
+            # ``--sprint`` is an explicit operator takeover: it applies to
+            # every map and must not fall back to ordinary obstacle decisions.
+            # Selective sprint remains available to library/environment users
+            # by leaving ``unrestricted`` false and providing ``map_names``.
+            self.sprint_enabled = True
+            self.sprint_map_names = {"*"}
+            self.sprint_ignore_obstacles = True
         return self
 
     def sprint_applies_to(self, map_name):
