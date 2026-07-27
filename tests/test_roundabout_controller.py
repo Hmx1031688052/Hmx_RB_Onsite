@@ -5,27 +5,27 @@ from types import SimpleNamespace
 from roundabout_controller import RoundaboutController
 
 
-def ego(x=0.0, y=0.0, speed=0.0):
+def ego(x=0.0, y=0.0, speed=0.0, theta=0.0):
     return SimpleNamespace(
         x=x,
         y=y,
-        theta=0.0,
+        theta=theta,
         speed=speed,
         length=4.0,
         width=1.8,
     )
 
 
-def vehicle(identifier, x, y=0.0, speed=0.0):
+def vehicle(identifier, x, y=0.0, speed=0.0, theta=0.0):
     return SimpleNamespace(
         id=str(identifier),
         x=x,
         y=y,
-        theta=0.0,
+        theta=theta,
         speed=speed,
         speed_valid=True,
-        world_vx=speed,
-        world_vy=0.0,
+        world_vx=speed * math.cos(theta),
+        world_vy=speed * math.sin(theta),
         length=4.0,
         width=1.8,
         obs_type=1,
@@ -42,8 +42,35 @@ def straight_path():
     }
 
 
+def curved_path(radius=20.0):
+    angles = [
+        0.5 * math.pi * index / 100.0
+        for index in range(101)
+    ]
+    return {
+        "x": [radius * math.sin(value) for value in angles],
+        "y": [
+            radius * (1.0 - math.cos(value))
+            for value in angles
+        ],
+        "kappa": [1.0 / radius] * len(angles),
+        "frame_id": "roundabout.xodr",
+        "stamp": 2,
+    }
+
+
 class RoundaboutControllerTest(unittest.TestCase):
-    def test_follow_locks_nearest_same_lane_vehicle_once(self):
+    def test_clear_global_path_cruises(self):
+        controller = RoundaboutController(
+            mode="follow", max_speed=30.0
+        )
+        plan = controller.plan(ego(), [], straight_path())
+
+        self.assertEqual(plan.behavior, "ROUNDABOUT_CRUISE")
+        self.assertEqual(plan.target_speed, 30.0)
+        self.assertIsNone(controller.locked_lead_id)
+
+    def test_nearest_path_vehicle_is_selected_each_cycle(self):
         controller = RoundaboutController(mode="follow")
         first = controller.plan(
             ego(),
@@ -57,17 +84,56 @@ class RoundaboutControllerTest(unittest.TestCase):
         )
 
         self.assertEqual(first.behavior, "ROUNDABOUT_FOLLOW")
-        self.assertEqual(controller.locked_lead_id, "near")
         self.assertEqual(second.behavior, "ROUNDABOUT_FOLLOW")
         self.assertEqual(
-            controller.last_debug["lead"]["id"], "near"
+            controller.last_debug["lead"]["id"], "far"
         )
 
-    def test_follow_uses_one_metre_bumper_gap(self):
+    def test_path_vehicle_gate_uses_absolute_d_below_one_metre(self):
         controller = RoundaboutController(
-            mode="follow",
-            desired_gap=1.0,
-            max_speed=30.0,
+            mode="follow", lane_half_width=1.0
+        )
+        controller.plan(
+            ego(),
+            [
+                vehicle("outside", 5.0, y=1.01),
+                vehicle("inside", 8.0, y=0.99),
+            ],
+            straight_path(),
+        )
+
+        self.assertEqual(
+            controller.last_debug["lead"]["id"], "inside"
+        )
+        self.assertLess(
+            abs(controller.last_debug["lead"]["d"]), 1.0
+        )
+
+    def test_vehicle_outside_path_corridor_restores_cruise(self):
+        controller = RoundaboutController(mode="follow")
+        plan = controller.plan(
+            ego(),
+            [vehicle("other_lane", 7.0, y=2.0)],
+            straight_path(),
+        )
+
+        self.assertEqual(plan.behavior, "ROUNDABOUT_CRUISE")
+        self.assertEqual(plan.target_speed, controller.max_speed)
+
+    def test_opposite_direction_vehicle_is_not_followed(self):
+        controller = RoundaboutController(mode="follow")
+        plan = controller.plan(
+            ego(),
+            [vehicle("wrong_way", 5.0, theta=math.pi)],
+            straight_path(),
+        )
+
+        self.assertEqual(plan.behavior, "ROUNDABOUT_CRUISE")
+        self.assertIsNone(controller.locked_lead_id)
+
+    def test_one_metre_bumper_gap_is_idm_minimum_gap(self):
+        controller = RoundaboutController(
+            mode="follow", desired_gap=1.0
         )
         plan = controller.plan(
             ego(speed=8.0),
@@ -75,52 +141,81 @@ class RoundaboutControllerTest(unittest.TestCase):
             straight_path(),
         )
 
+        self.assertEqual(plan.behavior, "ROUNDABOUT_FOLLOW")
         self.assertAlmostEqual(
             controller.last_debug["lead"]["gap"], 1.0
         )
-        self.assertAlmostEqual(plan.target_speed, 8.0)
 
-    def test_follow_catches_gap_without_switching_target(self):
+    def test_relative_speed_causes_earlier_idm_deceleration(self):
+        closing_controller = RoundaboutController(mode="follow")
+        matched_controller = RoundaboutController(mode="follow")
+        closing = closing_controller.control(
+            ego(speed=10.0),
+            [vehicle("lead", 14.0, speed=2.0)],
+            straight_path(),
+            0.02,
+        )
+        matched = matched_controller.control(
+            ego(speed=10.0),
+            [vehicle("lead", 14.0, speed=10.0)],
+            straight_path(),
+            0.02,
+        )
+
+        self.assertLess(closing.acc, matched.acc)
+        self.assertGreater(
+            closing_controller.last_debug[
+                "desired_dynamic_gap"
+            ],
+            matched_controller.last_debug[
+                "desired_dynamic_gap"
+            ],
+        )
+
+    def test_ttc_is_emergency_braking_fallback(self):
         controller = RoundaboutController(
             mode="follow",
-            desired_gap=1.0,
-            max_speed=30.0,
+            ttc_emergency=1.0,
+            max_decel=15.5,
         )
-        controller.plan(
-            ego(),
-            [vehicle("lead", 7.0)],
+        command = controller.control(
+            ego(speed=10.0),
+            [vehicle("lead", 6.0, speed=0.0)],
             straight_path(),
+            0.02,
+        )
+
+        self.assertEqual(command.acc, -15.5)
+        self.assertEqual(command.speed, 0.0)
+        self.assertTrue(
+            controller.last_debug["ttc_emergency_active"]
+        )
+        self.assertEqual(
+            controller.last_plan.behavior,
+            "ROUNDABOUT_TTC_BRAKE",
+        )
+
+    def test_curve_speed_caps_cruise_before_turn(self):
+        controller = RoundaboutController(
+            mode="follow",
+            max_speed=30.0,
+            curve_lateral_accel=4.0,
         )
         plan = controller.plan(
-            ego(speed=4.0),
-            [vehicle("lead", 12.0, speed=6.0)],
-            straight_path(),
+            ego(speed=5.0), [], curved_path(radius=20.0)
         )
 
-        self.assertGreater(plan.target_speed, 6.0)
-        self.assertEqual(controller.locked_lead_id, "lead")
+        self.assertAlmostEqual(
+            plan.target_speed, math.sqrt(4.0 / 0.05), delta=0.1
+        )
+        self.assertLess(plan.target_speed, 30.0)
 
-    def test_follow_does_not_jump_to_speed_ceiling_for_large_gap(self):
+    def test_constant_speed_lead_is_followed_without_collision(self):
         controller = RoundaboutController(
             mode="follow",
             desired_gap=1.0,
+            time_headway=0.8,
             max_speed=30.0,
-            catchup_speed=6.0,
-        )
-        plan = controller.plan(
-            ego(),
-            [vehicle("lead", 15.0, speed=3.0)],
-            straight_path(),
-        )
-
-        self.assertLessEqual(plan.target_speed, 9.0)
-
-    def test_constant_speed_lead_is_approached_without_overshoot(self):
-        controller = RoundaboutController(
-            mode="follow",
-            desired_gap=1.0,
-            max_speed=30.0,
-            max_accel=20.0,
             follow_max_accel=8.0,
         )
         dt = 0.02
@@ -128,10 +223,12 @@ class RoundaboutControllerTest(unittest.TestCase):
         lead_x = 15.0
         minimum_gap = float("inf")
         maximum_accel = 0.0
-        for _ in range(400):
-            lead = vehicle("lead", lead_x, speed=3.0)
+        for _ in range(500):
             command = controller.control(
-                ego_state, [lead], straight_path(), dt
+                ego_state,
+                [vehicle("lead", lead_x, speed=3.0)],
+                straight_path(),
+                dt,
             )
             maximum_accel = max(maximum_accel, command.acc)
             ego_state.speed = max(
@@ -149,57 +246,7 @@ class RoundaboutControllerTest(unittest.TestCase):
         self.assertGreater(minimum_gap, 0.5)
         self.assertAlmostEqual(ego_state.speed, 3.0, delta=0.5)
 
-    def test_locked_lead_survives_lane_projection_departure(self):
-        controller = RoundaboutController(mode="follow")
-        controller.plan(
-            ego(),
-            [vehicle("locked", 7.0)],
-            straight_path(),
-        )
-        plan = controller.plan(
-            ego(),
-            [vehicle("locked", 8.0, y=5.0, speed=2.0)],
-            straight_path(),
-        )
-
-        self.assertEqual(plan.behavior, "ROUNDABOUT_FOLLOW")
-        self.assertEqual(
-            controller.last_debug["lead"]["id"], "locked"
-        )
-
-    def test_initial_lock_rejects_opposite_direction_vehicle(self):
-        controller = RoundaboutController(mode="follow")
-        wrong_way = vehicle("wrong", 5.0)
-        wrong_way.theta = math.pi
-        plan = controller.plan(
-            ego(),
-            [wrong_way, vehicle("lead", 8.0)],
-            straight_path(),
-        )
-
-        self.assertEqual(plan.behavior, "ROUNDABOUT_FOLLOW")
-        self.assertEqual(controller.locked_lead_id, "lead")
-
-    def test_lost_locked_lead_does_not_relock_another_vehicle(self):
-        controller = RoundaboutController(mode="follow")
-        controller.plan(
-            ego(),
-            [vehicle("locked", 7.0)],
-            straight_path(),
-        )
-        plan = controller.plan(
-            ego(),
-            [vehicle("other", 6.0)],
-            straight_path(),
-        )
-
-        self.assertEqual(
-            plan.behavior, "ROUNDABOUT_FOLLOW_WAIT"
-        )
-        self.assertEqual(plan.target_speed, 0.0)
-        self.assertEqual(controller.locked_lead_id, "locked")
-
-    def test_direct_mode_ignores_traffic_decisions(self):
+    def test_direct_mode_ignores_traffic(self):
         controller = RoundaboutController(
             mode="direct", max_speed=24.0
         )
@@ -226,18 +273,6 @@ class RoundaboutControllerTest(unittest.TestCase):
         self.assertTrue(
             controller.last_debug["roundabout_exclusive"]
         )
-
-    def test_waiting_at_standstill_does_not_steer(self):
-        controller = RoundaboutController(mode="follow")
-        command = controller.control(
-            ego(y=-1.0, speed=0.0),
-            [],
-            straight_path(),
-            0.05,
-        )
-
-        self.assertEqual(command.speed, 0.0)
-        self.assertEqual(command.steer, 0.0)
 
 
 if __name__ == "__main__":

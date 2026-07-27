@@ -1,15 +1,16 @@
-"""Deterministic roundabout path tracking and fixed-lead following.
+"""Exclusive global-path controller with IDM longitudinal following.
 
-This controller deliberately has no behaviour tree, obstacle prediction, or
-trajectory-candidate sampling.  The launch mode owns the whole session:
+There is no behaviour tree, obstacle prediction, or trajectory sampling:
 
-* ``direct`` tracks the global path at a fixed maximum speed.
-* ``follow`` locks the nearest same-lane lead once and controls a fixed
-  bumper-to-bumper gap to that ID for the rest of the session.
+* lateral control follows the supplied global path;
+* vehicles with ``abs(path_d) < lane_half_width`` are path traffic;
+* a clear path uses the free-road IDM term;
+* the nearest path vehicle uses full IDM car following;
+* TTC is an emergency brake only;
+* look-ahead path curvature caps the IDM desired speed.
 """
 
 import math
-import os
 import time
 
 from rule_based_planner import ControlOutput, PlanResult, ReferencePath
@@ -35,7 +36,7 @@ def _wrap(angle):
 
 
 class RoundaboutController(object):
-    """Session-exclusive global-path/direct-follow controller."""
+    """Global-path lateral control plus cruise/follow IDM."""
 
     VALID_MODES = ("off", "follow", "direct")
 
@@ -46,11 +47,14 @@ class RoundaboutController(object):
         max_speed=30.0,
         max_accel=20.0,
         max_decel=15.5,
-        lane_half_width=1.75,
-        gap_gain=1.5,
-        speed_gain=1.8,
+        lane_half_width=1.0,
         follow_max_accel=8.0,
-        catchup_speed=6.0,
+        time_headway=0.8,
+        idm_comfort_decel=6.0,
+        idm_delta=4.0,
+        ttc_emergency=1.0,
+        curve_lateral_accel=4.0,
+        curve_lookahead_time=2.0,
         wheelbase=3.38,
         steering_ratio=1.65,
         max_steer_deg=28.0,
@@ -67,21 +71,32 @@ class RoundaboutController(object):
         self.max_speed = max(0.1, float(max_speed))
         self.max_accel = max(0.1, float(max_accel))
         self.max_decel = max(0.1, float(max_decel))
-        self.lane_half_width = max(0.5, float(lane_half_width))
-        self.gap_gain = max(0.1, float(gap_gain))
-        self.speed_gain = max(0.1, float(speed_gain))
+        self.lane_half_width = max(0.1, float(lane_half_width))
         self.follow_max_accel = max(
             0.1, min(self.max_accel, float(follow_max_accel))
         )
-        self.catchup_speed = max(0.1, float(catchup_speed))
+        self.time_headway = max(0.1, float(time_headway))
+        self.idm_comfort_decel = max(
+            0.1, float(idm_comfort_decel)
+        )
+        self.idm_delta = max(1.0, float(idm_delta))
+        self.ttc_emergency = max(0.1, float(ttc_emergency))
+        self.curve_lateral_accel = max(
+            0.1, float(curve_lateral_accel)
+        )
+        self.curve_lookahead_time = max(
+            0.1, float(curve_lookahead_time)
+        )
         self.wheelbase = max(0.5, float(wheelbase))
         self.steering_ratio = max(0.1, float(steering_ratio))
         self.max_steer_deg = max(1.0, float(max_steer_deg))
-        self.steer_rate_deg_s = max(
-            1.0, float(steer_rate_deg_s)
-        )
+        self.steer_rate_deg_s = max(1.0, float(steer_rate_deg_s))
+
         self.reference = ReferencePath()
         self.map_name = ""
+        # Kept under the old name because run.py and existing debug tooling
+        # expose it. It now means current nearest path lead, not a permanent
+        # session lock.
         self.locked_lead_id = None
         self.locked_lead_description = None
         self.last_steer = 0.0
@@ -106,7 +121,16 @@ class RoundaboutController(object):
             None, 0.0, "ROUNDABOUT_OFF", False, ""
         )
 
-    def _ego_values(self, ego):
+    @staticmethod
+    def _path_half_extent(length, width, object_yaw, path_yaw):
+        delta = _wrap(object_yaw - path_yaw)
+        return 0.5 * (
+            length * abs(math.cos(delta))
+            + width * abs(math.sin(delta))
+        )
+
+    @staticmethod
+    def _ego_values(ego):
         return {
             "x": _finite(getattr(ego, "x", 0.0)),
             "y": _finite(getattr(ego, "y", 0.0)),
@@ -122,7 +146,8 @@ class RoundaboutController(object):
             ),
         }
 
-    def _obstacle_values(self, obstacle):
+    @staticmethod
+    def _obstacle_values(obstacle):
         yaw = _finite(getattr(obstacle, "theta", 0.0))
         speed = max(
             0.0, _finite(getattr(obstacle, "speed", 0.0))
@@ -140,7 +165,6 @@ class RoundaboutController(object):
             vx = speed * math.cos(yaw)
             vy = speed * math.sin(yaw)
         return {
-            "raw": obstacle,
             "id": str(getattr(obstacle, "id", "-1")),
             "x": _finite(getattr(obstacle, "x", 0.0)),
             "y": _finite(getattr(obstacle, "y", 0.0)),
@@ -171,202 +195,126 @@ class RoundaboutController(object):
             ),
         }
 
-    @staticmethod
-    def _path_half_extent(length, width, object_yaw, path_yaw):
-        delta = _wrap(object_yaw - path_yaw)
-        return 0.5 * (
-            length * abs(math.cos(delta))
-            + width * abs(math.sin(delta))
+    def _project_vehicle(self, ego_values, ego_projection, obstacle):
+        item = self._obstacle_values(obstacle)
+        projection = self.reference.project(item["x"], item["y"])
+        if projection is None:
+            return None
+
+        ego_extent = self._path_half_extent(
+            ego_values["length"],
+            ego_values["width"],
+            ego_values["yaw"],
+            ego_projection["yaw"],
         )
-
-    def _lead_geometry(self, ego_values, ego_projection, raw):
-        """Measure one obstacle without using lane gates.
-
-        The initial lock is lane-gated, but a fixed target must remain
-        observable while either vehicle is slightly off the reference path.
-        """
-        item = self._obstacle_values(raw)
-        dx = item["x"] - ego_values["x"]
-        dy = item["y"] - ego_values["y"]
-        cos_ego = math.cos(ego_values["yaw"])
-        sin_ego = math.sin(ego_values["yaw"])
-        forward = dx * cos_ego + dy * sin_ego
-        lateral = -dx * sin_ego + dy * cos_ego
-        heading_delta = _wrap(item["yaw"] - ego_values["yaw"])
-        ego_extent = 0.5 * ego_values["length"]
         obstacle_extent = self._path_half_extent(
             item["length"],
             item["width"],
             item["yaw"],
-            ego_values["yaw"],
+            projection["yaw"],
         )
-        ego_gap = forward - ego_extent - obstacle_extent
-        ego_longitudinal_speed = max(
-            0.0, item["vx"] * cos_ego + item["vy"] * sin_ego
-        )
-
-        projection = self.reference.project(item["x"], item["y"])
-        path_gap = None
-        path_speed = None
-        relative_d = None
-        if projection is not None:
-            relative_d = projection["d"] - ego_projection["d"]
-            path_ego_extent = self._path_half_extent(
-                ego_values["length"],
-                ego_values["width"],
-                ego_values["yaw"],
-                ego_projection["yaw"],
-            )
-            path_obstacle_extent = self._path_half_extent(
-                item["length"],
-                item["width"],
-                item["yaw"],
-                projection["yaw"],
-            )
-            centre_distance = projection["s"] - ego_projection["s"]
-            path_gap = (
-                centre_distance
-                - path_ego_extent
-                - path_obstacle_extent
-            )
-            path_speed = max(
-                0.0,
-                item["vx"] * math.cos(projection["yaw"])
-                + item["vy"] * math.sin(projection["yaw"]),
-            )
-
-        # Along a curve, Frenet distance is more useful than the ego x-axis.
-        # If projection puts the target behind, retain the physical ego-frame
-        # measurement so a fixed ID cannot disappear because of topology.
-        use_path = (
-            path_gap is not None
-            and projection["s"] > ego_projection["s"]
-            and forward > -0.5 * ego_values["length"]
+        centre_distance = projection["s"] - ego_projection["s"]
+        path_speed = max(
+            0.0,
+            item["vx"] * math.cos(projection["yaw"])
+            + item["vy"] * math.sin(projection["yaw"]),
         )
         item.update(
             {
-                "s": (
-                    projection["s"] if projection is not None else None
+                "s": projection["s"],
+                "d": projection["d"],
+                "relative_d": (
+                    projection["d"] - ego_projection["d"]
                 ),
-                "d": (
-                    projection["d"] if projection is not None else None
+                "path_yaw": projection["yaw"],
+                "path_heading_delta": _wrap(
+                    item["yaw"] - projection["yaw"]
                 ),
-                "relative_d": relative_d,
-                "path_yaw": (
-                    projection["yaw"]
-                    if projection is not None
-                    else ego_values["yaw"]
-                ),
-                "forward": forward,
-                "lateral": lateral,
-                "heading_delta": heading_delta,
-                "ego_gap": ego_gap,
-                "path_gap": path_gap,
-                "gap_source": "path" if use_path else "ego",
-                "gap": path_gap if use_path else ego_gap,
-                "longitudinal_speed": (
-                    path_speed if use_path else ego_longitudinal_speed
-                ),
+                "centre_distance": centre_distance,
+                "gap": centre_distance - ego_extent - obstacle_extent,
+                "longitudinal_speed": path_speed,
             }
         )
         return item
 
-    def _select_or_find_locked_lead(
+    def _select_path_lead(
         self, ego_values, ego_projection, obstacles
     ):
-        measured = [
-            self._lead_geometry(
-                ego_values, ego_projection, raw
+        candidates = []
+        for obstacle in obstacles or []:
+            item = self._project_vehicle(
+                ego_values, ego_projection, obstacle
             )
-            for raw in (obstacles or [])
+            if item is None:
+                continue
+            is_vehicle = (
+                item["obs_type"] == 1
+                or "VEHICLE" in item["role"].upper()
+            )
+            if (
+                is_vehicle
+                and item["id"] not in ("", "-1", "None")
+                and abs(item["d"]) < self.lane_half_width
+                and item["centre_distance"] > 0.0
+                and abs(item["path_heading_delta"])
+                <= math.radians(55.0)
+            ):
+                candidates.append(item)
+
+        lead = (
+            min(candidates, key=lambda item: item["centre_distance"])
+            if candidates
+            else None
+        )
+        previous_id = self.locked_lead_id
+        self.locked_lead_id = lead["id"] if lead else None
+        self.locked_lead_description = lead["role"] if lead else None
+        if lead is not None and lead["id"] != previous_id:
+            print(
+                "[roundabout][LEAD] id={} role={} model={} "
+                "gap={:.3f}m path_d={:.3f}m path_ds={:.3f}m "
+                "size={:.2f}x{:.2f}m".format(
+                    lead["id"],
+                    lead["role"] or "unknown",
+                    lead["model_name"] or "unknown",
+                    lead["gap"],
+                    lead["d"],
+                    lead["centre_distance"],
+                    lead["length"],
+                    lead["width"],
+                )
+            )
+        return lead, len(candidates)
+
+    def _curve_speed_limit(self, projection, speed):
+        lookahead = _clip(
+            8.0 + speed * self.curve_lookahead_time,
+            15.0,
+            45.0,
+        )
+        sample_count = max(2, int(math.ceil(lookahead)) + 1)
+        stations = [
+            projection["s"]
+            + lookahead * index / float(sample_count - 1)
+            for index in range(sample_count)
         ]
-        if self.locked_lead_id is None:
-            candidates = [
-                item
-                for item in measured
-                if item["id"] not in ("", "-1", "None")
-                and (
-                    item["obs_type"] == 1
-                    or "VEHICLE" in item["role"].upper()
-                )
-                and item["forward"] > 0.0
-                and abs(item["lateral"])
-                <= self.lane_half_width + 0.5 * item["width"]
-                and abs(item["heading_delta"]) <= math.radians(55.0)
-            ]
-            if candidates:
-                lead = min(
-                    candidates, key=lambda item: item["forward"]
-                )
-                self.locked_lead_id = lead["id"]
-                self.locked_lead_description = lead["role"]
-                print(
-                    "[roundabout][LOCK] lead_id={} role={} "
-                    "model={} gap={:.3f}m source={} "
-                    "forward={:.3f}m lateral={:.3f}m "
-                    "heading_delta={:.1f}deg size={:.2f}x{:.2f}m".format(
-                        lead["id"],
-                        lead["role"] or "unknown",
-                        lead["model_name"] or "unknown",
-                        lead["gap"],
-                        lead["gap_source"],
-                        lead["forward"],
-                        lead["lateral"],
-                        math.degrees(lead["heading_delta"]),
-                        lead["length"],
-                        lead["width"],
-                    )
-                )
-                return lead
-            return None
-        return next(
-            (
-                item
-                for item in measured
-                if item["id"] == self.locked_lead_id
-            ),
-            None,
+        _, _, _, kappas = self.reference.sample(stations)
+        max_curvature = max(
+            [abs(_finite(value)) for value in kappas] + [0.0]
         )
-
-    def _longitudinal_target(
-        self, ego_values, ego_projection, obstacles
-    ):
-        if self.mode == "direct":
-            return self.max_speed, None, "ROUNDABOUT_DIRECT", ""
-
-        lead = self._select_or_find_locked_lead(
-            ego_values, ego_projection, obstacles
+        if max_curvature <= 1e-4:
+            curve_speed = self.max_speed
+        else:
+            curve_speed = math.sqrt(
+                self.curve_lateral_accel / max_curvature
+            )
+        return (
+            _clip(curve_speed, 0.5, self.max_speed),
+            max_curvature,
+            lookahead,
         )
-        if lead is None:
-            reason = (
-                "waiting for initial same-lane lead"
-                if self.locked_lead_id is None
-                else "locked lead temporarily unavailable"
-            )
-            return 0.0, None, "ROUNDABOUT_FOLLOW_WAIT", reason
-
-        gap_error = lead["gap"] - self.desired_gap
-        speed_correction = _clip(
-            self.gap_gain * gap_error,
-            -self.catchup_speed,
-            self.catchup_speed,
-        )
-        target_speed = lead["longitudinal_speed"] + speed_correction
-        if gap_error > 0.0:
-            # Never request a closing speed that cannot be removed before the
-            # configured one-metre gap, even if catch-up gain is increased.
-            safe_closing_speed = math.sqrt(
-                2.0 * self.max_decel * gap_error
-            )
-            target_speed = min(
-                target_speed,
-                lead["longitudinal_speed"] + safe_closing_speed,
-            )
-        target_speed = _clip(target_speed, 0.0, self.max_speed)
-        return target_speed, lead, "ROUNDABOUT_FOLLOW", ""
 
     def plan(self, ego, obstacles, global_path, map_name=""):
-        """Update the fixed lead/gap target without trajectory sampling."""
         self.map_name = str(map_name or self.map_name)
         if not self.enabled:
             self.last_plan = PlanResult(
@@ -406,11 +354,41 @@ class RoundaboutController(object):
             }
             return self.last_plan
 
-        target_speed, lead, behavior, reason = (
-            self._longitudinal_target(
-                ego_values, projection, obstacles
+        curve_speed, max_curvature, curve_lookahead = (
+            self._curve_speed_limit(
+                projection, ego_values["speed"]
             )
         )
+        lead = None
+        path_vehicle_count = 0
+        if self.mode == "direct":
+            behavior = "ROUNDABOUT_DIRECT"
+            reason = ""
+            target_speed = curve_speed
+            self.locked_lead_id = None
+            self.locked_lead_description = None
+        else:
+            lead, path_vehicle_count = self._select_path_lead(
+                ego_values, projection, obstacles
+            )
+            if lead is None:
+                behavior = "ROUNDABOUT_CRUISE"
+                reason = "global path clear"
+                target_speed = curve_speed
+            else:
+                behavior = "ROUNDABOUT_FOLLOW"
+                reason = ""
+                follow_speed = lead["longitudinal_speed"] + max(
+                    0.0,
+                    (lead["gap"] - self.desired_gap)
+                    / self.time_headway,
+                )
+                target_speed = _clip(
+                    min(curve_speed, follow_speed),
+                    0.0,
+                    self.max_speed,
+                )
+
         lead_debug = None
         if lead is not None:
             lead_debug = {
@@ -421,11 +399,7 @@ class RoundaboutController(object):
                     "s",
                     "d",
                     "relative_d",
-                    "forward",
-                    "lateral",
-                    "ego_gap",
-                    "path_gap",
-                    "gap_source",
+                    "centre_distance",
                     "longitudinal_speed",
                     "role",
                 )
@@ -438,6 +412,12 @@ class RoundaboutController(object):
             ),
             "desired_speed": target_speed,
             "desired_gap": self.desired_gap,
+            "time_headway": self.time_headway,
+            "curve_speed_limit": curve_speed,
+            "lookahead_max_curvature": max_curvature,
+            "curve_lookahead": curve_lookahead,
+            "path_d_threshold": self.lane_half_width,
+            "path_vehicle_count": path_vehicle_count,
             "locked_lead_id": self.locked_lead_id,
             "locked_lead_role": self.locked_lead_description,
             "lead": lead_debug,
@@ -448,29 +428,29 @@ class RoundaboutController(object):
             "reason": reason,
         }
         self.last_plan = PlanResult(
-            None,
-            target_speed,
-            behavior,
-            False,
-            reason,
+            None, target_speed, behavior, False, reason
         )
+
         now = time.monotonic()
         if now - self._last_status_print >= 0.5:
             self._last_status_print = now
-            if lead is None:
-                lead_text = "none"
-            else:
-                lead_text = "{} gap={:.2f}m v={:.2f}m/s".format(
+            lead_text = (
+                "none"
+                if lead is None
+                else "{} gap={:.2f}m v={:.2f}m/s d={:.2f}m".format(
                     lead["id"],
                     lead["gap"],
                     lead["longitudinal_speed"],
+                    lead["d"],
                 )
+            )
             print(
                 "[roundabout] mode={} behavior={} target_v={:.2f} "
-                "lead={} d={:.2f}m".format(
+                "curve_v={:.2f} lead={} ego_d={:.2f}m".format(
                     self.mode,
                     behavior,
                     target_speed,
+                    curve_speed,
                     lead_text,
                     projection["d"],
                 )
@@ -488,6 +468,7 @@ class RoundaboutController(object):
         if speed < 0.25 and target_speed < 0.1:
             self.last_steer = 0.0
             return 0.0, heading_error, lateral_error, 0.0
+
         feedforward = math.atan(
             self.wheelbase * projection["kappa"]
         )
@@ -502,12 +483,11 @@ class RoundaboutController(object):
             -8.0,
             8.0,
         )
-        raw_steer = (
-            math.degrees(feedforward) * self.steering_ratio
-            + feedback_steer
-        )
         raw_steer = _clip(
-            raw_steer, -self.max_steer_deg, self.max_steer_deg
+            math.degrees(feedforward) * self.steering_ratio
+            + feedback_steer,
+            -self.max_steer_deg,
+            self.max_steer_deg,
         )
         change = self.steer_rate_deg_s * max(0.005, float(dt))
         steer = _clip(
@@ -518,6 +498,66 @@ class RoundaboutController(object):
         self.last_steer = steer
         return steer, heading_error, lateral_error, raw_steer
 
+    def _idm_acceleration(self, ego_speed, curve_speed, lead):
+        acceleration = (
+            self.max_accel
+            if self.mode == "direct"
+            else self.follow_max_accel
+        )
+        desired_speed = max(0.1, curve_speed)
+        free_term = (
+            max(0.0, ego_speed) / desired_speed
+        ) ** self.idm_delta
+        interaction_term = 0.0
+        dynamic_gap = self.desired_gap
+        closing_speed = 0.0
+        ttc = float("inf")
+        emergency = False
+
+        if self.mode == "follow" and lead is not None:
+            lead_speed = lead["longitudinal_speed"]
+            closing_speed = ego_speed - lead_speed
+            dynamic_gap = self.desired_gap + max(
+                0.0,
+                ego_speed * self.time_headway
+                + ego_speed
+                * closing_speed
+                / (
+                    2.0
+                    * math.sqrt(
+                        acceleration * self.idm_comfort_decel
+                    )
+                ),
+            )
+            effective_gap = max(0.05, lead["gap"])
+            interaction_term = (
+                dynamic_gap / effective_gap
+            ) ** 2
+            if closing_speed > 0.05 and lead["gap"] > 0.0:
+                ttc = lead["gap"] / closing_speed
+            emergency = (
+                lead["gap"] <= 0.05
+                or ttc <= self.ttc_emergency
+            )
+
+        command = acceleration * (
+            1.0 - free_term - interaction_term
+        )
+        if emergency:
+            command = -self.max_decel
+        command = _clip(
+            command, -self.max_decel, acceleration
+        )
+        return {
+            "acc": command,
+            "desired_dynamic_gap": dynamic_gap,
+            "closing_speed": closing_speed,
+            "ttc": ttc,
+            "ttc_emergency_active": emergency,
+            "free_road_term": free_term,
+            "interaction_term": interaction_term,
+        }
+
     def control(
         self,
         ego,
@@ -527,7 +567,6 @@ class RoundaboutController(object):
         map_name="",
         steering_feedback=None,
     ):
-        """Compute one exclusive direct/follow control command."""
         plan = self.plan(ego, obstacles, global_path, map_name)
         ego_values = self._ego_values(ego)
         projection = self.last_debug.get("projection")
@@ -552,61 +591,41 @@ class RoundaboutController(object):
                 ego_values, projection, dt, target_speed
             )
         )
-        speed_error = target_speed - ego_values["speed"]
-        accel_ceiling = (
-            self.follow_max_accel
-            if self.mode == "follow"
-            else self.max_accel
-        )
-        acc = _clip(
-            self.speed_gain * speed_error,
-            -self.max_decel,
-            accel_ceiling,
-        )
         lead = self.last_debug.get("lead")
-        if self.mode == "follow" and lead is not None:
-            lead_speed = lead["longitudinal_speed"]
-            closing_speed = ego_values["speed"] - lead_speed
-            gap_margin = lead["gap"] - self.desired_gap
-            # Relative-speed damping prevents the old 20 m/s² launch followed
-            # by full braking. It is intentionally independent of sampling.
-            acc += 0.9 * (lead_speed - ego_values["speed"])
-            acc = _clip(acc, -self.max_decel, accel_ceiling)
-            stopping_distance = (
-                closing_speed * closing_speed
-                / (2.0 * self.max_decel)
-                if closing_speed > 0.0
-                else 0.0
+        idm = self._idm_acceleration(
+            ego_values["speed"],
+            self.last_debug["curve_speed_limit"],
+            lead,
+        )
+        if idm["ttc_emergency_active"]:
+            target_speed = 0.0
+            self.last_plan = PlanResult(
+                None,
+                0.0,
+                "ROUNDABOUT_TTC_BRAKE",
+                True,
+                "TTC emergency brake",
             )
-            if (
-                closing_speed > 0.0
-                and gap_margin
-                <= stopping_distance + max(0.15, 0.15 * closing_speed)
-            ):
-                acc = -self.max_decel
-            elif gap_margin <= 0.0:
-                target_speed = min(target_speed, lead_speed)
-                if closing_speed > 0.0:
-                    acc = -self.max_decel
-                else:
-                    acc = min(0.0, acc)
-            self.last_debug.update(
-                {
-                    "closing_speed": closing_speed,
-                    "gap_margin": gap_margin,
-                    "stopping_distance": stopping_distance,
-                    "follow_accel_limit": self.follow_max_accel,
-                    "catchup_speed_limit": self.catchup_speed,
-                }
-            )
+            self.last_debug["reason"] = "TTC emergency brake"
+
         self.last_debug.update(
             {
                 "speed_error": target_speed - ego_values["speed"],
-                "desired_acc": acc,
-                "planned_accel": 0.0,
-                "output_acc": acc,
+                "desired_acc": idm["acc"],
+                "planned_accel": idm["acc"],
+                "output_acc": idm["acc"],
                 "output_steer": steer,
-                "lookahead": 0.0,
+                "desired_dynamic_gap": idm["desired_dynamic_gap"],
+                "closing_speed": idm["closing_speed"],
+                "ttc": idm["ttc"],
+                "ttc_threshold": self.ttc_emergency,
+                "ttc_emergency_active": idm[
+                    "ttc_emergency_active"
+                ],
+                "idm_free_road_term": idm["free_road_term"],
+                "idm_interaction_term": idm["interaction_term"],
+                "idm_acceleration": idm["acc"],
+                "lookahead": self.last_debug["curve_lookahead"],
                 "lateral_error": lateral_error,
                 "path_lateral_offset": lateral_error,
                 "actual_path_lateral_offset": lateral_error,
@@ -621,7 +640,6 @@ class RoundaboutController(object):
                 "roundabout_mode": self.mode,
                 "roundabout_exclusive": True,
                 "centerline_control_active": True,
-                "reason": plan.reason,
             }
         )
-        return ControlOutput(acc, target_speed, steer)
+        return ControlOutput(idm["acc"], target_speed, steer)

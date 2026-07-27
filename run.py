@@ -212,7 +212,7 @@ EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
-    "2026-07-27-roundabout-follow-stable-v18"
+    "2026-07-27-roundabout-idm-v19"
 )
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 loop_count = 0
@@ -2194,6 +2194,11 @@ def get_pointcloud_msg():
                 f"roundabout_mode={planner_debug.get('mode', 'off')} "
                 f"roundabout_lead={planner_debug.get('locked_lead_id')} "
                 f"roundabout_gap={float((planner_debug.get('lead') or {}).get('gap', float('nan'))):.3f}m "
+                f"roundabout_lead_d={float((planner_debug.get('lead') or {}).get('d', float('nan'))):.3f}m "
+                f"roundabout_path_vehicles={int(planner_debug.get('path_vehicle_count', 0))} "
+                f"roundabout_path_d_limit={float(planner_debug.get('path_d_threshold', float('nan'))):.3f}m "
+                f"roundabout_curve_v={float(planner_debug.get('curve_speed_limit', float('nan'))):.3f}m/s "
+                f"roundabout_curve_kappa={float(planner_debug.get('lookahead_max_curvature', float('nan'))):.4f} "
                 f"remaining={float(planner_debug.get('remaining', float('nan'))):.3f}m "
                 f"obstacles_raw={int(planner_debug.get('raw_obstacle_count', 0))} "
                 f"obstacles_used={int(planner_debug.get('planning_obstacle_count', 0))} "
@@ -2443,6 +2448,15 @@ def get_pointcloud_msg():
             f"sprint_recovery={bool(controller_debug.get('sprint_recovery_active', False))} "
             f"roundabout_mode={controller_debug.get('roundabout_mode', 'off')} "
             f"roundabout_exclusive={bool(controller_debug.get('roundabout_exclusive', False))} "
+            f"idm_dynamic_gap={float(controller_debug.get('desired_dynamic_gap', float('nan'))):.3f}m "
+            f"idm_closing_speed={float(controller_debug.get('closing_speed', float('nan'))):.3f}m/s "
+            f"idm_free={float(controller_debug.get('idm_free_road_term', float('nan'))):.3f} "
+            f"idm_interaction={float(controller_debug.get('idm_interaction_term', float('nan'))):.3f} "
+            f"ttc={float(controller_debug.get('ttc', float('nan'))):.3f}s "
+            f"ttc_threshold={float(controller_debug.get('ttc_threshold', float('nan'))):.3f}s "
+            f"ttc_emergency={bool(controller_debug.get('ttc_emergency_active', False))} "
+            f"curve_speed_limit={float(controller_debug.get('curve_speed_limit', float('nan'))):.3f}m/s "
+            f"curve_max_kappa={float(controller_debug.get('lookahead_max_curvature', float('nan'))):.4f} "
             f"path_d_change={float(controller_debug.get('path_offset_change', float('nan'))):.3f}m "
             f"divergence_count={int(controller_debug.get('path_divergence_count', 0))} "
             f"centerline_stop={bool(controller_debug.get('centerline_safety_stop', False))} "
@@ -3384,8 +3398,8 @@ if __name__ == "__main__":
         ).strip().lower(),
         help=(
             "exclusive roundabout controller selected at launch: "
-            "follow locks the first nearest same-lane lead; direct ignores "
-            "traffic decisions and tracks the global path"
+            "follow cruises on a clear global path and applies IDM to "
+            "the nearest path vehicle; direct ignores traffic"
         ),
     )
     arg_parser.add_argument(
@@ -3396,7 +3410,7 @@ if __name__ == "__main__":
         default=float(
             os.environ.get("RULE_ROUNDABOUT_GAP", "1.0")
         ),
-        help="fixed bumper-to-bumper gap in follow mode, metres",
+        help="IDM minimum bumper-to-bumper gap in metres",
     )
     arg_parser.add_argument(
         "--roundabout_max_speed",
@@ -3441,28 +3455,74 @@ if __name__ == "__main__":
         help="follow-mode acceleration limit in m/s^2",
     )
     arg_parser.add_argument(
-        "--roundabout_catchup_speed",
-        "--roundabout-catchup-speed",
-        dest="roundabout_catchup_speed",
-        type=float,
-        default=float(
-            os.environ.get(
-                "RULE_ROUNDABOUT_CATCHUP_SPEED", "6.0"
-            )
-        ),
-        help="maximum speed above the fixed lead while closing a gap",
-    )
-    arg_parser.add_argument(
         "--roundabout_lane_half_width",
         "--roundabout-lane-half-width",
         dest="roundabout_lane_half_width",
         type=float,
         default=float(
             os.environ.get(
-                "RULE_ROUNDABOUT_LANE_HALF_WIDTH", "1.75"
+                "RULE_ROUNDABOUT_LANE_HALF_WIDTH", "1.0"
             )
         ),
-        help="maximum Frenet-d difference for initial lead locking",
+        help="vehicle is on global path only when abs(Frenet d) is below this",
+    )
+    arg_parser.add_argument(
+        "--roundabout_time_headway",
+        "--roundabout-time-headway",
+        dest="roundabout_time_headway",
+        type=float,
+        default=float(
+            os.environ.get("RULE_ROUNDABOUT_TIME_HEADWAY", "0.8")
+        ),
+        help="IDM dynamic time headway in seconds",
+    )
+    arg_parser.add_argument(
+        "--roundabout_idm_comfort_decel",
+        "--roundabout-idm-comfort-decel",
+        dest="roundabout_idm_comfort_decel",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_IDM_COMFORT_DECEL", "6.0"
+            )
+        ),
+        help="IDM normal braking parameter in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--roundabout_ttc_threshold",
+        "--roundabout-ttc-threshold",
+        dest="roundabout_ttc_threshold",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_TTC_THRESHOLD", "1.0"
+            )
+        ),
+        help="TTC threshold for emergency maximum braking in seconds",
+    )
+    arg_parser.add_argument(
+        "--roundabout_curve_lat_accel",
+        "--roundabout-curve-lat-accel",
+        dest="roundabout_curve_lat_accel",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_CURVE_LAT_ACCEL", "4.0"
+            )
+        ),
+        help="lateral-acceleration budget used for curve speed in m/s^2",
+    )
+    arg_parser.add_argument(
+        "--roundabout_curve_lookahead_time",
+        "--roundabout-curve-lookahead-time",
+        dest="roundabout_curve_lookahead_time",
+        type=float,
+        default=float(
+            os.environ.get(
+                "RULE_ROUNDABOUT_CURVE_LOOKAHEAD_TIME", "2.0"
+            )
+        ),
+        help="speed-scaled curvature look-ahead time in seconds",
     )
     arg_parser.add_argument(
         "--pedestrian_conf",
@@ -3797,8 +3857,12 @@ if __name__ == "__main__":
         "roundabout_max_accel",
         "roundabout_max_decel",
         "roundabout_follow_max_accel",
-        "roundabout_catchup_speed",
         "roundabout_lane_half_width",
+        "roundabout_time_headway",
+        "roundabout_idm_comfort_decel",
+        "roundabout_ttc_threshold",
+        "roundabout_curve_lat_accel",
+        "roundabout_curve_lookahead_time",
     ):
         roundabout_value = getattr(args, roundabout_name)
         if roundabout_value <= 0.0:
@@ -4187,8 +4251,12 @@ if __name__ == "__main__":
         max_accel=args.roundabout_max_accel,
         max_decel=args.roundabout_max_decel,
         follow_max_accel=args.roundabout_follow_max_accel,
-        catchup_speed=args.roundabout_catchup_speed,
         lane_half_width=args.roundabout_lane_half_width,
+        time_headway=args.roundabout_time_headway,
+        idm_comfort_decel=args.roundabout_idm_comfort_decel,
+        ttc_emergency=args.roundabout_ttc_threshold,
+        curve_lateral_accel=args.roundabout_curve_lat_accel,
+        curve_lookahead_time=args.roundabout_curve_lookahead_time,
         wheelbase=planner_config.controller_wheelbase,
         steering_ratio=planner_config.steering_ratio,
         max_steer_deg=min(
@@ -4204,11 +4272,17 @@ if __name__ == "__main__":
         f"max_accel={roundabout_controller.max_accel:.3f}m/s2 "
         f"follow_max_accel="
         f"{roundabout_controller.follow_max_accel:.3f}m/s2 "
-        f"catchup_speed="
-        f"{roundabout_controller.catchup_speed:.3f}m/s "
         f"max_decel={roundabout_controller.max_decel:.3f}m/s2 "
         f"lane_half_width="
-        f"{roundabout_controller.lane_half_width:.3f}m"
+        f"{roundabout_controller.lane_half_width:.3f}m "
+        f"time_headway={roundabout_controller.time_headway:.3f}s "
+        f"idm_comfort_decel="
+        f"{roundabout_controller.idm_comfort_decel:.3f}m/s2 "
+        f"ttc={roundabout_controller.ttc_emergency:.3f}s "
+        f"curve_lat_accel="
+        f"{roundabout_controller.curve_lateral_accel:.3f}m/s2 "
+        f"curve_lookahead_time="
+        f"{roundabout_controller.curve_lookahead_time:.3f}s"
     )
     pre_map_name = None
     map_name = None
