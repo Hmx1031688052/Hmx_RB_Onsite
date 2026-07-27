@@ -25,6 +25,9 @@ _PAGE = r"""<!doctype html>
     .pill { padding: 4px 9px; border-radius: 999px; background: #263445; font-size: 12px; }
     #state.live { background: #144b38; color: #8bf0c5; }
     #state.stale { background: #54351b; color: #ffc982; }
+    #stationMeta { color: #8bf0c5; max-width: 520px; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; }
+    #stationMeta.override { background: #624415; color: #ffd166; }
     main { display: grid; grid-template-columns: minmax(0, 1fr) 330px;
       height: calc(100vh - 54px); }
     #stage { position: relative; min-width: 0; }
@@ -52,6 +55,7 @@ _PAGE = r"""<!doctype html>
     <h1>PointPillars 实时感知</h1>
     <span id="state" class="pill stale">等待点云</span>
     <span id="meta" class="pill">--</span>
+    <span id="stationMeta" class="pill">s: --</span>
     <span id="planMeta" class="pill">Plan: --</span>
   </header>
   <main>
@@ -67,6 +71,7 @@ _PAGE = r"""<!doctype html>
     </section>
     <aside>
       <div class="summary">
+        <div class="card"><span class="label">当前路径位置</span><b id="currentStation">s = --</b></div>
         <div class="card"><span class="label">点云采样</span><b id="pointCount">0</b></div>
         <div class="card"><span class="label">检测目标</span><b id="detCount">0</b></div>
         <div class="card"><span class="label">旁车真值框</span><b id="truthCount">0</b></div>
@@ -180,6 +185,19 @@ function updatePanel() {
   truthCount.textContent=(frame.ground_truth||[]).length;
   carCount.textContent=counts.Car||0; vrCount.textContent=`${counts.Pedestrian||0} / ${counts.Cyclist||0}`;
   const planning=frame.planning||{}, gp=(frame.global_path||[]).length, lp=(frame.local_path||[]).length;
+  const hasS=planning.current_s!==null && planning.current_s!==undefined &&
+    Number.isFinite(Number(planning.current_s));
+  const hasD=planning.current_d!==null && planning.current_d!==undefined &&
+    Number.isFinite(Number(planning.current_d));
+  const sText=hasS?Number(planning.current_s).toFixed(2):"--";
+  const dText=hasD?Number(planning.current_d).toFixed(2):"--";
+  const mapText=planning.map_name||"--";
+  const overrideText=planning.override_active
+    ?` | override: ${planning.override_name||"unnamed"} ${planning.override_range||""}`
+    :" | override: off";
+  currentStation.textContent=`s = ${sText} m`;
+  stationMeta.textContent=`${mapText} | s=${sText} m | d=${dText} m${overrideText}`;
+  stationMeta.className=`pill${planning.override_active?" override":""}`;
   const tm=frame.truth_meta||{};
   const sync=Number.isFinite(tm.sync_delta_ms)?` · GTΔ${tm.sync_delta_ms.toFixed(0)}ms`:"";
   planMeta.textContent=`Plan: ${planning.behavior||"--"} · ${Number(planning.target_speed||0).toFixed(1)} m/s · G${gp}/L${lp}${sync}`;
@@ -572,6 +590,13 @@ class PerceptionWebVisualizer:
         behavior="",
         target_speed=0.0,
         emergency=False,
+        current_s=None,
+        current_d=None,
+        map_name="",
+        override_active=False,
+        override_name=None,
+        override_s_start=None,
+        override_s_end=None,
     ):
         """Overlay map-frame global/local paths in the lidar ego frame."""
         if ego is None:
@@ -593,10 +618,44 @@ class PerceptionWebVisualizer:
                 getattr(local_trajectory, "y", []),
                 ego,
             )
+        def finite_or_none(value):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return round(number, 3) if math.isfinite(number) else None
+
+        def station_bound(value, default):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return default
+            if math.isinf(number):
+                return "-inf" if number < 0.0 else "inf"
+            if not math.isfinite(number):
+                return default
+            return "{:.2f}".format(number)
+
+        override_range = ""
+        if override_active:
+            override_range = "[{}, {})".format(
+                station_bound(override_s_start, "-inf"),
+                station_bound(override_s_end, "inf"),
+            )
         planning = {
             "behavior": str(behavior or ""),
             "target_speed": round(max(0.0, float(target_speed)), 3),
             "emergency": bool(emergency),
+            "current_s": finite_or_none(current_s),
+            "current_d": finite_or_none(current_d),
+            "map_name": str(map_name or "").replace("\\", "/").rsplit("/", 1)[-1],
+            "override_active": bool(override_active),
+            "override_name": (
+                str(override_name)
+                if override_active and override_name is not None
+                else None
+            ),
+            "override_range": override_range,
         }
         self._store_frame(
             global_path=global_points,

@@ -2070,6 +2070,8 @@ def get_pointcloud_msg():
         planning_elapsed = time.monotonic() - planning_started
         replanned = True
         last_rule_plan_wall_time = now
+        planner_debug = getattr(rule_planner, "last_debug", {}) or {}
+        projection_debug = planner_debug.get("projection") or {}
         perception_visualizer = getattr(
             model, "perception_web_visualizer", None
         )
@@ -2083,6 +2085,17 @@ def get_pointcloud_msg():
                 behavior=getattr(last_rule_plan, "behavior", ""),
                 target_speed=getattr(last_rule_plan, "target_speed", 0.0),
                 emergency=getattr(last_rule_plan, "emergency", False),
+                current_s=projection_debug.get("s"),
+                current_d=projection_debug.get("d"),
+                map_name=map_name,
+                override_active=planner_debug.get(
+                    "manual_control_active", False
+                ),
+                override_name=planner_debug.get(
+                    "manual_override_name"
+                ),
+                override_s_start=planner_debug.get("manual_s_start"),
+                override_s_end=planner_debug.get("manual_s_end"),
             )
         if DEBUG_DRIVE and now - last_drive_plan_debug_ts >= 0.5:
             last_drive_plan_debug_ts = now
@@ -2116,8 +2129,6 @@ def get_pointcloud_msg():
                 f"trajectory_points={trajectory_points} "
                 f"reason={last_rule_plan.reason or 'none'}"
             )
-            planner_debug = getattr(rule_planner, "last_debug", {}) or {}
-            projection_debug = planner_debug.get("projection") or {}
             speed_limit_debug = (
                 planner_debug.get("speed_limits") or {}
             )

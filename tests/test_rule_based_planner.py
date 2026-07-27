@@ -116,6 +116,12 @@ class RulePlannerTest(unittest.TestCase):
                 planner.last_debug["manual_collision_bypass"]
             )
             self.assertEqual(
+                0.0, planner.last_debug["manual_s_start"]
+            )
+            self.assertEqual(
+                1000.0, planner.last_debug["manual_s_end"]
+            )
+            self.assertEqual(
                 1, planner.last_debug["detected_obstacle_count"]
             )
             self.assertEqual(

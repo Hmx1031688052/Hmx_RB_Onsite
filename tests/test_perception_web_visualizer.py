@@ -124,6 +124,13 @@ class PerceptionWebVisualizerTests(unittest.TestCase):
             behavior="KEEP_LANE",
             target_speed=5.5,
             emergency=False,
+            current_s=123.4567,
+            current_d=-0.6584,
+            map_name="/tmp/maps/MT_14-merge.xodr",
+            override_active=True,
+            override_name="merge-lane-change",
+            override_s_start=120.0,
+            override_s_end=180.0,
         )
 
         payload = json.loads(visualizer._frame_json.decode("utf-8"))
@@ -135,6 +142,18 @@ class PerceptionWebVisualizerTests(unittest.TestCase):
         self.assertEqual(payload["local_path"], [[0.0, 0.0], [0.0, 5.0]])
         self.assertEqual(payload["planning"]["behavior"], "KEEP_LANE")
         self.assertEqual(payload["planning"]["target_speed"], 5.5)
+        self.assertEqual(payload["planning"]["current_s"], 123.457)
+        self.assertEqual(payload["planning"]["current_d"], -0.658)
+        self.assertEqual(
+            payload["planning"]["map_name"], "MT_14-merge.xodr"
+        )
+        self.assertTrue(payload["planning"]["override_active"])
+        self.assertEqual(
+            payload["planning"]["override_name"], "merge-lane-change"
+        )
+        self.assertEqual(
+            payload["planning"]["override_range"], "[120.00, 180.00)"
+        )
 
     def test_http_server_exposes_page_health_and_frame(self):
         visualizer = PerceptionWebVisualizer(host="127.0.0.1", port=0)
@@ -148,6 +167,8 @@ class PerceptionWebVisualizerTests(unittest.TestCase):
                 self.assertIn("PointPillars", page)
                 self.assertIn("Global path", page)
                 self.assertIn("Local path", page)
+                self.assertIn('id="currentStation"', page)
+                self.assertIn('id="stationMeta"', page)
                 self.assertIn("旁车真值框", page)
             with urlopen(base + "/api/frame", timeout=2.0) as response:
                 payload = json.load(response)

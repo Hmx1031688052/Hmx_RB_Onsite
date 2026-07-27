@@ -2245,6 +2245,16 @@ class RuleBasedPlanner(object):
                     manual_override["target_speed_mps"]
                 )
             ),
+            "manual_s_start": (
+                None
+                if manual_override is None
+                else float(manual_override["s_start"])
+            ),
+            "manual_s_end": (
+                None
+                if manual_override is None
+                else float(manual_override["s_end"])
+            ),
             "manual_collision_bypass": (
                 manual_override is not None
             ),
