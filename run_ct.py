@@ -80,14 +80,20 @@ def _ct_parser():
     parser.add_argument(
         "--ct-alignment-accel",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "2.8")),
-        help="moving alignment acceleration limit in m/s^2 (default: 2.8)",
+        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "100.0")),
+        help=(
+            "single continuous acceleration used to establish the low "
+            "alignment speed, in m/s^2 (default: 100.0)"
+        ),
     )
     parser.add_argument(
         "--ct-alignment-jerk",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_JERK", "4.5")),
-        help="moving alignment jerk limit in m/s^3 (default: 4.5)",
+        default=float(os.environ.get("CT_ALIGNMENT_JERK", "5000.0")),
+        help=(
+            "legacy compatibility option; alignment now uses one continuous "
+            "acceleration pulse instead of an S-curve"
+        ),
     )
     parser.add_argument(
         "--ct-heading-tolerance-deg",
@@ -675,54 +681,30 @@ def _install_score_config(ct_args):
                 else:
                     self.ct_alignment_stable_elapsed = 0.0
 
-                remaining_speed = max(
-                    0.0,
+                # Speed is not an alignment-completion condition. Publish the
+                # low alignment target immediately and use one contiguous
+                # acceleration pulse only until chassis feedback approaches
+                # it. This removes the former comfort S-curve's roughly
+                # 1.5-second startup cost without raising alignment speed or
+                # toggling acceleration repeatedly.
+                self.ct_alignment_command_speed = (
                     ct_args.ct_alignment_speed
-                    - self.ct_alignment_command_speed,
                 )
-                # Jerk-limited S-curve. Begin ramping acceleration down when
-                # its remaining triangular area would consume the remaining
-                # delta-v. This avoids the old 2.8/0/-2.8 bang-bang commands.
-                ramp_down_delta_v = (
-                    self.ct_alignment_command_acc
-                    * self.ct_alignment_command_acc
-                    / (2.0 * ct_args.ct_alignment_jerk)
+                try:
+                    measured_alignment_speed = max(
+                        0.0, float(getattr(ego, "speed", 0.0))
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    measured_alignment_speed = 0.0
+                alignment_speed_ack = max(
+                    0.05,
+                    0.90 * ct_args.ct_alignment_speed,
                 )
-                desired_acc = (
-                    0.0
-                    if remaining_speed
-                    <= ramp_down_delta_v + 1e-6
-                    else ct_args.ct_alignment_accel
+                self.ct_alignment_command_acc = (
+                    ct_args.ct_alignment_accel
+                    if measured_alignment_speed < alignment_speed_ack
+                    else 0.0
                 )
-                max_acc_change = ct_args.ct_alignment_jerk * dt
-                acc_error = (
-                    desired_acc - self.ct_alignment_command_acc
-                )
-                acc_change = max(
-                    -max_acc_change,
-                    min(max_acc_change, acc_error),
-                )
-                self.ct_alignment_command_acc += acc_change
-                self.ct_alignment_command_acc = max(
-                    0.0,
-                    min(
-                        ct_args.ct_alignment_accel,
-                        self.ct_alignment_command_acc,
-                    ),
-                )
-                self.ct_alignment_command_speed = min(
-                    ct_args.ct_alignment_speed,
-                    self.ct_alignment_command_speed
-                    + self.ct_alignment_command_acc * dt,
-                )
-                if (
-                    self.ct_alignment_command_speed
-                    >= ct_args.ct_alignment_speed - 1e-6
-                    and desired_acc <= 0.0
-                    and self.ct_alignment_command_acc
-                    <= max_acc_change
-                ):
-                    self.ct_alignment_command_acc = 0.0
 
                 output.speed = self.ct_alignment_command_speed
                 output.acc = self.ct_alignment_command_acc
