@@ -26,6 +26,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 
 # The onsite SDK keeps the generated ``chassis`` and ``main`` protobuf
 # packages beside Hmx_RB_Onsite. When this file is launched as
@@ -103,10 +108,43 @@ from main.proto.messages_pb2 import (
 
 TASK_TIMEOUT_RESTART_EXIT_CODE = 75
 SIMULATOR_STALL_RESTART_EXIT_CODE = 76
+SUPERVISOR_LOCK_PATH = Path("/tmp/run_hmxzw-supervisor.lock")
 
 
 def wrap_angle(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def acquire_supervisor_lock():
+    """Allow exactly one top-level runtime/DriverSim supervisor."""
+    if fcntl is None:
+        return None
+    lock_file = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(
+            lock_file.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print(
+            "[run3][supervisor][FATAL] another supervisor is already "
+            f"running pid={owner}; refuse duplicate startup",
+            flush=True,
+        )
+        return False
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    print(
+        "[run3][supervisor] singleton lock acquired "
+        f"pid={os.getpid()} path={SUPERVISOR_LOCK_PATH}",
+        flush=True,
+    )
+    return lock_file
 
 
 def session_order_key(value):
@@ -1331,6 +1369,9 @@ def main():
     try:
         args = parse_args()
         if not args.runtime_child:
+            supervisor_lock = acquire_supervisor_lock()
+            if supervisor_lock is False:
+                raise SystemExit(2)
             raise SystemExit(supervise_runtime(args))
         Run3(args).run()
     except KeyboardInterrupt:
