@@ -951,7 +951,7 @@ def parse_args():
             "/media/pc/FanXiang2T/Onsite_FirstWithForth/"
             "LinuxNoEditor416"
         ),
-        help="directory containing the managed DriverSim start.sh",
+        help="LinuxNoEditor build root containing DriverSim and Engine",
     )
     parser.add_argument(
         "--simulator-ready-delay",
@@ -1167,19 +1167,83 @@ def _cleanup_managed_stack(args, runtime, simulator, reason):
 
 def _start_managed_simulator(args):
     simulator_dir = Path(args.simulator_dir).expanduser().resolve()
-    start_script = simulator_dir / "start.sh"
-    if not start_script.is_file():
+    driver_binary = (
+        simulator_dir
+        / "DriverSim"
+        / "Binaries"
+        / "Linux"
+        / "DriverSim"
+    )
+    if not driver_binary.is_file():
         raise FileNotFoundError(
-            f"DriverSim start script not found: {start_script}"
+            f"DriverSim executable not found: {driver_binary}"
         )
+    driver_binary.chmod(driver_binary.stat().st_mode | 0o111)
+
+    library_dirs = [
+        (
+            simulator_dir
+            / "DriverSim/Source/DriverSim/ThirdParty/"
+            "LibMulticastNetwork/lib"
+        ),
+        (
+            simulator_dir
+            / "DriverSim/Source/DriverSim/ThirdParty/"
+            "LibNetwork/lib"
+        ),
+        (
+            simulator_dir
+            / "DriverSim/Source/DriverSim/ThirdParty/"
+            "VTSLog/lib"
+        ),
+        (
+            simulator_dir
+            / "DriverSim/Source/DriverSim/ThirdParty/"
+            "VTSMap/lib"
+        ),
+        (
+            simulator_dir
+            / "Engine/Plugins/Compositing/OpenCVLensDistortion/"
+            "Source/ThirdParty/OpenCV/lib/Linux"
+        ),
+        (
+            simulator_dir
+            / "DriverSim/Source/DriverSim/ThirdParty/Torch/lib"
+        ),
+    ]
+    simulator_env = os.environ.copy()
+    inherited_library_path = simulator_env.get(
+        "LD_LIBRARY_PATH", ""
+    )
+    simulator_env["LD_LIBRARY_PATH"] = os.pathsep.join(
+        [
+            *(str(path) for path in library_dirs),
+            *(
+                [inherited_library_path]
+                if inherited_library_path
+                else []
+            ),
+        ]
+    )
+    try:
+        subprocess.run(
+            ["pulseaudio", "--start"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
     print(
-        "[run3][supervisor] start DriverSim "
-        f"cwd={simulator_dir} command='bash start.sh'",
+        "[run3][supervisor] start DriverSim executable "
+        f"path={driver_binary}",
         flush=True,
     )
     process = subprocess.Popen(
-        ["bash", "start.sh"],
-        cwd=str(simulator_dir),
+        [str(driver_binary)],
+        cwd=str(driver_binary.parent),
+        env=simulator_env,
         start_new_session=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
