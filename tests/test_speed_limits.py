@@ -12,12 +12,19 @@ if SAMPLE_DIR not in sys.path:
 
 from speed_limits import (
     find_prepare_speed_candidates,
+    initial_state_speed_mps,
     resolve_expected_speed,
     xodr_speed_summary,
 )
 
 
 class ExpectedSpeedTest(unittest.TestCase):
+    def test_initial_state_speed_is_distinct_from_expected_speed(self):
+        self.assertEqual(initial_state_speed_mps({"speed": 20.0}), 20.0)
+        self.assertEqual(initial_state_speed_mps({"speed": 0.0}), 0.0)
+        self.assertIsNone(initial_state_speed_mps({}))
+        self.assertIsNone(initial_state_speed_mps({"speed": -1.0}))
+
     def test_explicit_prepare_kmh_field_has_priority(self):
         brief = {
             "speed_limit_mps": 10.0,

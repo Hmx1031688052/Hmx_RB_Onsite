@@ -24,24 +24,6 @@ CT_CONSTANT_ACCEL_MPS2 = 2.0
 CT_EVALUATOR_INTERVAL_S = 0.03
 
 
-def _next_ct_speed_command(
-    current_speed,
-    cruise_speed,
-    acceleration,
-    control_dt,
-    evaluator_interval=CT_EVALUATOR_INTERVAL_S,
-):
-    """Slew one published speed step at the evaluator's sampling interval."""
-    step_dt = min(
-        max(0.0, float(control_dt)),
-        max(0.0, float(evaluator_interval)),
-    )
-    return min(
-        float(cruise_speed),
-        float(current_speed) + float(acceleration) * step_dt,
-    )
-
-
 def _ct_parser():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -705,18 +687,10 @@ def _install_score_config(ct_args):
                 float(self.config.sprint_speed),
                 ct_args.ct_alignment_speed,
             )
-            # The cloud evaluator divides consecutive speed samples by its
-            # fixed simulation interval (normally 30 ms). A slow planning
-            # cycle must not accumulate acceleration over its full dt and
-            # publish the result as one large speed jump: e.g. 0.4167 m/s
-            # after a 0.2083 s plan is judged as 13.89 m/s2 over 30 ms.
-            self.ct_speed_command = _next_ct_speed_command(
-                self.ct_speed_command,
-                cruise_speed,
-                ct_args.ct_accel,
-                dt,
-                ct_args.ct_evaluator_interval,
-            )
+            # Supply only the desired cruise speed here. run.py's dedicated
+            # fixed-period final publisher is the single writer that slews the
+            # actual speed field and derives its matching acceleration.
+            self.ct_speed_command = cruise_speed
             if not self.ct_alignment_complete:
                 self.ct_alignment_elapsed += dt
                 goal = ct_route_state.get("goal")
@@ -1088,6 +1062,9 @@ def _install_score_config(ct_args):
                     "ct_constant_accel_mps2": ct_args.ct_accel,
                     "ct_feedback_speed": ego_speed,
                     "ct_speed_command": self.ct_speed_command,
+                    "ct_speed_command_lead": (
+                        self.ct_speed_command - ego_speed
+                    ),
                     "ct_speed_command_rate_mps2": ct_args.ct_accel,
                     "ct_evaluator_interval": (
                         ct_args.ct_evaluator_interval
@@ -1199,6 +1176,11 @@ def main():
     os.environ["E2E_PREPARE_RESULT_RESEND_INTERVAL"] = str(
         ct_args.ct_prepare_resend_interval
     )
+    os.environ["E2E_FINAL_CONTROL_LIMITER"] = "1"
+    os.environ["E2E_FINAL_CONTROL_INTERVAL"] = str(
+        ct_args.ct_evaluator_interval
+    )
+    os.environ["E2E_FINAL_CONTROL_SAFE_ACCEL"] = str(ct_args.ct_accel)
 
     print(
         "[ct-score] isolated scoring entrypoint active "

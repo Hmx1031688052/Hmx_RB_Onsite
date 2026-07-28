@@ -87,6 +87,22 @@ def _numeric_speed(value):
     return result
 
 
+def initial_state_speed_mps(init_state):
+    """Read launch speed without confusing it with a road speed limit."""
+    if not isinstance(init_state, dict):
+        return None
+    value = init_state.get("speed")
+    if isinstance(value, dict):
+        value = value.get("value", value.get("speed"))
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(speed) or speed < 0.0:
+        return None
+    return speed
+
+
 def _unit_from_value(value, siblings=None):
     unit = ""
     if isinstance(value, dict):

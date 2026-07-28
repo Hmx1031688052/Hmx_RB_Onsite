@@ -183,7 +183,8 @@ from rule_based_planner import (
     session_startup_speed,
 )
 from roundabout_controller import RoundaboutController
-from speed_limits import resolve_expected_speed
+from speed_limits import initial_state_speed_mps, resolve_expected_speed
+from control_publisher import FinalSpeedLimiter
 from npc_truth import (
     decode_npc_payload,
     ensure_npc_truth_timestamp,
@@ -217,6 +218,7 @@ GT_STARTUP_GRACE_SECONDS = max(
 EXPECTED_SPEED_CLI_MPS = None
 USE_XODR_EXPECTED_SPEED = False
 current_expected_speed = None
+episode_initial_speed = None
 ALGORITHM_POLICY_VERSION = (
     "2026-07-27-episode-speed-reset-v27"
 )
@@ -293,6 +295,26 @@ ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 ins_receiver_stop_event = threading.Event()
+final_control_enabled = (
+    os.environ.get("E2E_FINAL_CONTROL_LIMITER", "0") == "1"
+)
+final_control_interval = max(
+    0.005,
+    float(os.environ.get("E2E_FINAL_CONTROL_INTERVAL", "0.03")),
+)
+final_control_safe_accel = max(
+    0.0,
+    float(os.environ.get("E2E_FINAL_CONTROL_SAFE_ACCEL", "2.0")),
+)
+final_control_limiter = FinalSpeedLimiter(
+    safe_accel=final_control_safe_accel,
+    publish_interval=final_control_interval,
+)
+final_control_lock = threading.Lock()
+final_control_stop_event = threading.Event()
+final_control_active = False
+final_control_desired = None
+final_control_last_log_ts = 0.0
 test_start_received_ts = None
 channel_created_ts = None
 first_prepare_startup_timeout = max(
@@ -1230,20 +1252,11 @@ def hold_until_global_plan_ready():
 
 
 def startup_hold_speed():
-    """Use current INS speed, or this episode's expected speed before INS."""
-    expected_speed = 0.0
-    if isinstance(current_expected_speed, dict):
-        expected_speed = current_expected_speed.get("speed_mps", 0.0)
-    if not expected_speed:
-        expected_speed = getattr(
-            getattr(globals().get("rule_planner"), "config", None),
-            "expected_speed_mps",
-            0.0,
-        )
+    """Use current INS speed, or ActorPrepare's initial vehicle speed."""
     return session_startup_speed(
         first_ins_ready,
         getattr(globals().get("model"), "ego", None),
-        expected_speed,
+        episode_initial_speed,
     )
 
 
@@ -1826,6 +1839,7 @@ def get_prepare():
     global last_drive_lidar_debug_ts
     global last_gt_planning_timestamp
     global current_expected_speed
+    global episode_initial_speed
     global test_start_received_ts
 
     ret, msg = prepare_channel.get()
@@ -2012,6 +2026,14 @@ def get_prepare():
         last_drive_lidar_debug_ts = 0.0
         init_state = testee_brief["init_state"]
         target_state = testee_brief["target_state"]
+        episode_initial_speed = initial_state_speed_mps(init_state)
+        reset_final_control_publisher(episode_initial_speed)
+        print(
+            "[startup-speed] "
+            f"initial="
+            f"{episode_initial_speed if episode_initial_speed is not None else float('nan'):.3f}m/s "
+            "source=ActorPrepare.init_state.speed"
+        )
         #print(target_state)
         role_id = testee_brief["role_id"]
         if drive_trace_logger is not None:
@@ -2909,6 +2931,7 @@ def process_notify():
             )
             return notify.type
         if notify.type == NT_FINISH_TEST or notify.type == NT_ABORT_TEST :
+            deactivate_final_control_publisher()
             if drive_trace_logger is not None:
                 drive_trace_logger.end_session(
                     reason=(
@@ -2975,6 +2998,7 @@ def process_notify():
             start_test = True
             test_start_received_ts = time.time()
             model.start = 1
+            activate_final_control_publisher()
             # DriveSim holds the chassis brake while a prepared scenario is
             # waiting to start.  Publish a neutral command immediately when
             # the start notification arrives instead of waiting for the first
@@ -2988,7 +3012,7 @@ def process_notify():
                 "[startup-control] neutral brake release "
                 f"speed={startup_speed:.3f}m/s "
                 f"source="
-                f"{'session-ins' if first_ins_ready else 'episode-expected-speed'}"
+                f"{'session-ins' if first_ins_ready else 'episode-initial-speed'}"
             )
             if drive_trace_logger is not None:
                 drive_trace_logger.record_event(
@@ -3010,7 +3034,39 @@ def process_notify():
             return notify.type
 
 
-def send_control_cmd(target_acc, target_speed, target_steer):
+def reset_final_control_publisher(initial_speed):
+    global final_control_active
+    global final_control_desired
+
+    if not final_control_enabled:
+        return
+    with final_control_lock:
+        final_control_active = False
+        final_control_desired = None
+        final_control_limiter.reset(initial_speed)
+
+
+def activate_final_control_publisher():
+    global final_control_active
+
+    if not final_control_enabled:
+        return
+    with final_control_lock:
+        final_control_active = True
+
+
+def deactivate_final_control_publisher():
+    global final_control_active
+    global final_control_desired
+
+    if not final_control_enabled:
+        return
+    with final_control_lock:
+        final_control_active = False
+        final_control_desired = None
+
+
+def _put_control_cmd(target_acc, target_speed, target_steer):
     # Never let a stale braking command launch a stationary vehicle backwards.
     # Preserve negative acceleration only while the vehicle is actually moving.
     ego_speed = float(getattr(getattr(globals().get("model"), "ego", None), "speed", 0.0) or 0.0)
@@ -3025,6 +3081,94 @@ def send_control_cmd(target_acc, target_speed, target_steer):
     ret = cmd_channel.put(VEHICLE_CONTROL, length, data)
     if ret != 0:
         print("send cmd error")
+    return ret
+
+
+def send_control_cmd(target_acc, target_speed, target_steer):
+    global final_control_desired
+
+    if not final_control_enabled:
+        return _put_control_cmd(
+            target_acc,
+            target_speed,
+            target_steer,
+        )
+    with final_control_lock:
+        final_control_desired = (
+            float(target_acc),
+            float(target_speed),
+            float(target_steer),
+        )
+    return 0
+
+
+def final_control_publisher_loop():
+    """Publish the latest desired command through one fixed-rate writer."""
+    global final_control_last_log_ts
+
+    print(
+        "[final-control] publisher started "
+        f"interval={final_control_interval:.3f}s "
+        f"safe_accel={final_control_safe_accel:.3f}m/s2 "
+        f"max_speed_step="
+        f"{final_control_limiter.max_speed_step:.6f}m",
+        flush=True,
+    )
+    while not final_control_stop_event.is_set():
+        cycle_started = time.monotonic()
+        with final_control_lock:
+            if final_control_active and final_control_desired is not None:
+                _, desired_speed, desired_steer = final_control_desired
+                ego = getattr(globals().get("model"), "ego", None)
+                ego_speed = (
+                    None
+                    if ego is None
+                    else getattr(ego, "speed", None)
+                )
+                limited = final_control_limiter.step(
+                    desired_speed,
+                    ego_speed=ego_speed,
+                )
+                if limited is not None:
+                    published_speed, published_accel, previous_speed = (
+                        limited
+                    )
+                    _put_control_cmd(
+                        published_accel,
+                        published_speed,
+                        desired_steer,
+                    )
+                    now = time.monotonic()
+                    if (
+                        DEBUG_DRIVE
+                        and now - final_control_last_log_ts >= 0.5
+                    ):
+                        final_control_last_log_ts = now
+                        print(
+                            "[final-control][LIMIT] "
+                            f"desired_speed={desired_speed:.6f}m/s "
+                            f"previous_speed={previous_speed:.6f}m/s "
+                            f"published_speed={published_speed:.6f}m/s "
+                            f"derived_accel={published_accel:.6f}m/s2 "
+                            f"ego_speed="
+                            f"{float(ego_speed) if ego_speed is not None else float('nan'):.6f}m/s"
+                        )
+        elapsed = time.monotonic() - cycle_started
+        final_control_stop_event.wait(
+            max(0.0, final_control_interval - elapsed)
+        )
+
+
+def start_final_control_publisher_thread():
+    if not final_control_enabled:
+        return None
+    thread = threading.Thread(
+        target=final_control_publisher_loop,
+        name="final-control-publisher",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def get_vehicle_feedback():
@@ -4816,9 +4960,14 @@ if __name__ == "__main__":
     pre_map_name = None
     map_name = None
     ins_receiver_thread = start_ins_receiver_thread()
+    final_control_thread = start_final_control_publisher_thread()
     try:
         main()
     finally:
+        deactivate_final_control_publisher()
+        final_control_stop_event.set()
+        if final_control_thread is not None:
+            final_control_thread.join(timeout=1.0)
         ins_receiver_stop_event.set()
         ins_receiver_thread.join(timeout=1.0)
         model.close()
