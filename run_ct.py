@@ -1,9 +1,9 @@
 """Scoring-oriented DriveSim entrypoint.
 
 This module deliberately keeps the experimental direct-goal policy out of
-run.py. It reuses run.py's protocol/session handling, but replaces
-PlannerConfig with a small subclass whose sprint speed follows each episode's
-resolved expected speed.
+run.py. It reuses run.py's protocol/session handling, captures the literal
+episode destination, ignores the map/global route in CT planning, and ramps
+the speed command with a constant 2 m/s^2 acceleration.
 """
 
 import argparse
@@ -17,6 +17,9 @@ import time
 import numpy as np
 
 import rule_based_planner
+
+
+CT_CONSTANT_ACCEL_MPS2 = 2.0
 
 
 def _ct_parser():
@@ -68,8 +71,11 @@ def _ct_parser():
     parser.add_argument(
         "--ct-accel",
         type=float,
-        default=float(os.environ.get("CT_ACCEL", "1500.0")),
-        help="one-shot acceleration command in m/s^2 (default: 1500)",
+        default=float(os.environ.get("CT_ACCEL", "2.0")),
+        help=(
+            "constant acceleration command used for every valid direct-goal "
+            "control cycle, in m/s^2 (default: 2.0)"
+        ),
     )
     parser.add_argument(
         "--ct-alignment-speed",
@@ -80,11 +86,10 @@ def _ct_parser():
     parser.add_argument(
         "--ct-alignment-accel",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "2.8")),
+        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "2.0")),
         help=(
-            "single continuous acceleration used to establish the low "
-            "alignment speed, in m/s^2; internally capped at 3.0 "
-            "(default: 2.8)"
+            "legacy compatibility option; direct-goal mode now uses "
+            "--ct-accel continuously through alignment (default: 2.0)"
         ),
     )
     parser.add_argument(
@@ -457,15 +462,32 @@ def _supervise_runtime(ct_args):
 
 
 def _install_score_config(ct_args):
+    import predictor as predictor_module
+
     speed_factor = ct_args.ct_speed_factor
     base_config = rule_based_planner.PlannerConfig
     base_planner = rule_based_planner.RuleBasedPlanner
     base_controller = rule_based_planner.StableController
     # Shared only by the CT planner/controller classes installed below.
-    # The controller uses the literal route goal while aligning so it can
-    # steer toward the goal bearing instead of trying to return to the
-    # original start-to-goal chord.
+    # Capture the literal episode destination from ActorPrepare instead of
+    # deriving it from a map/global route.
     ct_route_state = {"goal": None}
+    base_set_destination = predictor_module.Predictor.set_destination
+
+    def ct_set_destination(model, x, y, theta):
+        goal_x = float(x)
+        goal_y = float(y)
+        if not math.isfinite(goal_x) or not math.isfinite(goal_y):
+            raise ValueError("CT destination must contain finite x/y")
+        ct_route_state["goal"] = (goal_x, goal_y)
+        print(
+            "[ct-score] direct destination captured "
+            f"goal=({goal_x:.3f},{goal_y:.3f}); "
+            "map/global route will not be used by CT planning"
+        )
+        return base_set_destination(model, x, y, theta)
+
+    predictor_module.Predictor.set_destination = ct_set_destination
 
     class CtPlannerConfig(base_config):
         """Planner configuration with episode-relative sprint speed."""
@@ -498,30 +520,21 @@ def _install_score_config(ct_args):
     rule_based_planner.PlannerConfig = CtPlannerConfig
 
     class CtRuleBasedPlanner(base_planner):
-        """Direct sprint planner using the literal start-to-goal chord."""
+        """Direct planner using only current ego pose and literal destination."""
 
         def _build_sprint_path(self, ego, global_path):
+            del global_path
             if self._sprint_path is not None:
                 goal = getattr(self, "_sprint_goal", None)
                 if goal is not None:
                     ct_route_state["goal"] = goal
                 return self._sprint_path
             try:
-                route_x = np.asarray(
-                    global_path.get("x", []), dtype=float
-                ).reshape(-1)
-                route_y = np.asarray(
-                    global_path.get("y", []), dtype=float
-                ).reshape(-1)
-                count = min(route_x.size, route_y.size)
-                valid = (
-                    np.isfinite(route_x[:count])
-                    & np.isfinite(route_y[:count])
-                )
-                if count < 2 or not np.any(valid):
+                goal = ct_route_state.get("goal")
+                if goal is None:
                     return None
-                goal_x = float(route_x[:count][valid][-1])
-                goal_y = float(route_y[:count][valid][-1])
+                goal_x = float(goal[0])
+                goal_y = float(goal[1])
                 start_x = float(ego.x)
                 start_y = float(ego.y)
             except (AttributeError, TypeError, ValueError):
@@ -567,10 +580,10 @@ def _install_score_config(ct_args):
                 math.cos(chord_yaw - start_yaw),
             )
             print(
-                "[ct-score] strict straight reference "
+                "[ct-score] destination-only straight reference "
                 f"start=({start_x:.3f},{start_y:.3f}) "
                 f"goal=({goal_x:.3f},{goal_y:.3f}) "
-                f"distance={distance:.3f}m kappa=0 "
+                f"distance={distance:.3f}m kappa=0 global_path=IGNORED "
                 f"start_heading={math.degrees(start_yaw):.3f}deg "
                 f"line_heading={math.degrees(chord_yaw):.3f}deg "
                 f"initial_heading_error="
@@ -582,7 +595,7 @@ def _install_score_config(ct_args):
     rule_based_planner.RuleBasedPlanner = CtRuleBasedPlanner
 
     class CtStableController(base_controller):
-        """Low-speed line alignment followed by an acknowledged boost."""
+        """Goal-heading alignment and tracking with constant acceleration."""
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -598,6 +611,7 @@ def _install_score_config(ct_args):
             self.ct_alignment_timeout_warned = False
             self.ct_straight_curvature_command = 0.0
             self.ct_straight_anchor = None
+            self.ct_speed_command = None
 
         def reset(self):
             super().reset()
@@ -646,9 +660,28 @@ def _install_score_config(ct_args):
                 0.01,
                 float(self.last_debug.get("dt", 0.02)),
             )
+            ego = args[0] if args else kwargs.get("ego")
+            try:
+                ego_speed = max(
+                    0.0, float(getattr(ego, "speed", 0.0))
+                )
+            except (AttributeError, TypeError, ValueError):
+                ego_speed = 0.0
+            if self.ct_speed_command is None:
+                self.ct_speed_command = ego_speed
+            cruise_speed = max(
+                float(self.config.sprint_speed),
+                ct_args.ct_alignment_speed,
+            )
+            # The evaluator derives "speed change rate" from consecutive
+            # commanded speeds. Ramp that field with the same 2 m/s2 slope as
+            # the acceleration command instead of jumping from 0 to cruise.
+            self.ct_speed_command = min(
+                cruise_speed,
+                self.ct_speed_command + ct_args.ct_accel * dt,
+            )
             if not self.ct_alignment_complete:
                 self.ct_alignment_elapsed += dt
-                ego = args[0] if args else kwargs.get("ego")
                 goal = ct_route_state.get("goal")
                 signed_heading_error = float(
                     self.last_debug.get("heading_error", 0.0)
@@ -681,14 +714,13 @@ def _install_score_config(ct_args):
                 else:
                     self.ct_alignment_stable_elapsed = 0.0
 
-                # Speed is not an alignment-completion condition. Publish the
-                # low alignment target immediately and use one contiguous
-                # acceleration pulse only until chassis feedback approaches
-                # it. This removes the former comfort S-curve's roughly
-                # 1.5-second startup cost without raising alignment speed or
-                # toggling acceleration repeatedly.
-                self.ct_alignment_command_speed = (
-                    ct_args.ct_alignment_speed
+                # Keep one longitudinal command from the first valid planning
+                # cycle through the finish. Heading alignment changes only the
+                # steering command; it never inserts a speed plateau, coast,
+                # or second acceleration edge.
+                self.ct_alignment_command_speed = max(
+                    self.ct_speed_command,
+                    0.0,
                 )
                 try:
                     measured_alignment_speed = max(
@@ -696,19 +728,8 @@ def _install_score_config(ct_args):
                     )
                 except (AttributeError, TypeError, ValueError):
                     measured_alignment_speed = 0.0
-                alignment_speed_ack = max(
-                    0.05,
-                    0.90 * ct_args.ct_alignment_speed,
-                )
-                effective_alignment_accel = min(
-                    3.0,
-                    ct_args.ct_alignment_accel,
-                )
-                self.ct_alignment_command_acc = (
-                    effective_alignment_accel
-                    if measured_alignment_speed < alignment_speed_ack
-                    else 0.0
-                )
+                effective_alignment_accel = ct_args.ct_accel
+                self.ct_alignment_command_acc = ct_args.ct_accel
 
                 output.speed = self.ct_alignment_command_speed
                 output.acc = self.ct_alignment_command_acc
@@ -871,7 +892,7 @@ def _install_score_config(ct_args):
                         f"{math.degrees(heading_error):.3f}deg "
                         f"original_line_offset={lateral_error:.3f}m "
                         f"new_line_anchor={self.ct_straight_anchor}; "
-                        "boost starts next control cycle"
+                        "constant acceleration continues"
                     )
                 elif timed_out and not self.ct_alignment_timeout_warned:
                     self.ct_alignment_timeout_warned = True
@@ -886,14 +907,6 @@ def _install_score_config(ct_args):
                         "boost remains inhibited until genuinely aligned"
                     )
                 return output
-
-            ego = args[0] if args else kwargs.get("ego")
-            try:
-                ego_speed = max(
-                    0.0, float(getattr(ego, "speed", 0.0))
-                )
-            except (TypeError, ValueError):
-                ego_speed = 0.0
 
             # At 40 m/s even one degree of front-wheel steering produces
             # roughly 10 m/s^2 lateral acceleration. The generic sprint
@@ -1024,54 +1037,23 @@ def _install_score_config(ct_args):
                     ),
                 }
             )
-            minimum_elapsed = (
-                self.sprint_pulse_elapsed
-                >= self.config.sprint_pulse_min_duration - 1e-9
+            output.speed = self.ct_speed_command
+            output.acc = ct_args.ct_accel
+            self.last_acc = ct_args.ct_accel
+            self.sprint_phase = "CT_CONSTANT_ACCEL"
+            self.sprint_pulse_acknowledged = False
+            self.last_debug.update(
+                {
+                    "sprint_phase": self.sprint_phase,
+                    "preview_target_speed": output.speed,
+                    "output_acc": output.acc,
+                    "ct_constant_accel": True,
+                    "ct_constant_accel_mps2": ct_args.ct_accel,
+                    "ct_feedback_speed": ego_speed,
+                    "ct_speed_command": self.ct_speed_command,
+                    "ct_speed_command_rate_mps2": ct_args.ct_accel,
+                }
             )
-            speed_acknowledged = (
-                minimum_elapsed
-                and ego_speed >= ct_args.ct_boost_ack_speed
-            )
-            boost_timed_out = (
-                self.sprint_phase == "PULSE"
-                and self.sprint_pulse_elapsed
-                >= ct_args.ct_boost_max_duration - 1e-9
-            )
-            if (
-                self.sprint_phase == "PULSE"
-                and (speed_acknowledged or boost_timed_out)
-            ):
-                self.sprint_pulse_acknowledged = True
-                self.sprint_phase = "COAST"
-                output.acc = 0.0
-                self.last_acc = 0.0
-                self.last_debug.update(
-                    {
-                        "sprint_phase": self.sprint_phase,
-                        "sprint_pulse_acknowledged": True,
-                        "sprint_accel_pulse_active": False,
-                        "output_acc": 0.0,
-                        "ct_boost_speed_acknowledged": (
-                            speed_acknowledged
-                        ),
-                        "ct_boost_timed_out": boost_timed_out,
-                        "ct_boost_feedback_speed": ego_speed,
-                    }
-                )
-                if speed_acknowledged:
-                    print(
-                        "[ct-score] boost acknowledged by chassis "
-                        f"ego_v={ego_speed:.3f}m/s "
-                        f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
-                        "entering COAST"
-                    )
-                else:
-                    print(
-                        "[ct-score][WARN] boost acknowledgement timeout "
-                        f"ego_v={ego_speed:.3f}m/s "
-                        f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
-                        "stopping acceleration publication"
-                    )
             return output
 
     CtStableController.__name__ = "CtStableController"
@@ -1084,6 +1066,18 @@ def main():
     if ct_args.ct_help:
         parser.print_help()
         return 0
+    if not math.isclose(
+        ct_args.ct_accel,
+        CT_CONSTANT_ACCEL_MPS2,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        print(
+            "[ct-score][OVERRIDE] this experiment fixes every valid "
+            f"control acceleration at {CT_CONSTANT_ACCEL_MPS2:.1f}m/s2; "
+            f"ignore requested --ct-accel={ct_args.ct_accel}"
+        )
+    ct_args.ct_accel = CT_CONSTANT_ACCEL_MPS2
     _validate_ct_args(parser, ct_args)
     if os.environ.get("CT_RUNTIME_CHILD") != "1":
         return _supervise_runtime(ct_args)
@@ -1166,12 +1160,11 @@ def main():
 
     print(
         "[ct-score] isolated scoring entrypoint active "
+        "policy=DIRECT_GOAL_CONSTANT_ACCEL "
         f"speed_factor={ct_args.ct_speed_factor:.3f} "
         f"alignment={ct_args.ct_alignment_duration:.3f}s "
-        f"pulse={ct_args.ct_pulse_duration:.3f}s "
-        f"boost_ack_speed={ct_args.ct_boost_ack_speed:.3f}m/s "
-        f"boost_max={ct_args.ct_boost_max_duration:.3f}s "
         f"accel={ct_args.ct_accel:.1f}m/s2 "
+        f"speed_command_rate={ct_args.ct_accel:.1f}m/s2 "
         f"alignment_speed={ct_args.ct_alignment_speed:.3f}m/s "
         f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
         f"alignment_steer="
@@ -1192,7 +1185,8 @@ def main():
         f"first_ins_timeout={ct_args.ct_first_ins_timeout:.1f}s "
         f"ins_start_gate="
         f"{ct_args.ct_ins_start_gate_tolerance:.1f}m "
-        "background_vehicles=IGNORED gt_subscription=DISABLED "
+        "global_path=IGNORED background_vehicles=IGNORED "
+        "gt_subscription=DISABLED "
         "ins_sequence_filter=MONOTONIC"
     )
     if ct_args.ct_channel_settle_duration > 0.0:

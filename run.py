@@ -292,6 +292,7 @@ ins_start_gate_xy = None
 ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
+ins_receiver_stop_event = threading.Event()
 test_start_received_ts = None
 channel_created_ts = None
 first_prepare_startup_timeout = max(
@@ -3048,6 +3049,11 @@ def get_vehicle_pose():
     # print(ins.sequence_num)
     if ins.sequence_num == 0 or ins.sequence_num > 1000000:
         return
+    # The native channel returns a sequence-1 sentinel whose nested position
+    # storage is not initialized while the simulator role is still preparing.
+    # run1.py discards it before touching position.x/y.
+    if ins.sequence_num == 1:
+        return
     ins_sequence = int(ins.sequence_num)
     ins_valid, invalid_reason, ins_xy = _ins_sample_status(ins)
     if not ins_valid:
@@ -3107,6 +3113,41 @@ def get_vehicle_pose():
 
 
         #这个地方可能会缓存上回合遗留的自车位置信息。
+
+def ins_receiver_loop():
+    """Prime and consume the single INS channel like the known-good run1.py."""
+    print(
+        "[ins-thread] receiver started mode=run1-compatible "
+        "consumer=single",
+        flush=True,
+    )
+    while not ins_receiver_stop_event.is_set():
+        # Poll after ActorPrepare establishes the init-state gate, but before
+        # ActorPrepareResult permits NT_START_TEST. The early get_ins() calls
+        # prime the native subscription and discard its sequence-1 sentinel.
+        if not recv_prepare or ins_start_gate_xy is None:
+            ins_receiver_stop_event.wait(0.005)
+            continue
+        try:
+            get_vehicle_pose()
+            ins_receiver_stop_event.wait(0.001)
+        except Exception as exc:
+            print(
+                f"[ins-thread][WARN] receive/update failed: {exc}",
+                flush=True,
+            )
+            ins_receiver_stop_event.wait(0.01)
+
+
+def start_ins_receiver_thread():
+    thread = threading.Thread(
+        target=ins_receiver_loop,
+        name="ins-receiver",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
 
 def abort_test():
     global session_id
@@ -3226,11 +3267,8 @@ def main():
                 pre_map_name = map_name
             time.sleep(0.1)
             continue
-        # Match run_ori.py's single-consumer message model: INS is read by
-        # the main loop after NT_START_TEST, never by a parallel receiver
-        # thread. This keeps one native subscriber and one deterministic
-        # get_ins() call sequence for the lifetime of the process.
-        get_vehicle_pose()
+        # The run1-compatible receiver thread is the only INS consumer. It is
+        # already active before NT_START_TEST, so do not call get_ins() here.
         if hold_until_ego_ready():
             get_vehicle_feedback()
             time.sleep(0.02)
@@ -4759,9 +4797,12 @@ if __name__ == "__main__":
     )
     pre_map_name = None
     map_name = None
+    ins_receiver_thread = start_ins_receiver_thread()
     try:
         main()
     finally:
+        ins_receiver_stop_event.set()
+        ins_receiver_thread.join(timeout=1.0)
         model.close()
         if drive_trace_logger is not None:
             drive_trace_logger.close()
