@@ -120,6 +120,19 @@ class FinalSpeedLimiterTest(unittest.TestCase):
         self.assertAlmostEqual(held_speed, 35.0)
         self.assertAlmostEqual(held_accel, 0.0)
 
+    def test_one_shot_uses_simulator_effective_interval(self):
+        limiter = FinalSpeedLimiter(
+            publish_interval=0.03,
+            one_shot_target=True,
+            one_shot_effective_interval=1.0 / 24.0,
+        )
+        limiter.reset(0.0)
+
+        speed, accel, _ = limiter.step(23.8, ego_speed=0.0)
+
+        self.assertAlmostEqual(speed, 23.8)
+        self.assertAlmostEqual(accel, 571.2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -727,12 +727,15 @@ def _install_score_config(ct_args):
                 else:
                     self.ct_alignment_stable_elapsed = 0.0
 
-                # Keep one longitudinal command from the first valid planning
-                # cycle through the finish. Heading alignment changes only the
-                # steering command; it never inserts a speed plateau, coast,
-                # or second acceleration edge.
+                # Do not launch at cruise speed while the initial heading is
+                # still wrong. DriveSim steering feedback trails the command
+                # by several frames, so the wheel must first turn and settle
+                # at a controllable alignment speed.
                 self.ct_alignment_command_speed = max(
-                    self.ct_speed_command,
+                    min(
+                        self.ct_speed_command,
+                        ct_args.ct_alignment_speed,
+                    ),
                     0.0,
                 )
                 try:
@@ -1188,6 +1191,13 @@ def main():
     # cruise target once with the matching instantaneous acceleration, then
     # hold the target with zero acceleration.
     os.environ["E2E_FINAL_CONTROL_ONE_SHOT_TARGET"] = "1"
+    # The latest DriveSim trace consumed a single command over roughly one
+    # 24 Hz physics step: a 23.8 m/s request calculated with 30 ms became
+    # 33.06 m/s. Use the effective physics interval so a one-shot request
+    # lands near, rather than far above, its target.
+    os.environ["E2E_FINAL_CONTROL_ONE_SHOT_EFFECTIVE_INTERVAL"] = str(
+        1.0 / 24.0
+    )
 
     print(
         "[ct-score] isolated scoring entrypoint active "

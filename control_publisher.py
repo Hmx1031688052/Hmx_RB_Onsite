@@ -19,10 +19,17 @@ class FinalSpeedLimiter:
         safe_accel=2.0,
         publish_interval=0.03,
         one_shot_target=False,
+        one_shot_effective_interval=None,
     ):
         self.safe_accel = max(0.0, float(safe_accel))
         self.publish_interval = max(1e-6, float(publish_interval))
         self.one_shot_target = bool(one_shot_target)
+        effective_interval = _finite(one_shot_effective_interval)
+        self.one_shot_effective_interval = (
+            self.publish_interval
+            if effective_interval is None
+            else max(1e-6, effective_interval)
+        )
         self.last_published_speed = None
         self.last_requested_speed = None
 
@@ -60,7 +67,8 @@ class FinalSpeedLimiter:
                 0.0, ego_speed
             )
             instant_accel = (
-                (desired - reference_speed) / self.publish_interval
+                (desired - reference_speed)
+                / self.one_shot_effective_interval
             )
             self.last_requested_speed = desired
             self.last_published_speed = desired

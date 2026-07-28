@@ -309,10 +309,22 @@ final_control_safe_accel = max(
 final_control_one_shot_target = (
     os.environ.get("E2E_FINAL_CONTROL_ONE_SHOT_TARGET", "0") == "1"
 )
+final_control_one_shot_effective_interval = max(
+    1e-6,
+    float(
+        os.environ.get(
+            "E2E_FINAL_CONTROL_ONE_SHOT_EFFECTIVE_INTERVAL",
+            str(final_control_interval),
+        )
+    ),
+)
 final_control_limiter = FinalSpeedLimiter(
     safe_accel=final_control_safe_accel,
     publish_interval=final_control_interval,
     one_shot_target=final_control_one_shot_target,
+    one_shot_effective_interval=(
+        final_control_one_shot_effective_interval
+    ),
 )
 final_control_lock = threading.Lock()
 final_control_stop_event = threading.Event()
@@ -3126,6 +3138,8 @@ def final_control_publisher_loop():
         f"interval={final_control_interval:.3f}s "
         f"safe_accel={final_control_safe_accel:.3f}m/s2 "
         f"one_shot_target={int(final_control_one_shot_target)} "
+        f"one_shot_effective_interval="
+        f"{final_control_one_shot_effective_interval:.6f}s "
         f"max_speed_step="
         f"{final_control_limiter.max_speed_step:.6f}m",
         flush=True,
