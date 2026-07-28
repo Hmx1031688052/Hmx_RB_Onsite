@@ -80,10 +80,11 @@ def _ct_parser():
     parser.add_argument(
         "--ct-alignment-accel",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "100.0")),
+        default=float(os.environ.get("CT_ALIGNMENT_ACCEL", "2.8")),
         help=(
             "single continuous acceleration used to establish the low "
-            "alignment speed, in m/s^2 (default: 100.0)"
+            "alignment speed, in m/s^2; internally capped at 3.0 "
+            "(default: 2.8)"
         ),
     )
     parser.add_argument(
@@ -700,8 +701,12 @@ def _install_score_config(ct_args):
                     0.05,
                     0.90 * ct_args.ct_alignment_speed,
                 )
+                effective_alignment_accel = min(
+                    3.0,
+                    ct_args.ct_alignment_accel,
+                )
                 self.ct_alignment_command_acc = (
-                    ct_args.ct_alignment_accel
+                    effective_alignment_accel
                     if measured_alignment_speed < alignment_speed_ack
                     else 0.0
                 )
@@ -817,6 +822,9 @@ def _install_score_config(ct_args):
                         ),
                         "ct_alignment_command_acc": (
                             self.ct_alignment_command_acc
+                        ),
+                        "ct_alignment_effective_accel_limit": (
+                            effective_alignment_accel
                         ),
                         "ct_alignment_steer": alignment_steer,
                         "ct_alignment_measured_steer": measured_steer,
