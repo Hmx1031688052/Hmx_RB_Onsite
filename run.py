@@ -1234,9 +1234,16 @@ def hold_until_ego_ready():
         print(
             "[startup][RECONNECT] no valid INS arrived after "
             f"{start_age:.1f}s invalid_count={invalid_ins_count}; "
-            "requesting one clean process-level channel reconnect"
+            "requesting one clean process-level channel reconnect",
+            flush=True,
         )
-        raise SystemExit(75)
+        # This path runs only inside run_ct.py's supervised runtime child.
+        # A normal SystemExit executes model.close(), whose HTTP visualizer
+        # shutdown can deadlock after a failed native-channel startup and
+        # prevent the parent from ever seeing the reconnect exit code.
+        # Process-level disposal is intentional here: the OS releases every
+        # native channel/socket before the supervisor creates a fresh child.
+        os._exit(75)
     if now - last_ego_hold_warn_ts >= 1.0:
         last_ego_hold_warn_ts = now
         print(
