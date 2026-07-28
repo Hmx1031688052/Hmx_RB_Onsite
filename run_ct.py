@@ -120,6 +120,39 @@ def _ct_parser():
         help="maximum moving alignment time in seconds (default: 6.0)",
     )
     parser.add_argument(
+        "--ct-straight-spatial-frequency",
+        type=float,
+        default=float(
+            os.environ.get("CT_STRAIGHT_SPATIAL_FREQUENCY", "0.03")
+        ),
+        help=(
+            "straight-line feedback frequency in 1/m; lower values are "
+            "gentler at sprint speed (default: 0.03)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-straight-max-lateral-accel",
+        type=float,
+        default=float(
+            os.environ.get("CT_STRAIGHT_MAX_LATERAL_ACCEL", "0.45")
+        ),
+        help=(
+            "maximum lateral acceleration used by CT straight tracking, "
+            "in m/s^2 (default: 0.45)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-straight-max-lateral-jerk",
+        type=float,
+        default=float(
+            os.environ.get("CT_STRAIGHT_MAX_LATERAL_JERK", "0.90")
+        ),
+        help=(
+            "maximum lateral jerk used to slew the CT curvature command, "
+            "in m/s^3 (default: 0.90)"
+        ),
+    )
+    parser.add_argument(
         "--ct-help",
         action="store_true",
         help="show run_ct.py-specific options and exit",
@@ -168,6 +201,9 @@ def _validate_ct_args(parser, args):
         "ct_lateral_tolerance",
         "ct_alignment_settle_duration",
         "ct_alignment_timeout",
+        "ct_straight_spatial_frequency",
+        "ct_straight_max_lateral_accel",
+        "ct_straight_max_lateral_jerk",
     ):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0.0:
@@ -320,6 +356,7 @@ def _install_score_config(ct_args):
             self.ct_alignment_result_logged = False
             self.ct_alignment_command_speed = 0.0
             self.ct_alignment_command_acc = 0.0
+            self.ct_straight_curvature_command = 0.0
 
         def reset(self):
             super().reset()
@@ -498,6 +535,108 @@ def _install_score_config(ct_args):
                 )
             except (TypeError, ValueError):
                 ego_speed = 0.0
+
+            # At 40 m/s even one degree of front-wheel steering produces
+            # roughly 10 m/s^2 lateral acceleration. The generic sprint
+            # controller intentionally grants large recovery authority and
+            # therefore oscillates around a literal straight chord. CT mode
+            # instead uses a low-bandwidth spatial controller:
+            #
+            #   curvature = 2*w*heading_error - w^2*lateral_error
+            #
+            # Its acceleration and curvature slew are both bounded using the
+            # anticipated post-boost speed, so the command is already small
+            # before delayed chassis speed feedback reports the jump.
+            heading_error = float(
+                self.last_debug.get("heading_error", 0.0)
+            )
+            lateral_error = float(
+                self.last_debug.get("lateral_error", 0.0)
+            )
+            plan_result = (
+                args[1] if len(args) > 1 else kwargs.get("plan_result")
+            )
+            try:
+                planned_speed = max(
+                    0.0,
+                    float(getattr(plan_result, "target_speed", 0.0)),
+                )
+            except (TypeError, ValueError):
+                planned_speed = 0.0
+            design_speed = max(
+                ego_speed,
+                planned_speed,
+                ct_args.ct_boost_ack_speed,
+            )
+            spatial_frequency = (
+                ct_args.ct_straight_spatial_frequency
+            )
+            desired_curvature = (
+                2.0 * spatial_frequency * heading_error
+                - spatial_frequency
+                * spatial_frequency
+                * lateral_error
+            )
+            curvature_limit = (
+                ct_args.ct_straight_max_lateral_accel
+                / max(design_speed * design_speed, 1.0)
+            )
+            desired_curvature = max(
+                -curvature_limit,
+                min(curvature_limit, desired_curvature),
+            )
+            curvature_change_limit = (
+                ct_args.ct_straight_max_lateral_jerk
+                * dt
+                / max(design_speed * design_speed, 1.0)
+            )
+            curvature_error = (
+                desired_curvature
+                - self.ct_straight_curvature_command
+            )
+            self.ct_straight_curvature_command += max(
+                -curvature_change_limit,
+                min(curvature_change_limit, curvature_error),
+            )
+            wheelbase = max(
+                0.1, float(self.config.controller_wheelbase)
+            )
+            steering_ratio = float(self.config.steering_ratio)
+            command_sign = float(
+                self.config.steering_command_sign
+            )
+            straight_steer = (
+                command_sign
+                * math.degrees(
+                    math.atan(
+                        wheelbase
+                        * self.ct_straight_curvature_command
+                    )
+                )
+                * steering_ratio
+            )
+            output.steer = straight_steer
+            self.last_steer = straight_steer
+            self.filtered_steer = straight_steer
+            self.last_debug.update(
+                {
+                    "output_steer": straight_steer,
+                    "ct_straight_tracking": True,
+                    "ct_straight_design_speed": design_speed,
+                    "ct_straight_desired_curvature": (
+                        desired_curvature
+                    ),
+                    "ct_straight_curvature_command": (
+                        self.ct_straight_curvature_command
+                    ),
+                    "ct_straight_curvature_limit": curvature_limit,
+                    "ct_straight_lateral_accel_command": (
+                        design_speed
+                        * design_speed
+                        * self.ct_straight_curvature_command
+                    ),
+                }
+            )
             minimum_elapsed = (
                 self.sprint_pulse_elapsed
                 >= self.config.sprint_pulse_min_duration - 1e-9
@@ -624,6 +763,12 @@ def main():
         f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
         f"heading_tol={ct_args.ct_heading_tolerance_deg:.3f}deg "
         f"lateral_tol={ct_args.ct_lateral_tolerance:.3f}m "
+        f"straight_frequency="
+        f"{ct_args.ct_straight_spatial_frequency:.3f}/m "
+        f"straight_lat_accel="
+        f"{ct_args.ct_straight_max_lateral_accel:.3f}m/s2 "
+        f"straight_lat_jerk="
+        f"{ct_args.ct_straight_max_lateral_jerk:.3f}m/s3 "
         "background_vehicles=IGNORED gt_subscription=DISABLED"
     )
     run_path = os.path.join(os.path.dirname(__file__), "run.py")
