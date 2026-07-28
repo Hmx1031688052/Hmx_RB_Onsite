@@ -74,8 +74,8 @@ def _ct_parser():
     parser.add_argument(
         "--ct-alignment-speed",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_SPEED", "1.5")),
-        help="moving alignment speed in m/s (default: 1.5)",
+        default=float(os.environ.get("CT_ALIGNMENT_SPEED", "3.0")),
+        help="moving alignment speed in m/s (default: 3.0)",
     )
     parser.add_argument(
         "--ct-alignment-accel",
@@ -139,17 +139,17 @@ def _ct_parser():
         "--ct-alignment-heading-gain",
         type=float,
         default=float(
-            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "1.5")
+            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "1.0")
         ),
-        help="low-speed alignment heading feedback gain (default: 1.5)",
+        help="fine-alignment heading feedback gain (default: 1.0)",
     )
     parser.add_argument(
         "--ct-alignment-lateral-gain",
         type=float,
         default=float(
-            os.environ.get("CT_ALIGNMENT_LATERAL_GAIN", "1.0")
+            os.environ.get("CT_ALIGNMENT_LATERAL_GAIN", "0.4")
         ),
-        help="low-speed alignment lateral feedback gain (default: 1.0)",
+        help="fine-alignment lateral feedback gain (default: 0.4)",
     )
     parser.add_argument(
         "--ct-alignment-steer-tolerance-deg",
@@ -162,6 +162,19 @@ def _ct_parser():
         help=(
             "commanded and measured steering-wheel tolerance required "
             "before boost, in degrees (default: 0.5)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-alignment-steer-rate-deg-s",
+        type=float,
+        default=float(
+            os.environ.get(
+                "CT_ALIGNMENT_STEER_RATE_DEG_S", "286.5"
+            )
+        ),
+        help=(
+            "measured steering-wheel slew used by switching prediction, "
+            "in deg/s (default: 286.5, matching 5 rad/s)"
         ),
     )
     parser.add_argument(
@@ -315,6 +328,7 @@ def _validate_ct_args(parser, args):
         "ct_alignment_heading_gain",
         "ct_alignment_lateral_gain",
         "ct_alignment_steer_tolerance_deg",
+        "ct_alignment_steer_rate_deg_s",
         "ct_straight_spatial_frequency",
         "ct_straight_max_lateral_accel",
         "ct_straight_max_lateral_jerk",
@@ -651,9 +665,10 @@ def _install_score_config(ct_args):
                 # The generic sprint controller is intentionally capped at
                 # 11 degrees and cannot align a 38-degree initial heading
                 # before a short route ends. At low speed the chassis can
-                # safely use its normal steering authority: even the maximum
-                # command remains below the 0.5 m/s^2 lateral-accel threshold
-                # at the default 1.5 m/s alignment speed.
+                # use its normal steering authority. CT uses a short 3 m/s
+                # manoeuvre here: its brief lateral-threshold exposure costs
+                # less under the duration-based score than spending most of
+                # a short episode aligning at crawl speed.
                 wheelbase = max(
                     0.1, float(self.config.controller_wheelbase)
                 )
@@ -667,19 +682,127 @@ def _install_score_config(ct_args):
                     ct_args.ct_alignment_max_steer_deg,
                     float(self.config.max_steering_wheel_deg),
                 )
-                desired_alignment_curvature = (
-                    ct_args.ct_alignment_heading_gain
-                    * float(
-                        self.last_debug.get(
-                            "heading_error", 0.0
+                signed_heading_error = float(
+                    self.last_debug.get("heading_error", 0.0)
+                )
+                signed_lateral_error = float(
+                    self.last_debug.get("lateral_error", 0.0)
+                )
+                steering_feedback = kwargs.get("steering_feedback")
+                try:
+                    signed_measured_steer = float(
+                        steering_feedback
+                    )
+                except (TypeError, ValueError):
+                    signed_measured_steer = 0.0
+                measured_steer = abs(signed_measured_steer)
+                max_front_angle = math.radians(
+                    max_alignment_steer / steering_ratio
+                )
+                max_alignment_curvature = (
+                    math.tan(max_front_angle) / wheelbase
+                )
+                fine_alignment = (
+                    abs(signed_heading_error)
+                    <= math.radians(
+                        max(
+                            2.0,
+                            4.0
+                            * ct_args.ct_heading_tolerance_deg,
                         )
                     )
-                    - ct_args.ct_alignment_lateral_gain
-                    * float(
-                        self.last_debug.get(
-                            "lateral_error", 0.0
+                    and abs(signed_lateral_error)
+                    <= ct_args.ct_lateral_tolerance
+                )
+                if fine_alignment:
+                    desired_alignment_curvature = (
+                        ct_args.ct_alignment_heading_gain
+                        * signed_heading_error
+                        - ct_args.ct_alignment_lateral_gain
+                        * signed_lateral_error
+                    )
+                    alignment_control_mode = "FINE"
+                    alignment_switch_surface = float("nan")
+                else:
+                    # Spatial-domain time-optimal switching surface for
+                    # d'=-heading_error, heading_error'=-curvature:
+                    #
+                    #   d - e*|e|/(2*kappa_max) = 0
+                    #
+                    # It commands one full-curvature turn followed by one
+                    # reverse-curvature turn. Unlike the former high-gain
+                    # linear law, it does not circle around the line several
+                    # times before settling.
+                    measured_front_angle = math.radians(
+                        command_sign
+                        * signed_measured_steer
+                        / steering_ratio
+                    )
+                    measured_curvature = (
+                        math.tan(measured_front_angle)
+                        / wheelbase
+                    )
+                    try:
+                        measured_speed = max(
+                            0.0,
+                            float(
+                                getattr(args[0], "speed", 0.0)
+                            ),
+                        )
+                    except (IndexError, TypeError, ValueError):
+                        measured_speed = (
+                            self.ct_alignment_command_speed
+                        )
+                    # Switching from +max steer to -max steer is not
+                    # instantaneous. Predict the state through 1.5 times the
+                    # measured wheel's time-to-centre so the reverse command
+                    # is issued before actuator lag carries the car past the
+                    # ideal switching curve.
+                    steering_unwind_time = (
+                        abs(signed_measured_steer)
+                        / ct_args.ct_alignment_steer_rate_deg_s
+                    )
+                    prediction_horizon = (
+                        1.5 * steering_unwind_time
+                    )
+                    predicted_heading_error = (
+                        signed_heading_error
+                        - measured_speed
+                        * measured_curvature
+                        * prediction_horizon
+                    )
+                    predicted_lateral_error = (
+                        signed_lateral_error
+                        - measured_speed
+                        * math.sin(signed_heading_error)
+                        * prediction_horizon
+                    )
+                    alignment_switch_surface = (
+                        predicted_lateral_error
+                        - predicted_heading_error
+                        * abs(predicted_heading_error)
+                        / max(
+                            2.0 * max_alignment_curvature,
+                            1e-6,
                         )
                     )
+                    if alignment_switch_surface > 1e-6:
+                        desired_alignment_curvature = (
+                            -max_alignment_curvature
+                        )
+                    elif alignment_switch_surface < -1e-6:
+                        desired_alignment_curvature = (
+                            max_alignment_curvature
+                        )
+                    else:
+                        desired_alignment_curvature = 0.0
+                    alignment_control_mode = "TIME_OPTIMAL"
+                desired_alignment_curvature = max(
+                    -max_alignment_curvature,
+                    min(
+                        max_alignment_curvature,
+                        desired_alignment_curvature,
+                    ),
                 )
                 alignment_front_angle = math.atan(
                     wheelbase * desired_alignment_curvature
@@ -696,11 +819,29 @@ def _install_score_config(ct_args):
                 output.steer = alignment_steer
                 self.last_steer = alignment_steer
                 self.filtered_steer = alignment_steer
-                steering_feedback = kwargs.get("steering_feedback")
-                try:
-                    measured_steer = abs(float(steering_feedback))
-                except (TypeError, ValueError):
+                if steering_feedback is None:
                     measured_steer = abs(alignment_steer)
+
+                profile_settled = (
+                    self.ct_alignment_command_speed
+                    >= ct_args.ct_alignment_speed - 0.01
+                    and self.ct_alignment_command_acc <= 0.05
+                )
+                geometry_settled = (
+                    self.ct_alignment_stable_elapsed
+                    >= ct_args.ct_alignment_settle_duration - 1e-9
+                    and profile_settled
+                )
+                if geometry_settled:
+                    # Do not let the fine controller spend another second
+                    # asymptotically reducing a small steering command. Once
+                    # pose geometry has remained valid, explicitly centre the
+                    # wheel and wait only for measured feedback to follow.
+                    alignment_control_mode = "CENTER_WHEEL"
+                    alignment_steer = 0.0
+                    output.steer = 0.0
+                    self.last_steer = 0.0
+                    self.filtered_steer = 0.0
 
                 # Discard any pulse state advanced internally while the
                 # lateral controller was being evaluated. The real boost
@@ -733,15 +874,16 @@ def _install_score_config(ct_args):
                         ),
                         "ct_alignment_steer": alignment_steer,
                         "ct_alignment_measured_steer": measured_steer,
+                        "ct_alignment_control_mode": (
+                            alignment_control_mode
+                        ),
+                        "ct_alignment_switch_surface": (
+                            alignment_switch_surface
+                        ),
                         "output_steer": alignment_steer,
                     }
                 )
 
-                profile_settled = (
-                    self.ct_alignment_command_speed
-                    >= ct_args.ct_alignment_speed - 0.01
-                    and self.ct_alignment_command_acc <= 0.05
-                )
                 steering_settled = (
                     abs(alignment_steer)
                     <= ct_args.ct_alignment_steer_tolerance_deg
@@ -749,9 +891,7 @@ def _install_score_config(ct_args):
                     <= ct_args.ct_alignment_steer_tolerance_deg
                 )
                 settled = (
-                    self.ct_alignment_stable_elapsed
-                    >= ct_args.ct_alignment_settle_duration - 1e-9
-                    and profile_settled
+                    geometry_settled
                     and steering_settled
                 )
                 timed_out = (
