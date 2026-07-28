@@ -74,8 +74,8 @@ def _ct_parser():
     parser.add_argument(
         "--ct-alignment-speed",
         type=float,
-        default=float(os.environ.get("CT_ALIGNMENT_SPEED", "1.0")),
-        help="moving alignment speed in m/s (default: 1.0)",
+        default=float(os.environ.get("CT_ALIGNMENT_SPEED", "1.5")),
+        help="moving alignment speed in m/s (default: 1.5)",
     )
     parser.add_argument(
         "--ct-alignment-accel",
@@ -119,7 +119,50 @@ def _ct_parser():
         default=float(
             os.environ.get("CT_ALIGNMENT_TIMEOUT", "6.0")
         ),
-        help="maximum moving alignment time in seconds (default: 6.0)",
+        help=(
+            "alignment warning threshold in seconds; it never bypasses "
+            "alignment requirements (default: 6.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-alignment-max-steer-deg",
+        type=float,
+        default=float(
+            os.environ.get("CT_ALIGNMENT_MAX_STEER_DEG", "42.0")
+        ),
+        help=(
+            "maximum steering-wheel command during low-speed alignment, "
+            "in degrees (default: 42.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-alignment-heading-gain",
+        type=float,
+        default=float(
+            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "1.5")
+        ),
+        help="low-speed alignment heading feedback gain (default: 1.5)",
+    )
+    parser.add_argument(
+        "--ct-alignment-lateral-gain",
+        type=float,
+        default=float(
+            os.environ.get("CT_ALIGNMENT_LATERAL_GAIN", "1.0")
+        ),
+        help="low-speed alignment lateral feedback gain (default: 1.0)",
+    )
+    parser.add_argument(
+        "--ct-alignment-steer-tolerance-deg",
+        type=float,
+        default=float(
+            os.environ.get(
+                "CT_ALIGNMENT_STEER_TOLERANCE_DEG", "0.5"
+            )
+        ),
+        help=(
+            "commanded and measured steering-wheel tolerance required "
+            "before boost, in degrees (default: 0.5)"
+        ),
     )
     parser.add_argument(
         "--ct-straight-spatial-frequency",
@@ -268,6 +311,10 @@ def _validate_ct_args(parser, args):
         "ct_lateral_tolerance",
         "ct_alignment_settle_duration",
         "ct_alignment_timeout",
+        "ct_alignment_max_steer_deg",
+        "ct_alignment_heading_gain",
+        "ct_alignment_lateral_gain",
+        "ct_alignment_steer_tolerance_deg",
         "ct_straight_spatial_frequency",
         "ct_straight_max_lateral_accel",
         "ct_straight_max_lateral_jerk",
@@ -490,6 +537,7 @@ def _install_score_config(ct_args):
             self.ct_alignment_result_logged = False
             self.ct_alignment_command_speed = 0.0
             self.ct_alignment_command_acc = 0.0
+            self.ct_alignment_timeout_warned = False
             self.ct_straight_curvature_command = 0.0
 
         def reset(self):
@@ -600,6 +648,60 @@ def _install_score_config(ct_args):
                 output.speed = self.ct_alignment_command_speed
                 output.acc = self.ct_alignment_command_acc
 
+                # The generic sprint controller is intentionally capped at
+                # 11 degrees and cannot align a 38-degree initial heading
+                # before a short route ends. At low speed the chassis can
+                # safely use its normal steering authority: even the maximum
+                # command remains below the 0.5 m/s^2 lateral-accel threshold
+                # at the default 1.5 m/s alignment speed.
+                wheelbase = max(
+                    0.1, float(self.config.controller_wheelbase)
+                )
+                steering_ratio = max(
+                    0.1, float(self.config.steering_ratio)
+                )
+                command_sign = float(
+                    self.config.steering_command_sign
+                )
+                max_alignment_steer = min(
+                    ct_args.ct_alignment_max_steer_deg,
+                    float(self.config.max_steering_wheel_deg),
+                )
+                desired_alignment_curvature = (
+                    ct_args.ct_alignment_heading_gain
+                    * float(
+                        self.last_debug.get(
+                            "heading_error", 0.0
+                        )
+                    )
+                    - ct_args.ct_alignment_lateral_gain
+                    * float(
+                        self.last_debug.get(
+                            "lateral_error", 0.0
+                        )
+                    )
+                )
+                alignment_front_angle = math.atan(
+                    wheelbase * desired_alignment_curvature
+                )
+                alignment_steer = (
+                    command_sign
+                    * math.degrees(alignment_front_angle)
+                    * steering_ratio
+                )
+                alignment_steer = max(
+                    -max_alignment_steer,
+                    min(max_alignment_steer, alignment_steer),
+                )
+                output.steer = alignment_steer
+                self.last_steer = alignment_steer
+                self.filtered_steer = alignment_steer
+                steering_feedback = kwargs.get("steering_feedback")
+                try:
+                    measured_steer = abs(float(steering_feedback))
+                except (TypeError, ValueError):
+                    measured_steer = abs(alignment_steer)
+
                 # Discard any pulse state advanced internally while the
                 # lateral controller was being evaluated. The real boost
                 # starts only on the cycle after alignment completes.
@@ -629,6 +731,9 @@ def _install_score_config(ct_args):
                         "ct_alignment_command_acc": (
                             self.ct_alignment_command_acc
                         ),
+                        "ct_alignment_steer": alignment_steer,
+                        "ct_alignment_measured_steer": measured_steer,
+                        "output_steer": alignment_steer,
                     }
                 )
 
@@ -637,21 +742,28 @@ def _install_score_config(ct_args):
                     >= ct_args.ct_alignment_speed - 0.01
                     and self.ct_alignment_command_acc <= 0.05
                 )
+                steering_settled = (
+                    abs(alignment_steer)
+                    <= ct_args.ct_alignment_steer_tolerance_deg
+                    and measured_steer
+                    <= ct_args.ct_alignment_steer_tolerance_deg
+                )
                 settled = (
                     self.ct_alignment_stable_elapsed
                     >= ct_args.ct_alignment_settle_duration - 1e-9
                     and profile_settled
+                    and steering_settled
                 )
                 timed_out = (
                     self.ct_alignment_elapsed
                     >= ct_args.ct_alignment_timeout
                 )
-                if settled or timed_out:
+                if settled:
                     self.ct_alignment_complete = True
                     self.ct_alignment_result_logged = True
                     print(
                         "[ct-score] moving alignment complete "
-                        f"reason={'settled' if settled else 'timeout'} "
+                        "reason=settled "
                         f"elapsed={self.ct_alignment_elapsed:.3f}s "
                         f"stable="
                         f"{self.ct_alignment_stable_elapsed:.3f}s "
@@ -659,6 +771,18 @@ def _install_score_config(ct_args):
                         f"{math.degrees(heading_error):.3f}deg "
                         f"lateral_error={lateral_error:.3f}m; "
                         "boost starts next control cycle"
+                    )
+                elif timed_out and not self.ct_alignment_timeout_warned:
+                    self.ct_alignment_timeout_warned = True
+                    print(
+                        "[ct-score][WAIT] alignment warning threshold "
+                        f"elapsed={self.ct_alignment_elapsed:.3f}s "
+                        f"heading_error="
+                        f"{math.degrees(heading_error):.3f}deg "
+                        f"lateral_error={lateral_error:.3f}m "
+                        f"command_steer={alignment_steer:.3f}deg "
+                        f"measured_steer={measured_steer:.3f}deg; "
+                        "boost remains inhibited until genuinely aligned"
                     )
                 return output
 
@@ -917,6 +1041,8 @@ def main():
         f"accel={ct_args.ct_accel:.1f}m/s2 "
         f"alignment_speed={ct_args.ct_alignment_speed:.3f}m/s "
         f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
+        f"alignment_steer="
+        f"{ct_args.ct_alignment_max_steer_deg:.1f}deg "
         f"heading_tol={ct_args.ct_heading_tolerance_deg:.3f}deg "
         f"lateral_tol={ct_args.ct_lateral_tolerance:.3f}m "
         f"straight_frequency="
