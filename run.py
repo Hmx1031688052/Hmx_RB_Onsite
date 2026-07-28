@@ -280,6 +280,8 @@ ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 test_start_received_ts = None
 last_ego_hold_warn_ts = 0.0
+last_prepare_wait_warn_ts = 0.0
+last_start_wait_warn_ts = 0.0
 last_rule_plan = None
 roundabout_controller = None
 last_rule_plan_wall_time = 0.0
@@ -2845,8 +2847,6 @@ def get_vehicle_pose():
     # print(ins.sequence_num)
     if ins.sequence_num == 0 or ins.sequence_num > 1000000:
         return
-    if ins.sequence_num==1:
-        return
     ins_sequence = int(ins.sequence_num)
     ins_valid, invalid_reason, ins_xy = _ins_sample_status(ins)
     if not ins_valid:
@@ -2974,18 +2974,37 @@ def main():
     global prepare_not_before_ts
     global first_control_sent
     global first_control_sent_ts
+    global last_prepare_wait_warn_ts
+    global last_start_wait_warn_ts
 
     while 1:
         loop_count += 1
         notify = process_notify()
         if not recv_prepare:
-            drain_sensor_queues()
+            # Match run_ori.py: do not consume lidar/INS before ActorPrepare.
+            # Some native channel builds do not replay a frame once a client
+            # has drained it before the simulator role becomes active.
             get_prepare()
+            now = time.time()
+            if now - last_prepare_wait_warn_ts >= 2.0:
+                last_prepare_wait_warn_ts = now
+                print(
+                    "[message-loop][WAIT] ActorPrepare not received; "
+                    "notify/prepare are the only channels being polled"
+                )
             time.sleep(0.1)
             continue
         if recv_prepare and not start_test:
-            drain_sensor_queues()
+            # Keep sensor queues untouched until NT_START_TEST. Only the
+            # prepare/notify handshake is active in this state.
             if not map_ready or map_loading:
+                now = time.time()
+                if now - last_start_wait_warn_ts >= 2.0:
+                    last_start_wait_warn_ts = now
+                    print(
+                        "[message-loop][WAIT] preparing map or waiting "
+                        "for NT_START_TEST"
+                    )
                 time.sleep(1.0)
                 continue
             if prepare_not_before_ts is not None:
@@ -3004,12 +3023,10 @@ def main():
         # get_ins() call sequence for the lifetime of the process.
         get_vehicle_pose()
         if hold_until_ego_ready():
-            drain_sensor_queues()
             get_vehicle_feedback()
             time.sleep(0.02)
             continue
         if hold_until_global_plan_ready():
-            drain_sensor_queues()
             get_vehicle_feedback()
             time.sleep(0.02)
             continue
@@ -4186,6 +4203,14 @@ if __name__ == "__main__":
     param.client_name = "apollo_testee"
     param.recv_self_msg = False
     session_id = ""
+    print(
+        "[network-config] "
+        f"config_center={args.config_center} "
+        f"field_id={args.field_id} "
+        f"interface={args.net_interface} "
+        f"local_ip={local_ip} "
+        f"client_name={param.client_name}"
+    )
 
     required_channel_names = {
         "lidar",

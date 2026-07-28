@@ -64,6 +64,12 @@ def _ct_parser():
         help="moving alignment acceleration limit in m/s^2 (default: 2.8)",
     )
     parser.add_argument(
+        "--ct-alignment-jerk",
+        type=float,
+        default=float(os.environ.get("CT_ALIGNMENT_JERK", "4.5")),
+        help="moving alignment jerk limit in m/s^3 (default: 4.5)",
+    )
+    parser.add_argument(
         "--ct-heading-tolerance-deg",
         type=float,
         default=float(
@@ -123,6 +129,7 @@ def _validate_ct_args(parser, args):
     for name in (
         "ct_alignment_speed",
         "ct_alignment_accel",
+        "ct_alignment_jerk",
         "ct_heading_tolerance_deg",
         "ct_lateral_tolerance",
         "ct_alignment_settle_duration",
@@ -277,6 +284,8 @@ def _install_score_config(ct_args):
             self.ct_alignment_elapsed = 0.0
             self.ct_alignment_stable_elapsed = 0.0
             self.ct_alignment_result_logged = False
+            self.ct_alignment_command_speed = 0.0
+            self.ct_alignment_command_acc = 0.0
 
         def reset(self):
             super().reset()
@@ -292,12 +301,20 @@ def _install_score_config(ct_args):
                 and not self.sprint_pulse_acknowledged
             )
             saved_ack_speed = self.config.sprint_pulse_ack_speed
+            saved_alignment_duration = (
+                self.config.sprint_alignment_duration
+            )
+            if not self.ct_alignment_complete:
+                self.config.sprint_alignment_duration = float("inf")
             if force_fixed_pulse:
                 self.config.sprint_pulse_ack_speed = float("inf")
             try:
                 output = super().control(*args, **kwargs)
             finally:
                 self.config.sprint_pulse_ack_speed = saved_ack_speed
+                self.config.sprint_alignment_duration = (
+                    saved_alignment_duration
+                )
             if not bool(self.last_debug.get("sprint_mode", False)):
                 self._reset_ct_alignment()
                 return output
@@ -327,23 +344,57 @@ def _install_score_config(ct_args):
                 else:
                     self.ct_alignment_stable_elapsed = 0.0
 
-                ego = args[0] if args else kwargs.get("ego")
-                ego_speed = max(
+                remaining_speed = max(
                     0.0,
-                    float(getattr(ego, "speed", 0.0)),
+                    ct_args.ct_alignment_speed
+                    - self.ct_alignment_command_speed,
                 )
-                speed_error = (
-                    ct_args.ct_alignment_speed - ego_speed
+                # Jerk-limited S-curve. Begin ramping acceleration down when
+                # its remaining triangular area would consume the remaining
+                # delta-v. This avoids the old 2.8/0/-2.8 bang-bang commands.
+                ramp_down_delta_v = (
+                    self.ct_alignment_command_acc
+                    * self.ct_alignment_command_acc
+                    / (2.0 * ct_args.ct_alignment_jerk)
                 )
-                alignment_acc = max(
-                    -ct_args.ct_alignment_accel,
+                desired_acc = (
+                    0.0
+                    if remaining_speed
+                    <= ramp_down_delta_v + 1e-6
+                    else ct_args.ct_alignment_accel
+                )
+                max_acc_change = ct_args.ct_alignment_jerk * dt
+                acc_error = (
+                    desired_acc - self.ct_alignment_command_acc
+                )
+                acc_change = max(
+                    -max_acc_change,
+                    min(max_acc_change, acc_error),
+                )
+                self.ct_alignment_command_acc += acc_change
+                self.ct_alignment_command_acc = max(
+                    0.0,
                     min(
                         ct_args.ct_alignment_accel,
-                        speed_error / dt,
+                        self.ct_alignment_command_acc,
                     ),
                 )
-                output.speed = ct_args.ct_alignment_speed
-                output.acc = alignment_acc
+                self.ct_alignment_command_speed = min(
+                    ct_args.ct_alignment_speed,
+                    self.ct_alignment_command_speed
+                    + self.ct_alignment_command_acc * dt,
+                )
+                if (
+                    self.ct_alignment_command_speed
+                    >= ct_args.ct_alignment_speed - 1e-6
+                    and desired_acc <= 0.0
+                    and self.ct_alignment_command_acc
+                    <= max_acc_change
+                ):
+                    self.ct_alignment_command_acc = 0.0
+
+                output.speed = self.ct_alignment_command_speed
+                output.acc = self.ct_alignment_command_acc
 
                 # Discard any pulse state advanced internally while the
                 # lateral controller was being evaluated. The real boost
@@ -368,12 +419,24 @@ def _install_score_config(ct_args):
                             math.degrees(heading_error)
                         ),
                         "ct_alignment_lateral_error": lateral_error,
+                        "ct_alignment_command_speed": (
+                            self.ct_alignment_command_speed
+                        ),
+                        "ct_alignment_command_acc": (
+                            self.ct_alignment_command_acc
+                        ),
                     }
                 )
 
+                profile_settled = (
+                    self.ct_alignment_command_speed
+                    >= ct_args.ct_alignment_speed - 0.01
+                    and self.ct_alignment_command_acc <= 0.05
+                )
                 settled = (
                     self.ct_alignment_stable_elapsed
                     >= ct_args.ct_alignment_settle_duration - 1e-9
+                    and profile_settled
                 )
                 timed_out = (
                     self.ct_alignment_elapsed
@@ -484,6 +547,7 @@ def main():
         f"pulse={ct_args.ct_pulse_duration:.3f}s "
         f"accel={ct_args.ct_accel:.1f}m/s2 "
         f"alignment_speed={ct_args.ct_alignment_speed:.3f}m/s "
+        f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
         f"heading_tol={ct_args.ct_heading_tolerance_deg:.3f}deg "
         f"lateral_tol={ct_args.ct_lateral_tolerance:.3f}m "
         "background_vehicles=IGNORED gt_subscription=DISABLED"
