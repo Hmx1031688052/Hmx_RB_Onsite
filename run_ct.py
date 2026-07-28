@@ -268,22 +268,23 @@ def _ct_parser():
         "--ct-prepare-response-delay",
         type=float,
         default=float(
-            os.environ.get("CT_PREPARE_RESPONSE_DELAY", "5.0")
+            os.environ.get("CT_PREPARE_RESPONSE_DELAY", "0.2")
         ),
         help=(
             "delay ActorPrepareResult after route readiness so simulator "
-            "publishers can initialize (default: 5.0)"
+            "can finish its immediate chassis preparation without missing "
+            "the AITOWN handshake window (default: 0.2)"
         ),
     )
     parser.add_argument(
         "--ct-prepare-resend-interval",
         type=float,
         default=float(
-            os.environ.get("CT_PREPARE_RESEND_INTERVAL", "6.0")
+            os.environ.get("CT_PREPARE_RESEND_INTERVAL", "1.0")
         ),
         help=(
             "resend ActorPrepareResult until START_TEST at this interval "
-            "(default: 6.0)"
+            "(default: 1.0)"
         ),
     )
     parser.add_argument(
