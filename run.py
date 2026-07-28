@@ -1650,7 +1650,10 @@ def save_global_plan_png(route):
 def prepare(result=True):
     global prepare_sent_ts
     prepare_sent_ts = time.time()
-    print(f"send prepare result={bool(result)}")
+    print(
+        "send prepare result="
+        f"{bool(result)} session_id={session_id} actor_id={actor_id}"
+    )
     print(
         "[prepare-timing] prepare_result_sent "
         f"wall_time={prepare_sent_ts:.3f} "
@@ -1836,6 +1839,27 @@ def get_prepare():
         model.last_invalid_ego_sample_warn_wall_time = 0.0
 
         brief_data = json.loads(prepare_msg.archive_info.brief_data)
+        testee_brief = brief_data["testees"][0]
+        # ``client_name`` identifies this process to the config centre, but
+        # ActorPrepareResult.actor_id identifies the concrete scenario actor.
+        # AITOWN generates IDs such as ``testee_D9A9``; answering with the
+        # fixed client name ``apollo_testee`` writes successfully to the
+        # multicast channel but is not credited to the actor that the session
+        # coordinator is waiting for.
+        scenario_actor_id = str(
+            testee_brief.get("actor_id")
+            or testee_brief.get("role_id")
+            or actor_id
+        ).strip()
+        if scenario_actor_id:
+            actor_id = scenario_actor_id
+        print(
+            "[prepare-identity] "
+            "client_name=apollo_testee "
+            f"response_actor_id={actor_id} "
+            f"brief_actor_id={testee_brief.get('actor_id')} "
+            f"brief_role_id={testee_brief.get('role_id')}"
+        )
         weather =  brief_data["environment"]['weather']
         model.weather = weather
         model.start = 0
@@ -1919,10 +1943,10 @@ def get_prepare():
         last_drive_feedback_debug_ts = 0.0
         last_drive_ins_debug_ts = 0.0
         last_drive_lidar_debug_ts = 0.0
-        init_state = brief_data["testees"][0]["init_state"]
-        target_state = brief_data["testees"][0]["target_state"]
+        init_state = testee_brief["init_state"]
+        target_state = testee_brief["target_state"]
         #print(target_state)
-        role_id = brief_data["testees"][0]["role_id"]
+        role_id = testee_brief["role_id"]
         if drive_trace_logger is not None:
             drive_trace_logger.start_session(
                 session_id,
