@@ -25,6 +25,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 
 # The onsite SDK keeps the generated ``chassis`` and ``main`` protobuf
 # packages beside Hmx_RB_Onsite. When this file is launched as
@@ -102,6 +107,39 @@ from main.proto.messages_pb2 import (
 
 TASK_TIMEOUT_RESTART_EXIT_CODE = 75
 SIMULATOR_STALL_RESTART_EXIT_CODE = 76
+SUPERVISOR_LOCK_PATH = Path("/tmp/run_hmxzw-supervisor.lock")
+
+
+def acquire_supervisor_lock():
+    """Allow only one process to manage this runtime and DriverSim."""
+    if fcntl is None:
+        return None
+    lock_file = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(
+            lock_file.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print(
+            "[run3][supervisor][FATAL] another supervisor is running "
+            f"pid={owner}",
+            flush=True,
+        )
+        return False
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    print(
+        "[run3][supervisor] singleton lock acquired "
+        f"pid={os.getpid()}",
+        flush=True,
+    )
+    return lock_file
 
 
 def wrap_angle(angle):
@@ -558,6 +596,7 @@ class Run3:
                 return
             self.started = True
             self.test_started_monotonic = time.monotonic()
+            self.last_ins_monotonic = None
             print(
                 "[run3][notify] START "
                 f"session={self.session_id} role={self.role_id} "
@@ -735,23 +774,27 @@ class Run3:
         ):
             return
         elapsed = time.monotonic() - self.test_started_monotonic
+        waiting_for_first_ins = self.last_ins_monotonic is None
         last_ins_time = (
             self.test_started_monotonic
-            if self.last_ins_monotonic is None
-            else max(
-                self.test_started_monotonic,
-                self.last_ins_monotonic,
-            )
+            if waiting_for_first_ins
+            else self.last_ins_monotonic
         )
         ins_silence = time.monotonic() - last_ins_time
+        active_ins_timeout = (
+            self.args.first_ins_timeout
+            if waiting_for_first_ins
+            else self.args.ins_stall_timeout
+        )
         if (
-            self.args.ins_stall_timeout > 0.0
-            and ins_silence >= self.args.ins_stall_timeout
+            active_ins_timeout > 0.0
+            and ins_silence >= active_ins_timeout
         ):
             print(
-                "[run3][WATCHDOG] INS stalled "
+                "[run3][WATCHDOG] "
+                f"{'first INS timeout' if waiting_for_first_ins else 'INS stalled'} "
                 f"for {ins_silence:.3f}s "
-                f"(limit={self.args.ins_stall_timeout:.1f}s); "
+                f"(limit={active_ins_timeout:.1f}s); "
                 f"session={self.session_id}; "
                 "restart DriverSim and runtime",
                 flush=True,
@@ -910,8 +953,38 @@ def parse_args():
     parser.add_argument(
         "--simulator-ready-delay",
         type=float,
-        default=6.0,
-        help="wait after DriverSim start before launching runtime (default: 6)",
+        default=2.0,
+        help=(
+            "extra settling delay after DriverSim PID appears "
+            "(default: 2)"
+        ),
+    )
+    parser.add_argument(
+        "--simulator-start-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "maximum wait for a real DriverSim PID after start.sh "
+            "(default: 30)"
+        ),
+    )
+    parser.add_argument(
+        "--max-simulator-start-failures",
+        type=int,
+        default=3,
+        help=(
+            "stop after this many consecutive startup failures; "
+            "<=0 retries forever (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--first-ins-timeout",
+        type=float,
+        default=15.0,
+        help=(
+            "allow this long for the first post-START INS while loading "
+            "the scene; <=0 disables (default: 15)"
+        ),
     )
     parser.add_argument(
         "--ins-stall-timeout",
@@ -1076,6 +1149,11 @@ def _start_managed_simulator(args):
         raise FileNotFoundError(
             f"DriverSim start script not found: {start_script}"
         )
+    if start_script.stat().st_size == 0:
+        raise RuntimeError(
+            f"DriverSim start script is empty: {start_script}; "
+            "refuse to enter the restart loop"
+        )
     print(
         "[run3][supervisor] start DriverSim "
         f"cwd={simulator_dir} command='bash start.sh'",
@@ -1088,6 +1166,30 @@ def _start_managed_simulator(args):
     )
 
 
+def _wait_for_driver_sim(args, launcher):
+    timeout = max(0.1, float(args.simulator_start_timeout))
+    deadline = time.monotonic() + timeout
+    launcher_exit_seen = None
+    while time.monotonic() < deadline:
+        driver_pids = _find_driver_sim_pids(args.simulator_dir)
+        if driver_pids:
+            settle_delay = max(
+                0.0, float(args.simulator_ready_delay)
+            )
+            if settle_delay:
+                time.sleep(settle_delay)
+            return _find_driver_sim_pids(args.simulator_dir)
+
+        launcher_code = launcher.poll()
+        if launcher_code is not None:
+            if launcher_exit_seen is None:
+                launcher_exit_seen = time.monotonic()
+            elif time.monotonic() - launcher_exit_seen >= 1.0:
+                break
+        time.sleep(0.2)
+    return []
+
+
 def supervise_runtime(args):
     child_argv = [
         sys.executable,
@@ -1096,31 +1198,32 @@ def supervise_runtime(args):
         "--runtime-child",
     ]
     restart_count = 0
+    simulator_start_failures = 0
     simulator = None
     runtime = None
     while True:
         try:
             if not args.no_manage_simulator:
-                _kill_simulator_residuals(
-                    args.simulator_dir,
-                    reason="before_start",
-                )
-                simulator = _start_managed_simulator(args)
-                ready_delay = max(
-                    0.0, float(args.simulator_ready_delay)
-                )
-                ready_deadline = time.monotonic() + ready_delay
-                while time.monotonic() < ready_deadline:
-                    time.sleep(0.2)
+                driver_pids = _find_driver_sim_pids(args.simulator_dir)
+                if driver_pids:
+                    simulator = None
+                    print(
+                        "[run3][supervisor] attach existing DriverSim "
+                        f"pids={driver_pids}",
+                        flush=True,
+                    )
+                else:
+                    simulator = _start_managed_simulator(args)
+                    driver_pids = _wait_for_driver_sim(args, simulator)
 
-                driver_pids = _find_driver_sim_pids(
-                    args.simulator_dir
-                )
                 if not driver_pids:
                     launcher_code = simulator.poll()
+                    simulator_start_failures += 1
                     print(
                         "[run3][supervisor] DriverSim process not found "
-                        f"after startup wait; launcher_code={launcher_code}",
+                        "after startup wait "
+                        f"launcher_code={launcher_code} "
+                        f"failure={simulator_start_failures}",
                         flush=True,
                     )
                     _terminate_managed_process(
@@ -1130,13 +1233,30 @@ def supervise_runtime(args):
                         args.simulator_dir,
                         reason="startup_process_missing",
                     )
-                    restart_count += 1
-                    time.sleep(max(0.0, float(args.restart_delay)))
                     simulator = None
+                    failure_limit = int(
+                        args.max_simulator_start_failures
+                    )
+                    if (
+                        failure_limit > 0
+                        and simulator_start_failures >= failure_limit
+                    ):
+                        print(
+                            "[run3][supervisor][FATAL] stop after "
+                            f"{simulator_start_failures} consecutive "
+                            "DriverSim startup failures",
+                            flush=True,
+                        )
+                        return 1
+                    time.sleep(max(0.0, float(args.restart_delay)))
                     continue
+                simulator_start_failures = 0
+                launcher_code = (
+                    None if simulator is None else simulator.poll()
+                )
                 print(
                     "[run3][supervisor] DriverSim process ready "
-                    f"pids={driver_pids} launcher_code={simulator.poll()}",
+                    f"pids={driver_pids} launcher_code={launcher_code}",
                     flush=True,
                 )
 
@@ -1144,6 +1264,7 @@ def supervise_runtime(args):
                 "[run3][supervisor] start runtime "
                 f"attempt={restart_count + 1} "
                 f"task_timeout={args.task_timeout:.1f}s "
+                f"first_ins_timeout={args.first_ins_timeout:.1f}s "
                 f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
                 flush=True,
             )
@@ -1225,6 +1346,9 @@ def main():
     try:
         args = parse_args()
         if not args.runtime_child:
+            supervisor_lock = acquire_supervisor_lock()
+            if supervisor_lock is False:
+                raise SystemExit(2)
             raise SystemExit(supervise_runtime(args))
         Run3(args).run()
     except KeyboardInterrupt:
