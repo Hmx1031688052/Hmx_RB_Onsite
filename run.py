@@ -4,6 +4,7 @@ import base64
 import json
 import math
 import os
+import re
 import sys
 import time
 import threading
@@ -222,7 +223,7 @@ ALGORITHM_POLICY_VERSION = (
 MULTICAST_CLIENT_NAME = "apollo_testee"
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 PREPARE_RESULT_REPEAT = max(
-    1, int(os.environ.get("E2E_PREPARE_RESULT_REPEAT", "3"))
+    1, int(os.environ.get("E2E_PREPARE_RESULT_REPEAT", "1"))
 )
 PREPARE_RESULT_INTERVAL = max(
     0.0, float(os.environ.get("E2E_PREPARE_RESULT_INTERVAL", "0.03"))
@@ -1704,6 +1705,27 @@ def should_send_prepare_result(now=None):
     )
 
 
+def _session_order_key(value):
+    """Extract the platform timestamp/sequence suffix for session ordering."""
+    match = re.search(r"_(\d{14})_(\d+)$", str(value or "").strip())
+    if match is None:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except ValueError:
+        return None
+
+
+def _is_newer_session(candidate, current):
+    candidate_key = _session_order_key(candidate)
+    current_key = _session_order_key(current)
+    return (
+        candidate_key is not None
+        and current_key is not None
+        and candidate_key > current_key
+    )
+
+
 def reset_episode_ego_state(reason):
     """Drop pose, speed, and feedback state that cannot cross sessions."""
     previous_speed = float(
@@ -1738,6 +1760,7 @@ def reset_episode_ego_state(reason):
 
 def get_prepare():
     global recv_prepare
+    global start_test
     global session_id
     global actor_id
     global role_id
@@ -1786,7 +1809,39 @@ def get_prepare():
     ret, msg = prepare_channel.get()
     if msg is None:
         return
-    if ret >= 0 and msg.type() == MT_ACTOR_PREPARE:
+    msg_type = msg.type()
+    if ret < 0 or msg_type != MT_ACTOR_PREPARE:
+        return
+    if ret >= 0 and msg_type == MT_ACTOR_PREPARE:
+        data = libMulticastNetwork.getMessageData(msg)
+        prepare_msg = ActorPrepare()
+        prepare_msg.ParseFromString(data)
+        incoming_session_id = str(prepare_msg.session_id or "").strip()
+        current_session_id = str(session_id or "").strip()
+        if not incoming_session_id:
+            print(
+                "[prepare][WARN] ignore ActorPrepare with empty session_id",
+                flush=True,
+            )
+            return
+        if incoming_session_id == current_session_id:
+            # The daemon can retransmit Prepare while awaiting its result.
+            # Never reset an already prepared or running episode.
+            return
+        if current_session_id and not _is_newer_session(
+            incoming_session_id,
+            current_session_id,
+        ):
+            print(
+                "[prepare][WARN] ignore stale or unordered ActorPrepare "
+                f"received={incoming_session_id} current={current_session_id}",
+                flush=True,
+            )
+            return
+
+        # ActorPrepare is the authoritative episode boundary. Do not let the
+        # previous episode's START state leak into the new map.
+        start_test = False
         prepare_received_ts = time.time()
         map_loading = True
         map_ready = False
@@ -1801,10 +1856,7 @@ def get_prepare():
         first_control_sent_ts = None
         test_start_received_ts = None
         recv_prepare = True
-        data = libMulticastNetwork.getMessageData(msg)
-        prepare_msg = ActorPrepare()
-        prepare_msg.ParseFromString(data)
-        session_id = prepare_msg.session_id
+        session_id = incoming_session_id
         npc_truth_frames.clear()
         npc_truth_debug_history.clear()
         gt_obstacle_adapter.reset()
@@ -2819,6 +2871,21 @@ def process_notify():
         notify = Notify()
         data = libMulticastNetwork.getMessageData(msg)
         notify.ParseFromString(data)
+        notify_session_id = str(notify.session_id or "").strip()
+        current_session_id = str(session_id or "").strip()
+        if (
+            notify.type in (NT_START_TEST, NT_FINISH_TEST, NT_ABORT_TEST)
+            and notify_session_id
+            and current_session_id
+            and notify_session_id != current_session_id
+        ):
+            print(
+                "[platform-notify][WARN] ignore stale session "
+                f"type={notify.type} received={notify_session_id} "
+                f"current={current_session_id}",
+                flush=True,
+            )
+            return notify.type
         if notify.type == NT_FINISH_TEST or notify.type == NT_ABORT_TEST :
             if drive_trace_logger is not None:
                 drive_trace_logger.end_session(
@@ -3115,6 +3182,10 @@ def main():
 
     while 1:
         loop_count += 1
+        # ActorPrepare is the authoritative session transition. Poll it first
+        # and on every iteration so a new session cannot remain queued behind
+        # a stale notification from the previous episode.
+        get_prepare()
         notify = process_notify()
         if not recv_prepare:
             # Match run_ori.py: do not consume lidar/INS before ActorPrepare.

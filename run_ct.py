@@ -241,11 +241,11 @@ def _ct_parser():
         "--ct-first-ins-timeout",
         type=float,
         default=float(
-            os.environ.get("CT_FIRST_INS_TIMEOUT", "8.0")
+            os.environ.get("CT_FIRST_INS_TIMEOUT", "0.0")
         ),
         help=(
             "request a clean process reconnect when START_TEST receives no "
-            "valid INS for this many seconds (default: 8.0)"
+            "valid INS for this many seconds (default: 0.0, disabled)"
         ),
     )
     parser.add_argument(
@@ -275,32 +275,31 @@ def _ct_parser():
         "--ct-prepare-response-delay",
         type=float,
         default=float(
-            os.environ.get("CT_PREPARE_RESPONSE_DELAY", "0.2")
+            os.environ.get("CT_PREPARE_RESPONSE_DELAY", "0.0")
         ),
         help=(
-            "delay ActorPrepareResult after route readiness so simulator "
-            "can finish its immediate chassis preparation without missing "
-            "the AITOWN handshake window (default: 0.2)"
+            "optional delay before ActorPrepareResult after route readiness "
+            "(default: 0.0, matching run1.py)"
         ),
     )
     parser.add_argument(
         "--ct-prepare-resend-interval",
         type=float,
         default=float(
-            os.environ.get("CT_PREPARE_RESEND_INTERVAL", "1.0")
+            os.environ.get("CT_PREPARE_RESEND_INTERVAL", "0.0")
         ),
         help=(
-            "resend ActorPrepareResult until START_TEST at this interval "
-            "(default: 1.0)"
+            "optional ActorPrepareResult resend interval "
+            "(default: 0.0, disabled, matching run1.py)"
         ),
     )
     parser.add_argument(
         "--ct-startup-reconnects",
         type=int,
-        default=int(os.environ.get("CT_STARTUP_RECONNECTS", "1")),
+        default=int(os.environ.get("CT_STARTUP_RECONNECTS", "0")),
         help=(
             "maximum automatic process-level reconnects for a dead initial "
-            "INS subscription (default: 1)"
+            "INS subscription (default: 0, disabled)"
         ),
     )
     parser.add_argument(
@@ -376,10 +375,10 @@ def _validate_ct_args(parser, args):
         )
     if (
         not math.isfinite(args.ct_first_ins_timeout)
-        or args.ct_first_ins_timeout <= 0.0
+        or args.ct_first_ins_timeout < 0.0
     ):
         parser.error(
-            "--ct-first-ins-timeout must be finite and greater than zero"
+            "--ct-first-ins-timeout must be finite and non-negative"
         )
     if (
         not math.isfinite(args.ct_ins_start_gate_tolerance)
@@ -401,10 +400,10 @@ def _validate_ct_args(parser, args):
         "ct_prepare_resend_interval",
     ):
         value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0.0:
+        if not math.isfinite(value) or value < 0.0:
             parser.error(
                 f"--{name.replace('_', '-')} must be finite and "
-                "greater than zero"
+                "non-negative"
             )
     if args.ct_startup_reconnects < 0 or args.ct_startup_reconnects > 1:
         parser.error("--ct-startup-reconnects must be either 0 or 1")
