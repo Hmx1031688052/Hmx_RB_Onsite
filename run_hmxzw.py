@@ -17,7 +17,9 @@ Removed:
 import argparse
 import json
 import math
+import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -95,6 +97,9 @@ from main.proto.messages_pb2 import (
     ActorPrepareResult,
     Notify,
 )
+
+
+TASK_TIMEOUT_RESTART_EXIT_CODE = 75
 
 
 def wrap_angle(angle):
@@ -315,6 +320,7 @@ class Run3:
         self.prepared = False
         self.started = False
         self.prepare_result_sent = False
+        self.test_started_monotonic = None
 
         self.ego = None
         self.first_current_ins_ready = False
@@ -384,6 +390,7 @@ class Run3:
         self.prepared = False
         self.started = False
         self.prepare_result_sent = False
+        self.test_started_monotonic = None
         self.map_name = ""
         self.role_id = self.actor_id
         self.ego = None
@@ -546,9 +553,11 @@ class Run3:
                 )
                 return
             self.started = True
+            self.test_started_monotonic = time.monotonic()
             print(
                 "[run3][notify] START "
-                f"session={self.session_id} role={self.role_id}",
+                f"session={self.session_id} role={self.role_id} "
+                f"timeout={self.args.task_timeout:.1f}s",
                 flush=True,
             )
             return
@@ -714,6 +723,30 @@ class Run3:
         )
         self.send_control(acceleration, speed, steering)
 
+    def enforce_task_timeout(self):
+        if (
+            not self.started
+            or self.test_started_monotonic is None
+            or self.args.task_timeout <= 0.0
+        ):
+            return
+        elapsed = time.monotonic() - self.test_started_monotonic
+        if elapsed < self.args.task_timeout:
+            return
+
+        print(
+            "[run3][WATCHDOG] task did not finish within "
+            f"{self.args.task_timeout:.1f}s; "
+            f"session={self.session_id} elapsed={elapsed:.3f}s; "
+            "terminate runtime child for a clean reconnect",
+            flush=True,
+        )
+        self.send_control(0.0, 0.0, 0.0)
+        # A process-level exit is intentional. It guarantees that native
+        # multicast channels and sockets are released before the supervisor
+        # starts a fresh runtime and re-registers the testee.
+        os._exit(TASK_TIMEOUT_RESTART_EXIT_CODE)
+
     def run(self):
         self.create_channels()
         print(
@@ -736,6 +769,7 @@ class Run3:
             self.poll_ins()
             self.poll_feedback()
             self.send_active_control()
+            self.enforce_task_timeout()
             time.sleep(min(0.002, 0.25 * self.control_period))
 
 
@@ -817,12 +851,88 @@ def parse_args():
         action="store_true",
         help="accepted for launcher compatibility; control logs are always on",
     )
+    parser.add_argument(
+        "--task-timeout",
+        type=float,
+        default=20.0,
+        help=(
+            "restart the complete runtime if a started task has not ended "
+            "within this many seconds; <=0 disables (default: 20)"
+        ),
+    )
+    parser.add_argument(
+        "--restart-delay",
+        type=float,
+        default=3.0,
+        help=(
+            "delay allowing the daemon to observe the disconnect before "
+            "reconnecting (default: 3.0)"
+        ),
+    )
+    parser.add_argument(
+        "--runtime-child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
+
+
+def supervise_runtime(args):
+    child_argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--runtime-child",
+    ]
+    restart_count = 0
+    while True:
+        print(
+            "[run3][supervisor] start runtime "
+            f"attempt={restart_count + 1} "
+            f"task_timeout={args.task_timeout:.1f}s",
+            flush=True,
+        )
+        child = subprocess.Popen(child_argv)
+        try:
+            return_code = child.wait()
+        except KeyboardInterrupt:
+            print(
+                "[run3][supervisor] interrupted; terminate runtime",
+                flush=True,
+            )
+            child.terminate()
+            try:
+                child.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            return 130
+
+        if return_code != TASK_TIMEOUT_RESTART_EXIT_CODE:
+            print(
+                "[run3][supervisor] runtime exited "
+                f"code={return_code}; supervisor stops",
+                flush=True,
+            )
+            return return_code
+
+        restart_count += 1
+        restart_delay = max(0.0, float(args.restart_delay))
+        print(
+            "[run3][supervisor] timeout restart "
+            f"count={restart_count} delay={restart_delay:.1f}s",
+            flush=True,
+        )
+        if restart_delay > 0.0:
+            time.sleep(restart_delay)
 
 
 def main():
     try:
-        Run3(parse_args()).run()
+        args = parse_args()
+        if not args.runtime_child:
+            raise SystemExit(supervise_runtime(args))
+        Run3(args).run()
     except KeyboardInterrupt:
         print("[run3] stopped by user", flush=True)
     except Exception as exc:
