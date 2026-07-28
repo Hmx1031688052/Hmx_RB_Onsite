@@ -903,7 +903,7 @@ def parse_args():
         "--simulator-dir",
         default=(
             "/media/pc/FanXiang2T/Onsite_FirstWithForth/"
-            "LinuxNoEditor416/DriverSim/Binaries/Linux"
+            "LinuxNoEditor416"
         ),
         help="directory containing the managed DriverSim start.sh",
     )
@@ -967,6 +967,87 @@ def _terminate_managed_process(process, label):
         process.wait()
 
 
+def _path_is_within(path, root):
+    try:
+        return os.path.commonpath(
+            (str(Path(path).resolve()), str(Path(root).resolve()))
+        ) == str(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _kill_simulator_residuals(simulator_dir, reason):
+    """SIGKILL detached DriverSim/crash-window processes under one build."""
+    if os.name != "posix":
+        return
+
+    simulator_root = Path(simulator_dir).expanduser().resolve()
+    own_pid = os.getpid()
+    residual_pids = []
+    for proc_dir in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(proc_dir.name)
+        except ValueError:
+            continue
+        if pid == own_pid:
+            continue
+
+        try:
+            exe_path = Path(os.readlink(proc_dir / "exe"))
+        except OSError:
+            exe_path = None
+        try:
+            cwd_path = Path(os.readlink(proc_dir / "cwd"))
+        except OSError:
+            cwd_path = None
+        try:
+            command_parts = (
+                (proc_dir / "cmdline")
+                .read_bytes()
+                .decode(errors="replace")
+                .split("\0")
+            )
+        except OSError:
+            command_parts = []
+
+        executable_name = (
+            "" if exe_path is None else exe_path.name.lower()
+        )
+        managed_binary = (
+            exe_path is not None
+            and _path_is_within(exe_path, simulator_root)
+            and (
+                executable_name.startswith("driversim")
+                or "crashreport" in executable_name
+            )
+        )
+        managed_launcher = (
+            cwd_path is not None
+            and _path_is_within(cwd_path, simulator_root)
+            and any(
+                Path(part).name == "start.sh"
+                for part in command_parts
+                if part
+            )
+        )
+        if managed_binary or managed_launcher:
+            residual_pids.append(pid)
+
+    for pid in sorted(set(residual_pids), reverse=True):
+        print(
+            "[run3][supervisor] SIGKILL simulator residual "
+            f"pid={pid} reason={reason}",
+            flush=True,
+        )
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    if residual_pids:
+        time.sleep(0.5)
+
+
 def _start_managed_simulator(args):
     simulator_dir = Path(args.simulator_dir).expanduser().resolve()
     start_script = simulator_dir / "start.sh"
@@ -999,6 +1080,10 @@ def supervise_runtime(args):
     while True:
         try:
             if not args.no_manage_simulator:
+                _kill_simulator_residuals(
+                    args.simulator_dir,
+                    reason="before_start",
+                )
                 simulator = _start_managed_simulator(args)
                 ready_delay = max(
                     0.0, float(args.simulator_ready_delay)
@@ -1062,10 +1147,20 @@ def supervise_runtime(args):
             )
             _terminate_managed_process(runtime, "runtime")
             _terminate_managed_process(simulator, "DriverSim")
+            if not args.no_manage_simulator:
+                _kill_simulator_residuals(
+                    args.simulator_dir,
+                    reason="supervisor_interrupted",
+                )
             return 130
 
         if restart_reason is None:
             _terminate_managed_process(simulator, "DriverSim")
+            if not args.no_manage_simulator:
+                _kill_simulator_residuals(
+                    args.simulator_dir,
+                    reason="runtime_exit",
+                )
             print(
                 "[run3][supervisor] runtime exited "
                 f"code={return_code}; supervisor stops",
@@ -1075,6 +1170,11 @@ def supervise_runtime(args):
 
         _terminate_managed_process(runtime, "runtime")
         _terminate_managed_process(simulator, "DriverSim")
+        if not args.no_manage_simulator:
+            _kill_simulator_residuals(
+                args.simulator_dir,
+                reason=restart_reason,
+            )
         runtime = None
         simulator = None
         restart_count += 1
