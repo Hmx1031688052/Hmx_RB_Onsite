@@ -219,6 +219,7 @@ current_expected_speed = None
 ALGORITHM_POLICY_VERSION = (
     "2026-07-27-episode-speed-reset-v27"
 )
+MULTICAST_CLIENT_NAME = "apollo_testee"
 CONTROL_LOOP_PERIOD = max(0.005, float(os.environ.get("RULE_CONTROL_PERIOD", "0.02")))
 PREPARE_RESULT_REPEAT = max(
     1, int(os.environ.get("E2E_PREPARE_RESULT_REPEAT", "3"))
@@ -1840,22 +1841,14 @@ def get_prepare():
 
         brief_data = json.loads(prepare_msg.archive_info.brief_data)
         testee_brief = brief_data["testees"][0]
-        # ``client_name`` identifies this process to the config centre, but
-        # ActorPrepareResult.actor_id identifies the concrete scenario actor.
-        # AITOWN generates IDs such as ``testee_D9A9``; answering with the
-        # fixed client name ``apollo_testee`` writes successfully to the
-        # multicast channel but is not credited to the actor that the session
-        # coordinator is waiting for.
-        scenario_actor_id = str(
-            testee_brief.get("actor_id")
-            or testee_brief.get("role_id")
-            or actor_id
-        ).strip()
-        if scenario_actor_id:
-            actor_id = scenario_actor_id
+        # The daemon registers this process as
+        # ``client1: testee/apollo_testee``. ActorPrepareResult must use that
+        # registered client identity; ``testee_D9A9`` is the scenario role,
+        # not the multicast client actor id.
+        actor_id = MULTICAST_CLIENT_NAME
         print(
             "[prepare-identity] "
-            "client_name=apollo_testee "
+            f"client_name={MULTICAST_CLIENT_NAME} "
             f"response_actor_id={actor_id} "
             f"brief_actor_id={testee_brief.get('actor_id')} "
             f"brief_role_id={testee_brief.get('role_id')}"
@@ -4345,7 +4338,7 @@ if __name__ == "__main__":
     #######################################################
 
     param.log_level = 1  # 1-info, 2-warning, 3-error， 设置不同的组播日志等级
-    param.client_name = "apollo_testee"
+    param.client_name = MULTICAST_CLIENT_NAME
     param.recv_self_msg = False
     session_id = ""
     print(
@@ -4428,8 +4421,8 @@ if __name__ == "__main__":
     save_results = False
     recv_prepare = False
     start_test = False
-    actor_id = "apollo_testee"
-    role_id = "apollo_testee"
+    actor_id = MULTICAST_CLIENT_NAME
+    role_id = MULTICAST_CLIENT_NAME
 
     # Pure Python closed loop: detector -> rule planner -> stable controller.
     model = Predictor()
