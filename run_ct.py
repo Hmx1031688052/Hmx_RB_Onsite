@@ -2,8 +2,9 @@
 
 This module deliberately keeps the experimental direct-goal policy out of
 run.py. It reuses run.py's protocol/session handling, captures the literal
-episode destination, ignores the map/global route in CT planning, and ramps
-the speed command with a constant 2 m/s^2 acceleration.
+episode destination from run.py's map-free direct seed, ignores the map route
+in CT planning, and ramps the speed command with a constant 2 m/s^2
+acceleration.
 """
 
 import argparse
@@ -462,32 +463,14 @@ def _supervise_runtime(ct_args):
 
 
 def _install_score_config(ct_args):
-    import predictor as predictor_module
-
     speed_factor = ct_args.ct_speed_factor
     base_config = rule_based_planner.PlannerConfig
     base_planner = rule_based_planner.RuleBasedPlanner
     base_controller = rule_based_planner.StableController
-    # Shared only by the CT planner/controller classes installed below.
-    # Capture the literal episode destination from ActorPrepare instead of
-    # deriving it from a map/global route.
+    # Shared only by the CT planner/controller classes installed below. The
+    # supplied path is already run.py's map-free direct start/goal seed; CT
+    # reads only its final destination and constructs its own straight line.
     ct_route_state = {"goal": None}
-    base_set_destination = predictor_module.Predictor.set_destination
-
-    def ct_set_destination(model, x, y, theta):
-        goal_x = float(x)
-        goal_y = float(y)
-        if not math.isfinite(goal_x) or not math.isfinite(goal_y):
-            raise ValueError("CT destination must contain finite x/y")
-        ct_route_state["goal"] = (goal_x, goal_y)
-        print(
-            "[ct-score] direct destination captured "
-            f"goal=({goal_x:.3f},{goal_y:.3f}); "
-            "map/global route will not be used by CT planning"
-        )
-        return base_set_destination(model, x, y, theta)
-
-    predictor_module.Predictor.set_destination = ct_set_destination
 
     class CtPlannerConfig(base_config):
         """Planner configuration with episode-relative sprint speed."""
@@ -520,21 +503,30 @@ def _install_score_config(ct_args):
     rule_based_planner.PlannerConfig = CtPlannerConfig
 
     class CtRuleBasedPlanner(base_planner):
-        """Direct planner using only current ego pose and literal destination."""
+        """Direct planner using current ego pose and the direct-seed endpoint."""
 
         def _build_sprint_path(self, ego, global_path):
-            del global_path
             if self._sprint_path is not None:
                 goal = getattr(self, "_sprint_goal", None)
                 if goal is not None:
                     ct_route_state["goal"] = goal
                 return self._sprint_path
             try:
-                goal = ct_route_state.get("goal")
-                if goal is None:
+                route_x = np.asarray(
+                    global_path.get("x", []), dtype=float
+                ).reshape(-1)
+                route_y = np.asarray(
+                    global_path.get("y", []), dtype=float
+                ).reshape(-1)
+                count = min(route_x.size, route_y.size)
+                valid = (
+                    np.isfinite(route_x[:count])
+                    & np.isfinite(route_y[:count])
+                )
+                if count < 2 or not np.any(valid):
                     return None
-                goal_x = float(goal[0])
-                goal_y = float(goal[1])
+                goal_x = float(route_x[:count][valid][-1])
+                goal_y = float(route_y[:count][valid][-1])
                 start_x = float(ego.x)
                 start_y = float(ego.y)
             except (AttributeError, TypeError, ValueError):
@@ -583,7 +575,7 @@ def _install_score_config(ct_args):
                 "[ct-score] destination-only straight reference "
                 f"start=({start_x:.3f},{start_y:.3f}) "
                 f"goal=({goal_x:.3f},{goal_y:.3f}) "
-                f"distance={distance:.3f}m kappa=0 global_path=IGNORED "
+                f"distance={distance:.3f}m kappa=0 map_route=IGNORED "
                 f"start_heading={math.degrees(start_yaw):.3f}deg "
                 f"line_heading={math.degrees(chord_yaw):.3f}deg "
                 f"initial_heading_error="
@@ -1066,16 +1058,18 @@ def main():
     if ct_args.ct_help:
         parser.print_help()
         return 0
-    if not math.isclose(
+    accel_overridden = not math.isclose(
         ct_args.ct_accel,
         CT_CONSTANT_ACCEL_MPS2,
         rel_tol=0.0,
         abs_tol=1e-9,
-    ):
+    )
+    requested_accel = ct_args.ct_accel
+    if accel_overridden and os.environ.get("CT_RUNTIME_CHILD") == "1":
         print(
             "[ct-score][OVERRIDE] this experiment fixes every valid "
             f"control acceleration at {CT_CONSTANT_ACCEL_MPS2:.1f}m/s2; "
-            f"ignore requested --ct-accel={ct_args.ct_accel}"
+            f"ignore requested --ct-accel={requested_accel}"
         )
     ct_args.ct_accel = CT_CONSTANT_ACCEL_MPS2
     _validate_ct_args(parser, ct_args)
@@ -1185,7 +1179,8 @@ def main():
         f"first_ins_timeout={ct_args.ct_first_ins_timeout:.1f}s "
         f"ins_start_gate="
         f"{ct_args.ct_ins_start_gate_tolerance:.1f}m "
-        "global_path=IGNORED background_vehicles=IGNORED "
+        "map_route=IGNORED direct_goal_seed=USED "
+        "background_vehicles=IGNORED "
         "gt_subscription=DISABLED "
         "ins_sequence_filter=MONOTONIC"
     )
