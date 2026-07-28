@@ -276,6 +276,21 @@ ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 ins_receiver_stop_event = threading.Event()
+test_start_received_ts = None
+last_ego_hold_warn_ts = 0.0
+INS_STALL_RESTART_SECONDS = max(
+    1.0,
+    float(os.environ.get("E2E_INS_STALL_RESTART_SECONDS", "5.0")),
+)
+INS_STALL_RESTART_MAX_ATTEMPTS = max(
+    0,
+    int(os.environ.get("E2E_INS_STALL_RESTART_MAX_ATTEMPTS", "2")),
+)
+ins_stall_restart_count = max(
+    0,
+    int(os.environ.get("E2E_INS_STALL_RESTART_COUNT", "0")),
+)
+ins_stall_restart_exhausted_logged = False
 last_rule_plan = None
 roundabout_controller = None
 last_rule_plan_wall_time = 0.0
@@ -1162,10 +1177,62 @@ def hold_until_global_plan_ready():
     return True
 
 
+def restart_after_ins_stall_if_needed():
+    """Replace this process when early sensor subscription never activates."""
+    global ins_stall_restart_exhausted_logged
+
+    if first_ins_ready or test_start_received_ts is None:
+        return False
+
+    start_age = time.time() - test_start_received_ts
+    if start_age < INS_STALL_RESTART_SECONDS:
+        return False
+    if ins_stall_restart_count >= INS_STALL_RESTART_MAX_ATTEMPTS:
+        if not ins_stall_restart_exhausted_logged:
+            ins_stall_restart_exhausted_logged = True
+            print(
+                "[startup-restart][FATAL] first INS is still unavailable; "
+                f"automatic restart limit reached "
+                f"count={ins_stall_restart_count}/"
+                f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
+            )
+        return False
+
+    next_count = ins_stall_restart_count + 1
+    print(
+        "[startup-restart] no valid INS after start; "
+        f"age={start_age:.1f}s restarting run.py automatically "
+        f"attempt={next_count}/"
+        f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.environ["E2E_INS_STALL_RESTART_COUNT"] = str(next_count)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    return True
+
+
 def hold_until_ego_ready():
+    global last_ego_hold_warn_ts
+
     if first_ins_ready and model.ego is not None:
         return False
 
+    now = time.time()
+    if now - last_ego_hold_warn_ts >= 1.0:
+        last_ego_hold_warn_ts = now
+        start_age = (
+            0.0
+            if test_start_received_ts is None
+            else max(0.0, now - test_start_received_ts)
+        )
+        print(
+            "[startup][WAIT] waiting for first valid INS "
+            f"start_age={start_age:.1f}s "
+            f"auto_restarts={ins_stall_restart_count}/"
+            f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
+        )
+    restart_after_ins_stall_if_needed()
     send_control_cmd(0.0, 0.0, 0.0)
     return True
 
@@ -1646,6 +1713,8 @@ def get_prepare():
     global last_drive_lidar_debug_ts
     global last_gt_planning_timestamp
     global current_expected_speed
+    global test_start_received_ts
+    global ins_stall_restart_exhausted_logged
 
     ret, msg = prepare_channel.get()
     if msg is None:
@@ -1662,6 +1731,8 @@ def get_prepare():
         first_pointcloud_ready_ts = None
         first_control_sent = False
         first_control_sent_ts = None
+        test_start_received_ts = None
+        ins_stall_restart_exhausted_logged = False
         recv_prepare = True
         data = libMulticastNetwork.getMessageData(msg)
         prepare_msg = ActorPrepare()
@@ -2652,6 +2723,8 @@ def process_notify():
     global last_rule_plan
     global last_rule_plan_wall_time
     global last_control_wall_time
+    global test_start_received_ts
+    global ins_stall_restart_exhausted_logged
     ret, msg = notify_channel.get()
     if msg is None:
         return
@@ -2684,6 +2757,8 @@ def process_notify():
             model.time_out = False
             start_test = False
             recv_prepare = False
+            test_start_received_ts = None
+            ins_stall_restart_exhausted_logged = False
             plan_start_check_remaining = 0
             plan_start_check_xy = None
             plan_start_check_map = ""
@@ -2721,6 +2796,8 @@ def process_notify():
         elif notify.type == NT_START_TEST:
             print("start session")
             start_test = True
+            test_start_received_ts = time.time()
+            ins_stall_restart_exhausted_logged = False
             model.start = 1
             # DriveSim holds the chassis brake while a prepared scenario is
             # waiting to start.  Publish a neutral command immediately when
@@ -2813,6 +2890,8 @@ def get_vehicle_pose():
     global first_ins_ready
     global first_ins_ready_ts
     global last_drive_ins_debug_ts
+    global ins_stall_restart_count
+    global ins_stall_restart_exhausted_logged
     ins = ins_channel.get_ins()
     # print(ins.sequence_num)
     if ins.sequence_num == 0 or ins.sequence_num > 1000000:
@@ -2850,6 +2929,9 @@ def get_vehicle_pose():
     if not first_ins_ready:
         first_ins_ready = True
         first_ins_ready_ts = time.time()
+        ins_stall_restart_count = 0
+        ins_stall_restart_exhausted_logged = False
+        os.environ.pop("E2E_INS_STALL_RESTART_COUNT", None)
         print(
             "[prepare-timing] first_ins_ready "
             f"wall_time={first_ins_ready_ts:.3f} "
@@ -2931,63 +3013,73 @@ def create_runtime_channels(
     retry_interval=1.0,
     startup_timeout=0.0,
 ):
-    """Wait for daemon/config-center readiness and return all channels.
+    """Create channels once, replacing the process before a retry.
 
-    ``create_channels`` is commonly called while the daemon and simulator are
-    being launched in parallel. A failed first call is therefore a startup
-    race, not a fatal configuration error. A timeout of zero waits forever,
-    which makes run.py independent of process launch order.
+    The native library is not safe to initialise repeatedly in one process.
+    When daemon/config-center startup races this script, exec the same command
+    again after a delay. A timeout of zero keeps trying indefinitely.
     """
     required_names = set(required_names)
     retry_interval = max(0.1, float(retry_interval))
     startup_timeout = max(0.0, float(startup_timeout))
-    started_at = time.monotonic()
-    attempt = 0
+    attempt = int(
+        os.environ.get("E2E_CHANNEL_STARTUP_ATTEMPT", "0")
+    ) + 1
+    started_at = float(
+        os.environ.get("E2E_CHANNEL_STARTUP_STARTED_AT", time.time())
+    )
+    channels = libMulticastNetwork.ChannelPtrVector()
+    channel_map = {}
+    ret = None
+    error = None
+    try:
+        ret = libMulticastNetwork.create_channels(param, channels)
+        # SWIG builds return 0, None, or an empty proxy on success.
+        # Match the original library usage: any false-like value means
+        # success.
+        if not ret:
+            for channel in channels:
+                channel_map[channel.name()] = channel
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
 
-    while True:
-        attempt += 1
-        channels = libMulticastNetwork.ChannelPtrVector()
-        channel_map = {}
-        ret = None
-        error = None
-        try:
-            ret = libMulticastNetwork.create_channels(param, channels)
-            if ret == 0:
-                for channel in channels:
-                    channel_map[channel.name()] = channel
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-
-        missing = sorted(required_names.difference(channel_map))
-        if ret == 0 and not missing:
-            elapsed = time.monotonic() - started_at
-            print(
-                "[channel-startup] ready "
-                f"attempt={attempt} elapsed={elapsed:.1f}s "
-                f"channels={','.join(sorted(channel_map))}"
-            )
-            # Keep the owning vector alive as well as the individual SWIG
-            # channel wrappers. Some libMulticastNetwork builds tie wrapper
-            # lifetime to the vector returned by create_channels().
-            return channels, channel_map
-
-        elapsed = time.monotonic() - started_at
-        detail = (
-            f"exception={error}"
-            if error is not None
-            else f"ret={ret} missing={','.join(missing) or '-'}"
-        )
-        if startup_timeout > 0.0 and elapsed >= startup_timeout:
-            raise RuntimeError(
-                "multicast channels did not become ready within "
-                f"{startup_timeout:.1f}s ({detail})"
-            )
+    missing = sorted(required_names.difference(channel_map))
+    elapsed = max(0.0, time.time() - started_at)
+    if not ret and not missing:
         print(
-            "[channel-startup][WAIT] daemon/config center not ready; "
-            f"attempt={attempt} elapsed={elapsed:.1f}s {detail}; "
-            f"retry_in={retry_interval:.1f}s"
+            "[channel-startup] ready "
+            f"attempt={attempt} elapsed={elapsed:.1f}s "
+            f"channels={','.join(sorted(channel_map))}"
         )
-        time.sleep(retry_interval)
+        os.environ.pop("E2E_CHANNEL_STARTUP_ATTEMPT", None)
+        os.environ.pop("E2E_CHANNEL_STARTUP_STARTED_AT", None)
+        # Keep the owning vector alive as well as the individual SWIG
+        # channel wrappers. Some libMulticastNetwork builds tie wrapper
+        # lifetime to the vector returned by create_channels().
+        return channels, channel_map
+
+    detail = (
+        f"exception={error}"
+        if error is not None
+        else f"ret={ret!r} missing={','.join(missing) or '-'}"
+    )
+    if startup_timeout > 0.0 and elapsed >= startup_timeout:
+        raise RuntimeError(
+            "multicast channels did not become ready within "
+            f"{startup_timeout:.1f}s ({detail})"
+        )
+    print(
+        "[channel-startup][WAIT] daemon/config center not ready; "
+        f"attempt={attempt} elapsed={elapsed:.1f}s {detail}; "
+        f"restart_in={retry_interval:.1f}s"
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.environ["E2E_CHANNEL_STARTUP_ATTEMPT"] = str(attempt)
+    os.environ["E2E_CHANNEL_STARTUP_STARTED_AT"] = str(started_at)
+    time.sleep(retry_interval)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    raise RuntimeError("failed to replace process for channel startup retry")
 
 
 def main():
