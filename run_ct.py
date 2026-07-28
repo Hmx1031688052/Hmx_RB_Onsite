@@ -37,8 +37,11 @@ def _ct_parser():
     parser.add_argument(
         "--ct-pulse-duration",
         type=float,
-        default=float(os.environ.get("CT_PULSE_DURATION", "0.02")),
-        help="minimum acceleration pulse time in seconds (default: 0.02)",
+        default=float(os.environ.get("CT_PULSE_DURATION", "0.03")),
+        help=(
+            "fixed acceleration pulse time in seconds; 0.03 matches one "
+            "DriveSim interval (default: 0.03)"
+        ),
     )
     parser.add_argument(
         "--ct-accel",
@@ -88,6 +91,7 @@ def _append_default(arguments, value, *names):
 
 def _install_score_config(speed_factor):
     base_config = rule_based_planner.PlannerConfig
+    base_controller = rule_based_planner.StableController
 
     class CtPlannerConfig(base_config):
         """Planner configuration with episode-relative sprint speed."""
@@ -118,6 +122,32 @@ def _install_score_config(speed_factor):
 
     CtPlannerConfig.__name__ = "CtPlannerConfig"
     rule_based_planner.PlannerConfig = CtPlannerConfig
+
+    class CtStableController(base_controller):
+        """Sprint controller with a fixed pulse independent of INS delay."""
+
+        def control(self, *args, **kwargs):
+            output = super().control(*args, **kwargs)
+            if (
+                self.sprint_phase == "PULSE"
+                and self.sprint_pulse_elapsed
+                >= self.config.sprint_pulse_min_duration - 1e-9
+            ):
+                # The normal controller waits for delayed INS speed feedback
+                # and can repeat a nominal 20 ms pulse for hundreds of
+                # milliseconds. CT mode deliberately limits the violation to
+                # the configured simulation-time window.
+                self.sprint_pulse_acknowledged = True
+                self.last_debug["ct_fixed_pulse_end"] = True
+                print(
+                    "[ct-score] fixed acceleration pulse completed "
+                    f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
+                    "next control is COAST without waiting for INS ack"
+                )
+            return output
+
+    CtStableController.__name__ = "CtStableController"
+    rule_based_planner.StableController = CtStableController
 
 
 def main():
