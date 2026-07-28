@@ -158,11 +158,11 @@ def _ct_parser():
         "--ct-channel-settle-duration",
         type=float,
         default=float(
-            os.environ.get("CT_CHANNEL_SETTLE_DURATION", "8.0")
+            os.environ.get("CT_CHANNEL_SETTLE_DURATION", "0.0")
         ),
         help=(
             "wait before the one native create_channels call so daemon and "
-            "LinuxNoEditor registrations can settle (default: 8.0)"
+            "LinuxNoEditor registrations can settle (default: 0.0; immediate)"
         ),
     )
     parser.add_argument(
@@ -174,6 +174,40 @@ def _ct_parser():
         help=(
             "request a clean process reconnect when START_TEST receives no "
             "valid INS for this many seconds (default: 8.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-first-prepare-timeout",
+        type=float,
+        default=float(
+            os.environ.get("CT_FIRST_PREPARE_TIMEOUT", "0.0")
+        ),
+        help=(
+            "on the first runtime child only, reconnect when ActorPrepare is "
+            "not received this many seconds after channel creation "
+            "(default: 0.0, disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-prepare-response-delay",
+        type=float,
+        default=float(
+            os.environ.get("CT_PREPARE_RESPONSE_DELAY", "5.0")
+        ),
+        help=(
+            "delay ActorPrepareResult after route readiness so simulator "
+            "publishers can initialize (default: 5.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-prepare-resend-interval",
+        type=float,
+        default=float(
+            os.environ.get("CT_PREPARE_RESEND_INTERVAL", "6.0")
+        ),
+        help=(
+            "resend ActorPrepareResult until START_TEST at this interval "
+            "(default: 6.0)"
         ),
     )
     parser.add_argument(
@@ -258,6 +292,23 @@ def _validate_ct_args(parser, args):
         parser.error(
             "--ct-first-ins-timeout must be finite and greater than zero"
         )
+    if (
+        not math.isfinite(args.ct_first_prepare_timeout)
+        or args.ct_first_prepare_timeout < 0.0
+    ):
+        parser.error(
+            "--ct-first-prepare-timeout must be finite and non-negative"
+        )
+    for name in (
+        "ct_prepare_response_delay",
+        "ct_prepare_resend_interval",
+    ):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0.0:
+            parser.error(
+                f"--{name.replace('_', '-')} must be finite and "
+                "greater than zero"
+            )
     if args.ct_startup_reconnects < 0 or args.ct_startup_reconnects > 1:
         parser.error("--ct-startup-reconnects must be either 0 or 1")
 
@@ -284,10 +335,9 @@ def _supervise_runtime(ct_args):
     for attempt in range(ct_args.ct_startup_reconnects + 1):
         child_env = os.environ.copy()
         child_env["CT_RUNTIME_CHILD"] = "1"
+        child_env["CT_RUNTIME_ATTEMPT"] = str(attempt)
         if attempt > 0 and not explicit_settle:
-            # The simulator has already been running throughout the first
-            # attempt. A short registration grace is sufficient on reconnect.
-            child_env["CT_CHANNEL_SETTLE_DURATION"] = "2.0"
+            child_env["CT_CHANNEL_SETTLE_DURATION"] = "0.0"
         if attempt > 0:
             print(
                 "[ct-startup][RECONNECT] restarting runtime child once "
@@ -844,6 +894,18 @@ def main():
     os.environ["E2E_FIRST_INS_TIMEOUT"] = str(
         ct_args.ct_first_ins_timeout
     )
+    runtime_attempt = int(os.environ.get("CT_RUNTIME_ATTEMPT", "0"))
+    os.environ["E2E_FIRST_PREPARE_TIMEOUT"] = (
+        str(ct_args.ct_first_prepare_timeout)
+        if runtime_attempt == 0
+        else "0"
+    )
+    os.environ["E2E_PREPARE_RESPONSE_DELAY"] = str(
+        ct_args.ct_prepare_response_delay
+    )
+    os.environ["E2E_PREPARE_RESULT_RESEND_INTERVAL"] = str(
+        ct_args.ct_prepare_resend_interval
+    )
 
     print(
         "[ct-score] isolated scoring entrypoint active "
@@ -863,6 +925,11 @@ def main():
         f"{ct_args.ct_straight_max_lateral_accel:.3f}m/s2 "
         f"straight_lat_jerk="
         f"{ct_args.ct_straight_max_lateral_jerk:.3f}m/s3 "
+        f"first_prepare_timeout="
+        f"{ct_args.ct_first_prepare_timeout:.1f}s "
+        f"prepare_delay={ct_args.ct_prepare_response_delay:.1f}s "
+        f"prepare_resend="
+        f"{ct_args.ct_prepare_resend_interval:.1f}s "
         f"first_ins_timeout={ct_args.ct_first_ins_timeout:.1f}s "
         "background_vehicles=IGNORED gt_subscription=DISABLED "
         "ins_sequence_filter=MONOTONIC"

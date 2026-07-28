@@ -226,6 +226,13 @@ PREPARE_RESULT_REPEAT = max(
 PREPARE_RESULT_INTERVAL = max(
     0.0, float(os.environ.get("E2E_PREPARE_RESULT_INTERVAL", "0.03"))
 )
+PREPARE_RESPONSE_DELAY = max(
+    0.0, float(os.environ.get("E2E_PREPARE_RESPONSE_DELAY", "0.0"))
+)
+PREPARE_RESULT_RESEND_INTERVAL = max(
+    0.0,
+    float(os.environ.get("E2E_PREPARE_RESULT_RESEND_INTERVAL", "0.0")),
+)
 loop_count = 0
 last_ins_sequence = None
 last_ins_position = None
@@ -284,6 +291,10 @@ ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 test_start_received_ts = None
+channel_created_ts = None
+first_prepare_startup_timeout = max(
+    0.0, float(os.environ.get("E2E_FIRST_PREPARE_TIMEOUT", "0.0"))
+)
 first_ins_startup_timeout = max(
     0.0, float(os.environ.get("E2E_FIRST_INS_TIMEOUT", "0.0"))
 )
@@ -1255,6 +1266,25 @@ def hold_until_ego_ready():
     return True
 
 
+def reconnect_if_prepare_subscription_is_dead():
+    if (
+        first_prepare_startup_timeout <= 0.0
+        or channel_created_ts is None
+        or recv_prepare
+    ):
+        return
+    channel_age = max(0.0, time.time() - channel_created_ts)
+    if channel_age < first_prepare_startup_timeout:
+        return
+    print(
+        "[startup][RECONNECT] ActorPrepare not received after "
+        f"{channel_age:.1f}s from native channel creation; "
+        "requesting one clean process-level channel reconnect",
+        flush=True,
+    )
+    os._exit(75)
+
+
 
 def check_plan_start_imu(ego, ins_sequence):
     global plan_start_check_remaining
@@ -1657,6 +1687,19 @@ def prepare(result=True):
     )
 
 
+def should_send_prepare_result(now=None):
+    if prepare_sent_ts is None:
+        return True
+    if PREPARE_RESULT_RESEND_INTERVAL <= 0.0:
+        return False
+    if now is None:
+        now = time.time()
+    return (
+        float(now) - prepare_sent_ts
+        >= PREPARE_RESULT_RESEND_INTERVAL
+    )
+
+
 def reset_episode_ego_state(reason):
     """Drop pose, speed, and feedback state that cannot cross sessions."""
     previous_speed = float(
@@ -1700,6 +1743,7 @@ def get_prepare():
     global prepare_received_ts
     global map_ready_ts
     global prepare_not_before_ts
+    global prepare_sent_ts
     global first_ins_ready
     global first_ins_ready_ts
     global first_pointcloud_ready
@@ -1744,6 +1788,7 @@ def get_prepare():
         map_ready = False
         map_ready_ts = None
         prepare_not_before_ts = None
+        prepare_sent_ts = None
         first_ins_ready = False
         first_ins_ready_ts = None
         first_pointcloud_ready = False
@@ -2053,7 +2098,9 @@ def get_prepare():
         map_ready = bool(plan_request_sent)
         if map_ready:
             map_ready_ts = time.time()
-            prepare_not_before_ts = map_ready_ts
+            prepare_not_before_ts = (
+                map_ready_ts + PREPARE_RESPONSE_DELAY
+            )
             print(
                 "[prepare-timing] map_ready "
                 f"wall_time={map_ready_ts:.3f} "
@@ -3057,6 +3104,7 @@ def main():
             # Some native channel builds do not replay a frame once a client
             # has drained it before the simulator role becomes active.
             get_prepare()
+            reconnect_if_prepare_subscription_is_dead()
             now = time.time()
             if now - last_prepare_wait_warn_ts >= 2.0:
                 last_prepare_wait_warn_ts = now
@@ -3084,9 +3132,10 @@ def main():
                 if settle_remaining > 0.0:
                     time.sleep(min(0.1, settle_remaining))
                     continue
-            prepare()
-            pre_map_name = map_name
-            map_ready = False
+            now = time.time()
+            if should_send_prepare_result(now):
+                prepare()
+                pre_map_name = map_name
             time.sleep(0.1)
             continue
         # Match run_ori.py's single-consumer message model: INS is read by
@@ -4304,6 +4353,7 @@ if __name__ == "__main__":
     except RuntimeError as exc:
         print(f"[channel-startup][FATAL] {exc}")
         sys.exit(1)
+    channel_created_ts = time.time()
     # 不同的组播消息通道，用于接收和发送消息
     for c in channel_map.values():
         print("message channel name: {}, id: {}".format(c.name(), c.id()))
