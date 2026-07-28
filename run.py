@@ -2925,6 +2925,71 @@ def abort_test():
     length = len(data)
     notify_channel.put(MT_NOTIFY, length, data)
 
+def create_runtime_channels(
+    param,
+    required_names,
+    retry_interval=1.0,
+    startup_timeout=0.0,
+):
+    """Wait for daemon/config-center readiness and return all channels.
+
+    ``create_channels`` is commonly called while the daemon and simulator are
+    being launched in parallel. A failed first call is therefore a startup
+    race, not a fatal configuration error. A timeout of zero waits forever,
+    which makes run.py independent of process launch order.
+    """
+    required_names = set(required_names)
+    retry_interval = max(0.1, float(retry_interval))
+    startup_timeout = max(0.0, float(startup_timeout))
+    started_at = time.monotonic()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        channels = libMulticastNetwork.ChannelPtrVector()
+        channel_map = {}
+        ret = None
+        error = None
+        try:
+            ret = libMulticastNetwork.create_channels(param, channels)
+            if ret == 0:
+                for channel in channels:
+                    channel_map[channel.name()] = channel
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+        missing = sorted(required_names.difference(channel_map))
+        if ret == 0 and not missing:
+            elapsed = time.monotonic() - started_at
+            print(
+                "[channel-startup] ready "
+                f"attempt={attempt} elapsed={elapsed:.1f}s "
+                f"channels={','.join(sorted(channel_map))}"
+            )
+            # Keep the owning vector alive as well as the individual SWIG
+            # channel wrappers. Some libMulticastNetwork builds tie wrapper
+            # lifetime to the vector returned by create_channels().
+            return channels, channel_map
+
+        elapsed = time.monotonic() - started_at
+        detail = (
+            f"exception={error}"
+            if error is not None
+            else f"ret={ret} missing={','.join(missing) or '-'}"
+        )
+        if startup_timeout > 0.0 and elapsed >= startup_timeout:
+            raise RuntimeError(
+                "multicast channels did not become ready within "
+                f"{startup_timeout:.1f}s ({detail})"
+            )
+        print(
+            "[channel-startup][WAIT] daemon/config center not ready; "
+            f"attempt={attempt} elapsed={elapsed:.1f}s {detail}; "
+            f"retry_in={retry_interval:.1f}s"
+        )
+        time.sleep(retry_interval)
+
+
 def main():
     global map_name
     global pre_map_name
@@ -3016,6 +3081,21 @@ if __name__ == "__main__":
     arg_parser.add_argument("--config_center", type=str, default="47.110.233.70:52009")
     arg_parser.add_argument("--field_id", type=str, default="field-zd-test1-22-0331134113-888")
     arg_parser.add_argument("--net_interface", type=str, default="usb0")
+    arg_parser.add_argument(
+        "--channel-startup-timeout",
+        type=float,
+        default=0.0,
+        help=(
+            "seconds to wait for daemon/config center and all multicast "
+            "channels; 0 waits forever (default)"
+        ),
+    )
+    arg_parser.add_argument(
+        "--channel-retry-interval",
+        type=float,
+        default=1.0,
+        help="seconds between multicast channel startup attempts (default: 1)",
+    )
     arg_parser.add_argument(
         "--max_speed",
         "--max-speed",
@@ -3788,6 +3868,10 @@ if __name__ == "__main__":
         ),
     )
     args = arg_parser.parse_args()
+    if args.channel_startup_timeout < 0.0:
+        arg_parser.error("--channel-startup-timeout must be non-negative")
+    if args.channel_retry_interval <= 0.0:
+        arg_parser.error("--channel-retry-interval must be greater than zero")
     if args.max_speed is not None and args.max_speed <= 0.0:
         arg_parser.error("--max_speed must be greater than zero")
     if args.max_speed_kmh is not None and args.max_speed_kmh <= 0.0:
@@ -4120,16 +4204,29 @@ if __name__ == "__main__":
     param.recv_self_msg = False
     session_id = ""
 
-    channels = libMulticastNetwork.ChannelPtrVector()
-    ret = libMulticastNetwork.create_channels(param, channels)
-    if ret:
-        print("create channels failed, ret: {}".format(ret))
+    required_channel_names = {
+        "lidar",
+        "notify",
+        "vehiclecontrol",
+        "prepare",
+        "ins",
+        "camera",
+    }
+    if PERCEPTION_SOURCE == "gt":
+        required_channel_names.add("npc")
+    try:
+        channels, channel_map = create_runtime_channels(
+            param,
+            required_channel_names,
+            retry_interval=args.channel_retry_interval,
+            startup_timeout=args.channel_startup_timeout,
+        )
+    except RuntimeError as exc:
+        print(f"[channel-startup][FATAL] {exc}")
         sys.exit(1)
-    channel_map = {}
     # 不同的组播消息通道，用于接收和发送消息
-    for c in channels:
+    for c in channel_map.values():
         print("message channel name: {}, id: {}".format(c.name(), c.id()))
-        channel_map[c.name()] = c
 
     pointcloud_channel = channel_map["lidar"]
     notify_channel = channel_map["notify"]
