@@ -93,9 +93,9 @@ def _ct_parser():
         "--ct-heading-tolerance-deg",
         type=float,
         default=float(
-            os.environ.get("CT_HEADING_TOLERANCE_DEG", "0.5")
+            os.environ.get("CT_HEADING_TOLERANCE_DEG", "0.8")
         ),
-        help="heading error required before boost, degrees (default: 0.5)",
+        help="heading error required before boost, degrees (default: 0.8)",
     )
     parser.add_argument(
         "--ct-lateral-tolerance",
@@ -112,9 +112,9 @@ def _ct_parser():
         "--ct-alignment-settle-duration",
         type=float,
         default=float(
-            os.environ.get("CT_ALIGNMENT_SETTLE_DURATION", "0.20")
+            os.environ.get("CT_ALIGNMENT_SETTLE_DURATION", "0.10")
         ),
-        help="continuous aligned time required before boost (default: 0.20)",
+        help="continuous aligned time required before boost (default: 0.10)",
     )
     parser.add_argument(
         "--ct-alignment-timeout",
@@ -142,9 +142,12 @@ def _ct_parser():
         "--ct-alignment-heading-gain",
         type=float,
         default=float(
-            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "6.0")
+            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "5.0")
         ),
-        help="goal-heading curvature gain (default: 6.0)",
+        help=(
+            "steering-wheel degrees commanded per degree of goal-heading "
+            "error (default: 5.0)"
+        ),
     )
     parser.add_argument(
         "--ct-alignment-lateral-gain",
@@ -162,12 +165,12 @@ def _ct_parser():
         type=float,
         default=float(
             os.environ.get(
-                "CT_ALIGNMENT_STEER_TOLERANCE_DEG", "0.5"
+                "CT_ALIGNMENT_STEER_TOLERANCE_DEG", "1.0"
             )
         ),
         help=(
             "commanded and measured steering-wheel tolerance required "
-            "before boost, in degrees (default: 0.5)"
+            "before boost, in degrees (default: 1.0)"
         ),
     )
     parser.add_argument(
@@ -179,8 +182,8 @@ def _ct_parser():
             )
         ),
         help=(
-            "measured steering-wheel slew used by heading-stop prediction, "
-            "in deg/s (default: 286.5, matching 5 rad/s)"
+            "legacy compatibility option; steering-feedback prediction is "
+            "disabled"
         ),
     )
     parser.add_argument(
@@ -730,12 +733,6 @@ def _install_score_config(ct_args):
                 # manoeuvre here: its brief lateral-threshold exposure costs
                 # less under the duration-based score than spending most of
                 # a short episode aligning at crawl speed.
-                wheelbase = max(
-                    0.1, float(self.config.controller_wheelbase)
-                )
-                steering_ratio = max(
-                    0.1, float(self.config.steering_ratio)
-                )
                 command_sign = float(
                     self.config.steering_command_sign
                 )
@@ -751,81 +748,52 @@ def _install_score_config(ct_args):
                 except (TypeError, ValueError):
                     signed_measured_steer = 0.0
                 measured_steer = abs(signed_measured_steer)
-                max_front_angle = math.radians(
-                    max_alignment_steer / steering_ratio
-                )
-                max_alignment_curvature = (
-                    math.tan(max_front_angle) / wheelbase
-                )
-                measured_front_angle = math.radians(
-                    command_sign
-                    * signed_measured_steer
-                    / steering_ratio
-                )
-                measured_curvature = (
-                    math.tan(measured_front_angle) / wheelbase
-                )
-                try:
-                    measured_speed = max(
-                        0.0, float(getattr(ego, "speed", 0.0))
+                # Deliberately simple segmented heading-only control:
+                #
+                #   accepted band -> centre
+                #   otherwise     -> max(4 deg, gain * heading error)
+                #
+                # Do not feed lateral error or measured steering back into
+                # the command. The former created an S turn; the latter,
+                # combined with delayed DriveSim feedback, created alternating
+                # +/-42 degree commands near the target angle.
+                error_deg = math.degrees(signed_heading_error)
+                if abs(error_deg) <= (
+                    ct_args.ct_heading_tolerance_deg
+                ):
+                    # Enter the accepted heading band with a centred command
+                    # immediately. Continuing to command even 2--3 degrees
+                    # of wheel angle during the settle window would
+                    # carry the chassis through the target heading.
+                    alignment_steer = 0.0
+                    alignment_control_mode = "GOAL_HEADING_CENTER"
+                else:
+                    # Preserve enough wheel authority to cross the last
+                    # degree promptly instead of asymptotically creeping
+                    # toward the accepted heading band.
+                    steer_mag = max(
+                        4.0,
+                        ct_args.ct_alignment_heading_gain
+                        * abs(error_deg),
                     )
-                except (AttributeError, TypeError, ValueError):
-                    measured_speed = self.ct_alignment_command_speed
-                # Heading-only alignment. Predict the heading at the point
-                # where the measured wheel would reach centre, then command
-                # curvature from that error. There is deliberately no
-                # lateral-error term and no reverse-curvature switching
-                # surface: the car turns once toward the live goal bearing.
-                steering_unwind_time = (
-                    abs(signed_measured_steer)
-                    / ct_args.ct_alignment_steer_rate_deg_s
-                )
-                predicted_heading_error = (
-                    signed_heading_error
-                    - measured_speed
-                    * measured_curvature
-                    * steering_unwind_time
-                )
-                desired_alignment_curvature = (
-                    ct_args.ct_alignment_heading_gain
-                    * predicted_heading_error
-                )
-                alignment_control_mode = "GOAL_HEADING"
+                    alignment_steer = (
+                        command_sign
+                        * math.copysign(
+                            min(max_alignment_steer, steer_mag),
+                            error_deg,
+                        )
+                    )
+                    alignment_control_mode = "GOAL_HEADING_P_MIN"
                 alignment_switch_surface = float("nan")
-                desired_alignment_curvature = max(
-                    -max_alignment_curvature,
-                    min(
-                        max_alignment_curvature,
-                        desired_alignment_curvature,
-                    ),
-                )
-                alignment_front_angle = math.atan(
-                    wheelbase * desired_alignment_curvature
-                )
-                alignment_steer = (
-                    command_sign
-                    * math.degrees(alignment_front_angle)
-                    * steering_ratio
-                )
-                alignment_steer = max(
-                    -max_alignment_steer,
-                    min(max_alignment_steer, alignment_steer),
-                )
                 output.steer = alignment_steer
                 self.last_steer = alignment_steer
                 self.filtered_steer = alignment_steer
                 if steering_feedback is None:
                     measured_steer = abs(alignment_steer)
 
-                profile_settled = (
-                    self.ct_alignment_command_speed
-                    >= ct_args.ct_alignment_speed - 0.01
-                    and self.ct_alignment_command_acc <= 0.05
-                )
                 geometry_settled = (
                     self.ct_alignment_stable_elapsed
                     >= ct_args.ct_alignment_settle_duration - 1e-9
-                    and profile_settled
                 )
                 if geometry_settled:
                     # Do not let the fine controller spend another second
