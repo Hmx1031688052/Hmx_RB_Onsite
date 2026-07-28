@@ -18,9 +18,58 @@ import argparse
 import json
 import math
 import re
+import sys
 import time
+from pathlib import Path
+
+
+# The onsite SDK keeps the generated ``chassis`` and ``main`` protobuf
+# packages beside Hmx_RB_Onsite. When this file is launched as
+# ``python Hmx_RB_Onsite/run_hmxzw.py``, Python adds only the script directory
+# to sys.path, not its parent. Add both explicitly before importing the SDK.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ONSITE_ROOT = _SCRIPT_DIR.parent
+for _module_root in (_ONSITE_ROOT, _SCRIPT_DIR):
+    _module_root_text = str(_module_root)
+    if _module_root_text not in sys.path:
+        sys.path.insert(0, _module_root_text)
 
 import libMulticastNetwork
+
+
+def _add_onsite_proto_root():
+    """Locate generated SDK protobuf packages in common onsite layouts."""
+    search_bases = [
+        _ONSITE_ROOT,
+        Path.cwd().resolve(),
+        Path(getattr(libMulticastNetwork, "__file__", _SCRIPT_DIR)).resolve().parent,
+    ]
+    patterns = (
+        "chassis/proto/chassis_enums_pb2.py",
+        "*/chassis/proto/chassis_enums_pb2.py",
+        "*/*/chassis/proto/chassis_enums_pb2.py",
+    )
+    checked = set()
+    for base in search_bases:
+        if base in checked or not base.is_dir():
+            continue
+        checked.add(base)
+        for pattern in patterns:
+            for enum_file in base.glob(pattern):
+                # .../<root>/chassis/proto/chassis_enums_pb2.py
+                proto_root = enum_file.parents[2]
+                if not (
+                    proto_root / "main" / "proto" / "enums_pb2.py"
+                ).is_file():
+                    continue
+                proto_root_text = str(proto_root)
+                if proto_root_text not in sys.path:
+                    sys.path.insert(0, proto_root_text)
+                return proto_root
+    return None
+
+
+_ONSITE_PROTO_ROOT = _add_onsite_proto_root()
 
 from chassis.proto.chassis_enums_pb2 import (
     VEHICLE_CONTROL,
