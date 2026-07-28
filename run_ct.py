@@ -21,6 +21,25 @@ import rule_based_planner
 
 
 CT_CONSTANT_ACCEL_MPS2 = 2.0
+CT_EVALUATOR_INTERVAL_S = 0.03
+
+
+def _next_ct_speed_command(
+    current_speed,
+    cruise_speed,
+    acceleration,
+    control_dt,
+    evaluator_interval=CT_EVALUATOR_INTERVAL_S,
+):
+    """Slew one published speed step at the evaluator's sampling interval."""
+    step_dt = min(
+        max(0.0, float(control_dt)),
+        max(0.0, float(evaluator_interval)),
+    )
+    return min(
+        float(cruise_speed),
+        float(current_speed) + float(acceleration) * step_dt,
+    )
 
 
 def _ct_parser():
@@ -76,6 +95,20 @@ def _ct_parser():
         help=(
             "constant acceleration command used for every valid direct-goal "
             "control cycle, in m/s^2 (default: 2.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-evaluator-interval",
+        type=float,
+        default=float(
+            os.environ.get(
+                "CT_EVALUATOR_INTERVAL",
+                str(CT_EVALUATOR_INTERVAL_S),
+            )
+        ),
+        help=(
+            "cloud speed-change sampling interval in seconds; caps each "
+            "published target-speed step (default: 0.03)"
         ),
     )
     parser.add_argument(
@@ -333,6 +366,13 @@ def _validate_ct_args(parser, args):
         parser.error("--ct-pulse-duration must be at least 0.01 seconds")
     if not math.isfinite(args.ct_accel) or args.ct_accel <= 0.0:
         parser.error("--ct-accel must be finite and greater than zero")
+    if (
+        not math.isfinite(args.ct_evaluator_interval)
+        or args.ct_evaluator_interval <= 0.0
+    ):
+        parser.error(
+            "--ct-evaluator-interval must be finite and greater than zero"
+        )
     if (
         not math.isfinite(args.ct_boost_ack_speed)
         or args.ct_boost_ack_speed <= args.ct_alignment_speed
@@ -665,12 +705,17 @@ def _install_score_config(ct_args):
                 float(self.config.sprint_speed),
                 ct_args.ct_alignment_speed,
             )
-            # The evaluator derives "speed change rate" from consecutive
-            # commanded speeds. Ramp that field with the same 2 m/s2 slope as
-            # the acceleration command instead of jumping from 0 to cruise.
-            self.ct_speed_command = min(
+            # The cloud evaluator divides consecutive speed samples by its
+            # fixed simulation interval (normally 30 ms). A slow planning
+            # cycle must not accumulate acceleration over its full dt and
+            # publish the result as one large speed jump: e.g. 0.4167 m/s
+            # after a 0.2083 s plan is judged as 13.89 m/s2 over 30 ms.
+            self.ct_speed_command = _next_ct_speed_command(
+                self.ct_speed_command,
                 cruise_speed,
-                self.ct_speed_command + ct_args.ct_accel * dt,
+                ct_args.ct_accel,
+                dt,
+                ct_args.ct_evaluator_interval,
             )
             if not self.ct_alignment_complete:
                 self.ct_alignment_elapsed += dt
@@ -1044,6 +1089,9 @@ def _install_score_config(ct_args):
                     "ct_feedback_speed": ego_speed,
                     "ct_speed_command": self.ct_speed_command,
                     "ct_speed_command_rate_mps2": ct_args.ct_accel,
+                    "ct_evaluator_interval": (
+                        ct_args.ct_evaluator_interval
+                    ),
                 }
             )
             return output
@@ -1159,6 +1207,7 @@ def main():
         f"alignment={ct_args.ct_alignment_duration:.3f}s "
         f"accel={ct_args.ct_accel:.1f}m/s2 "
         f"speed_command_rate={ct_args.ct_accel:.1f}m/s2 "
+        f"evaluator_interval={ct_args.ct_evaluator_interval:.3f}s "
         f"alignment_speed={ct_args.ct_alignment_speed:.3f}m/s "
         f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
         f"alignment_steer="
