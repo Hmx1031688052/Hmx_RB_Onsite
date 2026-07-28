@@ -306,9 +306,13 @@ final_control_safe_accel = max(
     0.0,
     float(os.environ.get("E2E_FINAL_CONTROL_SAFE_ACCEL", "2.0")),
 )
+final_control_one_shot_target = (
+    os.environ.get("E2E_FINAL_CONTROL_ONE_SHOT_TARGET", "0") == "1"
+)
 final_control_limiter = FinalSpeedLimiter(
     safe_accel=final_control_safe_accel,
     publish_interval=final_control_interval,
+    one_shot_target=final_control_one_shot_target,
 )
 final_control_lock = threading.Lock()
 final_control_stop_event = threading.Event()
@@ -3121,6 +3125,7 @@ def final_control_publisher_loop():
         "[final-control] publisher started "
         f"interval={final_control_interval:.3f}s "
         f"safe_accel={final_control_safe_accel:.3f}m/s2 "
+        f"one_shot_target={int(final_control_one_shot_target)} "
         f"max_speed_step="
         f"{final_control_limiter.max_speed_step:.6f}m",
         flush=True,
@@ -3149,6 +3154,20 @@ def final_control_publisher_loop():
                         published_speed,
                         desired_steer,
                     )
+                    if (
+                        final_control_one_shot_target
+                        and abs(published_accel)
+                        > final_control_safe_accel + 1e-6
+                    ):
+                        print(
+                            "[final-control][ONE_SHOT] "
+                            f"ego_speed="
+                            f"{float(ego_speed) if ego_speed is not None else previous_speed:.6f}m/s "
+                            f"target_speed={published_speed:.6f}m/s "
+                            f"single_frame_accel="
+                            f"{published_accel:.6f}m/s2",
+                            flush=True,
+                        )
                     now = time.monotonic()
                     if (
                         DEBUG_DRIVE

@@ -99,6 +99,27 @@ class FinalSpeedLimiterTest(unittest.TestCase):
         self.assertAlmostEqual(previous, 10.0)
         self.assertAlmostEqual(speed, 10.06)
 
+    def test_one_shot_target_jumps_once_then_holds_zero_acceleration(self):
+        limiter = FinalSpeedLimiter(
+            safe_accel=2.0,
+            publish_interval=0.03,
+            one_shot_target=True,
+        )
+        limiter.reset(20.0)
+
+        speed, accel, previous = limiter.step(35.0, ego_speed=20.0)
+        held_speed, held_accel, held_previous = limiter.step(
+            35.0,
+            ego_speed=35.0,
+        )
+
+        self.assertAlmostEqual(previous, 20.0)
+        self.assertAlmostEqual(speed, 35.0)
+        self.assertAlmostEqual(accel, 500.0)
+        self.assertAlmostEqual(held_previous, 35.0)
+        self.assertAlmostEqual(held_speed, 35.0)
+        self.assertAlmostEqual(held_accel, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

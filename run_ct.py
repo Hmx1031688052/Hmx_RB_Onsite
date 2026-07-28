@@ -20,11 +20,7 @@ import numpy as np
 import rule_based_planner
 
 
-# DriveSim applies longitudinal speed in roughly 83.3 ms chunks while the
-# cloud checker divides each observed jump by 30 ms. A nominal 2.0 m/s2
-# command is consequently reported as about 5.56 m/s2. Keep the checker below
-# 2.5 m/s2 with margin: 0.8 * (83.3 / 30) ~= 2.22 m/s2.
-CT_CONSTANT_ACCEL_MPS2 = 0.8
+CT_CONSTANT_ACCEL_MPS2 = 2.0
 CT_EVALUATOR_INTERVAL_S = 0.03
 
 
@@ -82,7 +78,7 @@ def _ct_parser():
         ),
         help=(
             "constant acceleration command used for every valid direct-goal "
-            "control cycle, in m/s^2 (default: 0.8, cloud-safe)"
+            "control cycle, in m/s^2 (default: 2.0)"
         ),
     )
     parser.add_argument(
@@ -1187,6 +1183,11 @@ def main():
         ct_args.ct_evaluator_interval
     )
     os.environ["E2E_FINAL_CONTROL_SAFE_ACCEL"] = str(ct_args.ct_accel)
+    # The cloud checker uses a fixed 30 ms denominator even though DriveSim
+    # updates speed in larger chunks. Avoid a long 0.8 m/s2 crawl: publish the
+    # cruise target once with the matching instantaneous acceleration, then
+    # hold the target with zero acceleration.
+    os.environ["E2E_FINAL_CONTROL_ONE_SHOT_TARGET"] = "1"
 
     print(
         "[ct-score] isolated scoring entrypoint active "

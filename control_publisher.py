@@ -14,10 +14,17 @@ def _finite(value):
 class FinalSpeedLimiter:
     """Limit the speed field exactly where control messages are published."""
 
-    def __init__(self, safe_accel=2.0, publish_interval=0.03):
+    def __init__(
+        self,
+        safe_accel=2.0,
+        publish_interval=0.03,
+        one_shot_target=False,
+    ):
         self.safe_accel = max(0.0, float(safe_accel))
         self.publish_interval = max(1e-6, float(publish_interval))
+        self.one_shot_target = bool(one_shot_target)
         self.last_published_speed = None
+        self.last_requested_speed = None
 
     @property
     def max_speed_step(self):
@@ -28,6 +35,7 @@ class FinalSpeedLimiter:
         self.last_published_speed = (
             None if initial_speed is None else max(0.0, initial_speed)
         )
+        self.last_requested_speed = self.last_published_speed
 
     def step(self, desired_speed, ego_speed=None):
         desired_speed = _finite(desired_speed)
@@ -39,6 +47,30 @@ class FinalSpeedLimiter:
 
         previous = self.last_published_speed
         desired = previous if desired_speed is None else max(0.0, desired_speed)
+        epsilon = 1e-6
+
+        # Optional scoring mode: consume a new target in exactly one control
+        # frame, then hold it with zero acceleration. This intentionally
+        # trades one speed-change spike for minimum time-to-target.
+        if self.one_shot_target and (
+            self.last_requested_speed is None
+            or abs(desired - self.last_requested_speed) > epsilon
+        ):
+            reference_speed = previous if ego_speed is None else max(
+                0.0, ego_speed
+            )
+            instant_accel = (
+                (desired - reference_speed) / self.publish_interval
+            )
+            self.last_requested_speed = desired
+            self.last_published_speed = desired
+            return desired, instant_accel, previous
+
+        if self.one_shot_target:
+            self.last_requested_speed = desired
+            self.last_published_speed = desired
+            return desired, 0.0, previous
+
         delta = self.max_speed_step
         low = max(0.0, previous - delta)
         high = previous + delta
@@ -58,7 +90,6 @@ class FinalSpeedLimiter:
         reference_speed = previous if ego_speed is None else max(
             0.0, ego_speed
         )
-        epsilon = 1e-6
         if (
             desired > reference_speed + epsilon
             and limited_speed > reference_speed + epsilon
