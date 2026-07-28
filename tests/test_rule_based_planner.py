@@ -79,6 +79,12 @@ class RulePlannerTest(unittest.TestCase):
         self.assertEqual(
             session_startup_speed(True, stale_ego), 40.0
         )
+        self.assertEqual(
+            session_startup_speed(False, stale_ego, 20.0), 20.0
+        )
+        self.assertEqual(
+            session_startup_speed(True, stale_ego, 20.0), 40.0
+        )
 
     def test_direct_sprint_route_preserves_opposite_lane_goal(self):
         route = build_direct_sprint_route(

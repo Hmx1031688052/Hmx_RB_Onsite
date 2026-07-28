@@ -1220,12 +1220,31 @@ def hold_until_global_plan_ready():
     now = time.time()
     if now - last_global_plan_hold_warn_ts > 1.0:
         last_global_plan_hold_warn_ts = now
+        hold_speed = startup_hold_speed()
         print(
             "[direct-global-plan] no valid route after start; "
-            "send zero-speed hold control"
+            f"preserve startup speed={hold_speed:.3f}m/s"
         )
-    send_control_cmd(0.0, 0.0, 0.0)
+    send_control_cmd(0.0, startup_hold_speed(), 0.0)
     return True
+
+
+def startup_hold_speed():
+    """Use current INS speed, or this episode's expected speed before INS."""
+    expected_speed = 0.0
+    if isinstance(current_expected_speed, dict):
+        expected_speed = current_expected_speed.get("speed_mps", 0.0)
+    if not expected_speed:
+        expected_speed = getattr(
+            getattr(globals().get("rule_planner"), "config", None),
+            "expected_speed_mps",
+            0.0,
+        )
+    return session_startup_speed(
+        first_ins_ready,
+        getattr(globals().get("model"), "ego", None),
+        expected_speed,
+    )
 
 
 def hold_until_ego_ready():
@@ -1260,12 +1279,14 @@ def hold_until_ego_ready():
         os._exit(75)
     if now - last_ego_hold_warn_ts >= 1.0:
         last_ego_hold_warn_ts = now
+        hold_speed = startup_hold_speed()
         print(
             "[startup][WAIT] waiting for first valid INS "
             f"start_age={start_age:.1f}s; "
+            f"preserve_speed={hold_speed:.3f}m/s; "
             "single subscription remains active"
         )
-    send_control_cmd(0.0, 0.0, 0.0)
+    send_control_cmd(0.0, startup_hold_speed(), 0.0)
     return True
 
 
@@ -2961,16 +2982,13 @@ def process_notify():
             # releases that inherited brake without requesting a speed step.
             stable_controller.reset()
             last_control_wall_time = None
-            startup_speed = session_startup_speed(
-                first_ins_ready,
-                getattr(model, "ego", None),
-            )
+            startup_speed = startup_hold_speed()
             send_control_cmd(0.0, startup_speed, 0.0)
             print(
                 "[startup-control] neutral brake release "
                 f"speed={startup_speed:.3f}m/s "
                 f"source="
-                f"{'session-ins' if first_ins_ready else 'zero-no-session-ins'}"
+                f"{'session-ins' if first_ins_ready else 'episode-expected-speed'}"
             )
             if drive_trace_logger is not None:
                 drive_trace_logger.record_event(

@@ -51,11 +51,11 @@ def _wrap(angle):
     return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
 
 
-def session_startup_speed(first_ins_ready, ego):
-    """Return a startup hold speed only from this episode's accepted INS."""
-    if not first_ins_ready or ego is None:
-        return 0.0
-    return max(0.0, _finite(getattr(ego, "speed", 0.0), 0.0))
+def session_startup_speed(first_ins_ready, ego, fallback_speed=0.0):
+    """Preserve startup motion without trusting a stale previous-session ego."""
+    if first_ins_ready and ego is not None:
+        return max(0.0, _finite(getattr(ego, "speed", 0.0), 0.0))
+    return max(0.0, _finite(fallback_speed, 0.0))
 
 
 def _unique(values, tolerance=1e-4):
