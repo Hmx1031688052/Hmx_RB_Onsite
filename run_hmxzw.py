@@ -719,8 +719,13 @@ class Run3:
         print(
             "[run3] minimal straight sprint started "
             f"align_speed={self.controller.align_speed:.2f}m/s "
+            f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
             f"confirm_frames={self.controller.align_confirm_frames} "
+            f"steer_kp={self.controller.steer_kp:.2f} "
+            f"steer_range="
+            f"[{self.controller.steer_min_deg:.1f},"
+            f"{self.controller.steer_limit_deg:.1f}]deg "
             f"sprint_acc={self.controller.sprint_acceleration:.1f} "
             f"sprint_speed={self.controller.sprint_speed:.1f}",
             flush=True,
@@ -755,36 +760,36 @@ def parse_args():
     parser.add_argument(
         "--align-speed",
         type=float,
-        default=3.0,
-        help="low-speed heading-alignment target (default: 3.0 m/s)",
+        default=6.0,
+        help="fast heading-alignment target (default: 6.0 m/s)",
     )
     parser.add_argument(
         "--align-acceleration",
         type=float,
-        default=2.0,
-        help="heading-alignment acceleration (default: 2.0 m/s^2)",
+        default=10.0,
+        help="fast heading-alignment acceleration (default: 10.0 m/s^2)",
     )
     parser.add_argument(
-        "--align-tolerance-deg", type=float, default=2.0
+        "--align-tolerance-deg", type=float, default=3.0
     )
     parser.add_argument(
         "--align-confirm-frames",
         type=int,
-        default=3,
-        help="fresh in-tolerance INS frames before sprint (default: 3)",
+        default=2,
+        help="fresh in-tolerance INS frames before sprint (default: 2)",
     )
     parser.add_argument(
         "--steer-kp",
         type=float,
-        default=2.0,
-        help="steering-wheel degrees per heading-error degree (default: 2.0)",
+        default=3.0,
+        help="steering-wheel degrees per heading-error degree (default: 3.0)",
     )
     parser.add_argument("--steer-sign", type=float, default=1.0)
     parser.add_argument(
         "--steer-min-deg",
         type=float,
-        default=6.0,
-        help="minimum wheel command outside tolerance (default: 6 deg)",
+        default=12.0,
+        help="minimum wheel command outside tolerance (default: 12 deg)",
     )
     parser.add_argument(
         "--steer-limit-deg",
@@ -806,6 +811,11 @@ def parse_args():
         "--ins-start-gate-tolerance",
         type=float,
         default=50.0,
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="accepted for launcher compatibility; control logs are always on",
     )
     return parser.parse_args()
 
