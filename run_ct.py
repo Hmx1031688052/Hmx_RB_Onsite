@@ -103,7 +103,10 @@ def _ct_parser():
         default=float(
             os.environ.get("CT_LATERAL_TOLERANCE", "0.15")
         ),
-        help="path lateral error required before boost, metres (default: 0.15)",
+        help=(
+            "legacy compatibility option; goal-heading alignment no longer "
+            "requires returning to the original chord"
+        ),
     )
     parser.add_argument(
         "--ct-alignment-settle-duration",
@@ -139,9 +142,9 @@ def _ct_parser():
         "--ct-alignment-heading-gain",
         type=float,
         default=float(
-            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "1.0")
+            os.environ.get("CT_ALIGNMENT_HEADING_GAIN", "6.0")
         ),
-        help="fine-alignment heading feedback gain (default: 1.0)",
+        help="goal-heading curvature gain (default: 6.0)",
     )
     parser.add_argument(
         "--ct-alignment-lateral-gain",
@@ -149,7 +152,10 @@ def _ct_parser():
         default=float(
             os.environ.get("CT_ALIGNMENT_LATERAL_GAIN", "0.4")
         ),
-        help="fine-alignment lateral feedback gain (default: 0.4)",
+        help=(
+            "legacy compatibility option; lateral feedback is disabled "
+            "during alignment"
+        ),
     )
     parser.add_argument(
         "--ct-alignment-steer-tolerance-deg",
@@ -173,7 +179,7 @@ def _ct_parser():
             )
         ),
         help=(
-            "measured steering-wheel slew used by switching prediction, "
+            "measured steering-wheel slew used by heading-stop prediction, "
             "in deg/s (default: 286.5, matching 5 rad/s)"
         ),
     )
@@ -426,6 +432,11 @@ def _install_score_config(ct_args):
     base_config = rule_based_planner.PlannerConfig
     base_planner = rule_based_planner.RuleBasedPlanner
     base_controller = rule_based_planner.StableController
+    # Shared only by the CT planner/controller classes installed below.
+    # The controller uses the literal route goal while aligning so it can
+    # steer toward the goal bearing instead of trying to return to the
+    # original start-to-goal chord.
+    ct_route_state = {"goal": None}
 
     class CtPlannerConfig(base_config):
         """Planner configuration with episode-relative sprint speed."""
@@ -462,6 +473,9 @@ def _install_score_config(ct_args):
 
         def _build_sprint_path(self, ego, global_path):
             if self._sprint_path is not None:
+                goal = getattr(self, "_sprint_goal", None)
+                if goal is not None:
+                    ct_route_state["goal"] = goal
                 return self._sprint_path
             try:
                 route_x = np.asarray(
@@ -516,6 +530,7 @@ def _install_score_config(ct_args):
                 ),
             }
             self._sprint_goal = (goal_x, goal_y)
+            ct_route_state["goal"] = self._sprint_goal
             chord_yaw = math.atan2(dy, dx)
             start_yaw = float(getattr(ego, "theta", chord_yaw))
             heading_error = math.atan2(
@@ -553,6 +568,7 @@ def _install_score_config(ct_args):
             self.ct_alignment_command_acc = 0.0
             self.ct_alignment_timeout_warned = False
             self.ct_straight_curvature_command = 0.0
+            self.ct_straight_anchor = None
 
         def reset(self):
             super().reset()
@@ -591,9 +607,25 @@ def _install_score_config(ct_args):
             )
             if not self.ct_alignment_complete:
                 self.ct_alignment_elapsed += dt
-                heading_error = abs(
-                    float(self.last_debug.get("heading_error", math.inf))
+                ego = args[0] if args else kwargs.get("ego")
+                goal = ct_route_state.get("goal")
+                signed_heading_error = float(
+                    self.last_debug.get("heading_error", 0.0)
                 )
+                if ego is not None and goal is not None:
+                    try:
+                        goal_dx = float(goal[0]) - float(ego.x)
+                        goal_dy = float(goal[1]) - float(ego.y)
+                        if math.hypot(goal_dx, goal_dy) > 1e-6:
+                            goal_yaw = math.atan2(goal_dy, goal_dx)
+                            ego_yaw = float(ego.theta)
+                            signed_heading_error = math.atan2(
+                                math.sin(goal_yaw - ego_yaw),
+                                math.cos(goal_yaw - ego_yaw),
+                            )
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                heading_error = abs(signed_heading_error)
                 lateral_error = abs(
                     float(self.last_debug.get("lateral_error", math.inf))
                 )
@@ -602,8 +634,6 @@ def _install_score_config(ct_args):
                     <= math.radians(
                         ct_args.ct_heading_tolerance_deg
                     )
-                    and lateral_error
-                    <= ct_args.ct_lateral_tolerance
                 )
                 if aligned:
                     self.ct_alignment_stable_elapsed += dt
@@ -682,12 +712,6 @@ def _install_score_config(ct_args):
                     ct_args.ct_alignment_max_steer_deg,
                     float(self.config.max_steering_wheel_deg),
                 )
-                signed_heading_error = float(
-                    self.last_debug.get("heading_error", 0.0)
-                )
-                signed_lateral_error = float(
-                    self.last_debug.get("lateral_error", 0.0)
-                )
                 steering_feedback = kwargs.get("steering_feedback")
                 try:
                     signed_measured_steer = float(
@@ -702,101 +726,41 @@ def _install_score_config(ct_args):
                 max_alignment_curvature = (
                     math.tan(max_front_angle) / wheelbase
                 )
-                fine_alignment = (
-                    abs(signed_heading_error)
-                    <= math.radians(
-                        max(
-                            2.0,
-                            4.0
-                            * ct_args.ct_heading_tolerance_deg,
-                        )
-                    )
-                    and abs(signed_lateral_error)
-                    <= ct_args.ct_lateral_tolerance
+                measured_front_angle = math.radians(
+                    command_sign
+                    * signed_measured_steer
+                    / steering_ratio
                 )
-                if fine_alignment:
-                    desired_alignment_curvature = (
-                        ct_args.ct_alignment_heading_gain
-                        * signed_heading_error
-                        - ct_args.ct_alignment_lateral_gain
-                        * signed_lateral_error
+                measured_curvature = (
+                    math.tan(measured_front_angle) / wheelbase
+                )
+                try:
+                    measured_speed = max(
+                        0.0, float(getattr(ego, "speed", 0.0))
                     )
-                    alignment_control_mode = "FINE"
-                    alignment_switch_surface = float("nan")
-                else:
-                    # Spatial-domain time-optimal switching surface for
-                    # d'=-heading_error, heading_error'=-curvature:
-                    #
-                    #   d - e*|e|/(2*kappa_max) = 0
-                    #
-                    # It commands one full-curvature turn followed by one
-                    # reverse-curvature turn. Unlike the former high-gain
-                    # linear law, it does not circle around the line several
-                    # times before settling.
-                    measured_front_angle = math.radians(
-                        command_sign
-                        * signed_measured_steer
-                        / steering_ratio
-                    )
-                    measured_curvature = (
-                        math.tan(measured_front_angle)
-                        / wheelbase
-                    )
-                    try:
-                        measured_speed = max(
-                            0.0,
-                            float(
-                                getattr(args[0], "speed", 0.0)
-                            ),
-                        )
-                    except (IndexError, TypeError, ValueError):
-                        measured_speed = (
-                            self.ct_alignment_command_speed
-                        )
-                    # Switching from +max steer to -max steer is not
-                    # instantaneous. Predict the state through 1.5 times the
-                    # measured wheel's time-to-centre so the reverse command
-                    # is issued before actuator lag carries the car past the
-                    # ideal switching curve.
-                    steering_unwind_time = (
-                        abs(signed_measured_steer)
-                        / ct_args.ct_alignment_steer_rate_deg_s
-                    )
-                    prediction_horizon = (
-                        1.5 * steering_unwind_time
-                    )
-                    predicted_heading_error = (
-                        signed_heading_error
-                        - measured_speed
-                        * measured_curvature
-                        * prediction_horizon
-                    )
-                    predicted_lateral_error = (
-                        signed_lateral_error
-                        - measured_speed
-                        * math.sin(signed_heading_error)
-                        * prediction_horizon
-                    )
-                    alignment_switch_surface = (
-                        predicted_lateral_error
-                        - predicted_heading_error
-                        * abs(predicted_heading_error)
-                        / max(
-                            2.0 * max_alignment_curvature,
-                            1e-6,
-                        )
-                    )
-                    if alignment_switch_surface > 1e-6:
-                        desired_alignment_curvature = (
-                            -max_alignment_curvature
-                        )
-                    elif alignment_switch_surface < -1e-6:
-                        desired_alignment_curvature = (
-                            max_alignment_curvature
-                        )
-                    else:
-                        desired_alignment_curvature = 0.0
-                    alignment_control_mode = "TIME_OPTIMAL"
+                except (AttributeError, TypeError, ValueError):
+                    measured_speed = self.ct_alignment_command_speed
+                # Heading-only alignment. Predict the heading at the point
+                # where the measured wheel would reach centre, then command
+                # curvature from that error. There is deliberately no
+                # lateral-error term and no reverse-curvature switching
+                # surface: the car turns once toward the live goal bearing.
+                steering_unwind_time = (
+                    abs(signed_measured_steer)
+                    / ct_args.ct_alignment_steer_rate_deg_s
+                )
+                predicted_heading_error = (
+                    signed_heading_error
+                    - measured_speed
+                    * measured_curvature
+                    * steering_unwind_time
+                )
+                desired_alignment_curvature = (
+                    ct_args.ct_alignment_heading_gain
+                    * predicted_heading_error
+                )
+                alignment_control_mode = "GOAL_HEADING"
+                alignment_switch_surface = float("nan")
                 desired_alignment_curvature = max(
                     -max_alignment_curvature,
                     min(
@@ -901,6 +865,13 @@ def _install_score_config(ct_args):
                 if settled:
                     self.ct_alignment_complete = True
                     self.ct_alignment_result_logged = True
+                    try:
+                        self.ct_straight_anchor = (
+                            float(ego.x),
+                            float(ego.y),
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        self.ct_straight_anchor = None
                     print(
                         "[ct-score] moving alignment complete "
                         "reason=settled "
@@ -909,7 +880,8 @@ def _install_score_config(ct_args):
                         f"{self.ct_alignment_stable_elapsed:.3f}s "
                         f"heading_error="
                         f"{math.degrees(heading_error):.3f}deg "
-                        f"lateral_error={lateral_error:.3f}m; "
+                        f"original_line_offset={lateral_error:.3f}m "
+                        f"new_line_anchor={self.ct_straight_anchor}; "
                         "boost starts next control cycle"
                     )
                 elif timed_out and not self.ct_alignment_timeout_warned:
@@ -951,6 +923,28 @@ def _install_score_config(ct_args):
             lateral_error = float(
                 self.last_debug.get("lateral_error", 0.0)
             )
+            goal = ct_route_state.get("goal")
+            anchor = self.ct_straight_anchor
+            if ego is not None and goal is not None and anchor is not None:
+                try:
+                    line_dx = float(goal[0]) - float(anchor[0])
+                    line_dy = float(goal[1]) - float(anchor[1])
+                    line_length = math.hypot(line_dx, line_dy)
+                    if line_length > 1e-6:
+                        line_yaw = math.atan2(line_dy, line_dx)
+                        ego_yaw = float(ego.theta)
+                        heading_error = math.atan2(
+                            math.sin(line_yaw - ego_yaw),
+                            math.cos(line_yaw - ego_yaw),
+                        )
+                        offset_x = float(ego.x) - float(anchor[0])
+                        offset_y = float(ego.y) - float(anchor[1])
+                        lateral_error = (
+                            -math.sin(line_yaw) * offset_x
+                            + math.cos(line_yaw) * offset_y
+                        )
+                except (AttributeError, TypeError, ValueError):
+                    pass
             plan_result = (
                 args[1] if len(args) > 1 else kwargs.get("plan_result")
             )
@@ -1020,6 +1014,12 @@ def _install_score_config(ct_args):
                 {
                     "output_steer": straight_steer,
                     "ct_straight_tracking": True,
+                    "ct_straight_anchor": anchor,
+                    "ct_straight_goal": goal,
+                    "ct_straight_heading_error_deg": math.degrees(
+                        heading_error
+                    ),
+                    "ct_straight_lateral_error": lateral_error,
                     "ct_straight_design_speed": design_speed,
                     "ct_straight_desired_curvature": (
                         desired_curvature
