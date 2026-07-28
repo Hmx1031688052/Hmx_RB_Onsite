@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -100,6 +101,7 @@ from main.proto.messages_pb2 import (
 
 
 TASK_TIMEOUT_RESTART_EXIT_CODE = 75
+SIMULATOR_STALL_RESTART_EXIT_CODE = 76
 
 
 def wrap_angle(angle):
@@ -321,6 +323,7 @@ class Run3:
         self.started = False
         self.prepare_result_sent = False
         self.test_started_monotonic = None
+        self.last_ins_monotonic = None
 
         self.ego = None
         self.first_current_ins_ready = False
@@ -391,6 +394,7 @@ class Run3:
         self.started = False
         self.prepare_result_sent = False
         self.test_started_monotonic = None
+        self.last_ins_monotonic = None
         self.map_name = ""
         self.role_id = self.actor_id
         self.ego = None
@@ -656,6 +660,7 @@ class Run3:
             )
 
         self.last_ins_sequence = sequence
+        self.last_ins_monotonic = time.monotonic()
         self.ego = {
             "x": x,
             "y": y,
@@ -727,10 +732,35 @@ class Run3:
         if (
             not self.started
             or self.test_started_monotonic is None
-            or self.args.task_timeout <= 0.0
         ):
             return
         elapsed = time.monotonic() - self.test_started_monotonic
+        last_ins_time = (
+            self.test_started_monotonic
+            if self.last_ins_monotonic is None
+            else max(
+                self.test_started_monotonic,
+                self.last_ins_monotonic,
+            )
+        )
+        ins_silence = time.monotonic() - last_ins_time
+        if (
+            self.args.ins_stall_timeout > 0.0
+            and ins_silence >= self.args.ins_stall_timeout
+        ):
+            print(
+                "[run3][WATCHDOG] INS stalled "
+                f"for {ins_silence:.3f}s "
+                f"(limit={self.args.ins_stall_timeout:.1f}s); "
+                f"session={self.session_id}; "
+                "restart DriverSim and runtime",
+                flush=True,
+            )
+            self.send_control(0.0, 0.0, 0.0)
+            os._exit(SIMULATOR_STALL_RESTART_EXIT_CODE)
+
+        if self.args.task_timeout <= 0.0:
+            return
         if elapsed < self.args.task_timeout:
             return
 
@@ -870,11 +900,90 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--simulator-dir",
+        default=(
+            "/media/pc/FanXiang2T/Onsite_FirstWithForth/"
+            "LinuxNoEditor416/DriverSim/Binaries/Linux"
+        ),
+        help="directory containing the managed DriverSim start.sh",
+    )
+    parser.add_argument(
+        "--simulator-ready-delay",
+        type=float,
+        default=6.0,
+        help="wait after DriverSim start before launching runtime (default: 6)",
+    )
+    parser.add_argument(
+        "--ins-stall-timeout",
+        type=float,
+        default=4.0,
+        help=(
+            "after START, restart DriverSim if no fresh INS arrives for this "
+            "many seconds; <=0 disables (default: 4)"
+        ),
+    )
+    parser.add_argument(
+        "--no-manage-simulator",
+        action="store_true",
+        help="leave LinuxNoEditor external and restart only this runtime",
+    )
+    parser.add_argument(
         "--runtime-child",
         action="store_true",
         help=argparse.SUPPRESS,
     )
     return parser.parse_args()
+
+
+def _terminate_managed_process(process, label):
+    if process is None or process.poll() is not None:
+        return
+    print(
+        f"[run3][supervisor] terminate {label} pid={process.pid}",
+        flush=True,
+    )
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=5.0)
+        return
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        pass
+    if process.poll() is None:
+        print(
+            f"[run3][supervisor] kill unresponsive {label} "
+            f"pid={process.pid}",
+            flush=True,
+        )
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def _start_managed_simulator(args):
+    simulator_dir = Path(args.simulator_dir).expanduser().resolve()
+    start_script = simulator_dir / "start.sh"
+    if not start_script.is_file():
+        raise FileNotFoundError(
+            f"DriverSim start script not found: {start_script}"
+        )
+    print(
+        "[run3][supervisor] start DriverSim "
+        f"cwd={simulator_dir} command='bash start.sh'",
+        flush=True,
+    )
+    return subprocess.Popen(
+        ["bash", "start.sh"],
+        cwd=str(simulator_dir),
+        start_new_session=True,
+    )
 
 
 def supervise_runtime(args):
@@ -885,30 +994,78 @@ def supervise_runtime(args):
         "--runtime-child",
     ]
     restart_count = 0
+    simulator = None
+    runtime = None
     while True:
-        print(
-            "[run3][supervisor] start runtime "
-            f"attempt={restart_count + 1} "
-            f"task_timeout={args.task_timeout:.1f}s",
-            flush=True,
-        )
-        child = subprocess.Popen(child_argv)
         try:
-            return_code = child.wait()
-        except KeyboardInterrupt:
+            if not args.no_manage_simulator:
+                simulator = _start_managed_simulator(args)
+                ready_delay = max(
+                    0.0, float(args.simulator_ready_delay)
+                )
+                ready_deadline = time.monotonic() + ready_delay
+                while time.monotonic() < ready_deadline:
+                    simulator_code = simulator.poll()
+                    if simulator_code is not None:
+                        print(
+                            "[run3][supervisor] DriverSim exited during "
+                            f"startup code={simulator_code}",
+                            flush=True,
+                        )
+                        break
+                    time.sleep(0.2)
+                if simulator.poll() is not None:
+                    restart_count += 1
+                    time.sleep(max(0.0, float(args.restart_delay)))
+                    simulator = None
+                    continue
+
             print(
-                "[run3][supervisor] interrupted; terminate runtime",
+                "[run3][supervisor] start runtime "
+                f"attempt={restart_count + 1} "
+                f"task_timeout={args.task_timeout:.1f}s "
+                f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
                 flush=True,
             )
-            child.terminate()
-            try:
-                child.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+            runtime = subprocess.Popen(
+                child_argv,
+                start_new_session=True,
+            )
+            restart_reason = None
+            return_code = None
+            while restart_reason is None:
+                return_code = runtime.poll()
+                if return_code is not None:
+                    if return_code == TASK_TIMEOUT_RESTART_EXIT_CODE:
+                        restart_reason = "task_timeout"
+                    elif (
+                        return_code
+                        == SIMULATOR_STALL_RESTART_EXIT_CODE
+                    ):
+                        restart_reason = "ins_stall"
+                    else:
+                        break
+                if (
+                    simulator is not None
+                    and simulator.poll() is not None
+                ):
+                    restart_reason = (
+                        "simulator_exit_"
+                        f"{simulator.returncode}"
+                    )
+                if restart_reason is None and return_code is None:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
+            print(
+                "[run3][supervisor] interrupted; stop managed processes",
+                flush=True,
+            )
+            _terminate_managed_process(runtime, "runtime")
+            _terminate_managed_process(simulator, "DriverSim")
             return 130
 
-        if return_code != TASK_TIMEOUT_RESTART_EXIT_CODE:
+        if restart_reason is None:
+            _terminate_managed_process(simulator, "DriverSim")
             print(
                 "[run3][supervisor] runtime exited "
                 f"code={return_code}; supervisor stops",
@@ -916,11 +1073,16 @@ def supervise_runtime(args):
             )
             return return_code
 
+        _terminate_managed_process(runtime, "runtime")
+        _terminate_managed_process(simulator, "DriverSim")
+        runtime = None
+        simulator = None
         restart_count += 1
         restart_delay = max(0.0, float(args.restart_delay))
         print(
-            "[run3][supervisor] timeout restart "
-            f"count={restart_count} delay={restart_delay:.1f}s",
+            "[run3][supervisor] restart complete stack "
+            f"reason={restart_reason} count={restart_count} "
+            f"delay={restart_delay:.1f}s",
             flush=True,
         )
         if restart_delay > 0.0:
