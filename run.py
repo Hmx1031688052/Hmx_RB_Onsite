@@ -278,22 +278,8 @@ ins_start_gate_xy = None
 ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
-ins_receiver_stop_event = threading.Event()
 test_start_received_ts = None
 last_ego_hold_warn_ts = 0.0
-INS_STALL_RESTART_SECONDS = max(
-    1.0,
-    float(os.environ.get("E2E_INS_STALL_RESTART_SECONDS", "5.0")),
-)
-INS_STALL_RESTART_MAX_ATTEMPTS = max(
-    0,
-    int(os.environ.get("E2E_INS_STALL_RESTART_MAX_ATTEMPTS", "2")),
-)
-ins_stall_restart_count = max(
-    0,
-    int(os.environ.get("E2E_INS_STALL_RESTART_COUNT", "0")),
-)
-ins_stall_restart_exhausted_logged = False
 last_rule_plan = None
 roundabout_controller = None
 last_rule_plan_wall_time = 0.0
@@ -1182,41 +1168,6 @@ def hold_until_global_plan_ready():
     return True
 
 
-def restart_after_ins_stall_if_needed():
-    """Replace this process when early sensor subscription never activates."""
-    global ins_stall_restart_exhausted_logged
-
-    if first_ins_ready or test_start_received_ts is None:
-        return False
-
-    start_age = time.time() - test_start_received_ts
-    if start_age < INS_STALL_RESTART_SECONDS:
-        return False
-    if ins_stall_restart_count >= INS_STALL_RESTART_MAX_ATTEMPTS:
-        if not ins_stall_restart_exhausted_logged:
-            ins_stall_restart_exhausted_logged = True
-            print(
-                "[startup-restart][FATAL] first INS is still unavailable; "
-                f"automatic restart limit reached "
-                f"count={ins_stall_restart_count}/"
-                f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
-            )
-        return False
-
-    next_count = ins_stall_restart_count + 1
-    print(
-        "[startup-restart] no valid INS after start; "
-        f"age={start_age:.1f}s restarting run.py automatically "
-        f"attempt={next_count}/"
-        f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
-    )
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.environ["E2E_INS_STALL_RESTART_COUNT"] = str(next_count)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-    return True
-
-
 def hold_until_ego_ready():
     global last_ego_hold_warn_ts
 
@@ -1233,11 +1184,9 @@ def hold_until_ego_ready():
         )
         print(
             "[startup][WAIT] waiting for first valid INS "
-            f"start_age={start_age:.1f}s "
-            f"auto_restarts={ins_stall_restart_count}/"
-            f"{INS_STALL_RESTART_MAX_ATTEMPTS}"
+            f"start_age={start_age:.1f}s; "
+            "single subscription remains active"
         )
-    restart_after_ins_stall_if_needed()
     send_control_cmd(0.0, 0.0, 0.0)
     return True
 
@@ -1719,7 +1668,6 @@ def get_prepare():
     global last_gt_planning_timestamp
     global current_expected_speed
     global test_start_received_ts
-    global ins_stall_restart_exhausted_logged
 
     ret, msg = prepare_channel.get()
     if msg is None:
@@ -1737,7 +1685,6 @@ def get_prepare():
         first_control_sent = False
         first_control_sent_ts = None
         test_start_received_ts = None
-        ins_stall_restart_exhausted_logged = False
         recv_prepare = True
         data = libMulticastNetwork.getMessageData(msg)
         prepare_msg = ActorPrepare()
@@ -2731,7 +2678,6 @@ def process_notify():
     global last_rule_plan_wall_time
     global last_control_wall_time
     global test_start_received_ts
-    global ins_stall_restart_exhausted_logged
     ret, msg = notify_channel.get()
     if msg is None:
         return
@@ -2765,7 +2711,6 @@ def process_notify():
             start_test = False
             recv_prepare = False
             test_start_received_ts = None
-            ins_stall_restart_exhausted_logged = False
             plan_start_check_remaining = 0
             plan_start_check_xy = None
             plan_start_check_map = ""
@@ -2804,7 +2749,6 @@ def process_notify():
             print("start session")
             start_test = True
             test_start_received_ts = time.time()
-            ins_stall_restart_exhausted_logged = False
             model.start = 1
             # DriveSim holds the chassis brake while a prepared scenario is
             # waiting to start.  Publish a neutral command immediately when
@@ -2897,8 +2841,6 @@ def get_vehicle_pose():
     global first_ins_ready
     global first_ins_ready_ts
     global last_drive_ins_debug_ts
-    global ins_stall_restart_count
-    global ins_stall_restart_exhausted_logged
     ins = ins_channel.get_ins()
     # print(ins.sequence_num)
     if ins.sequence_num == 0 or ins.sequence_num > 1000000:
@@ -2936,9 +2878,6 @@ def get_vehicle_pose():
     if not first_ins_ready:
         first_ins_ready = True
         first_ins_ready_ts = time.time()
-        ins_stall_restart_count = 0
-        ins_stall_restart_exhausted_logged = False
-        os.environ.pop("E2E_INS_STALL_RESTART_COUNT", None)
         print(
             "[prepare-timing] first_ins_ready "
             f"wall_time={first_ins_ready_ts:.3f} "
@@ -2964,33 +2903,7 @@ def get_vehicle_pose():
         )
 
 
-def ins_receiver_loop():
-    """Receive INS independently from point-cloud inference."""
-    print("[ins-thread] receiver started")
-    while not ins_receiver_stop_event.is_set():
-        # The gate is installed only after ActorPrepare has reset all episode
-        # state. Do not publish stale samples between episodes.
-        if not recv_prepare or ins_start_gate_xy is None:
-            ins_receiver_stop_event.wait(0.005)
-            continue
-        try:
-            get_vehicle_pose()
-            # get_ins() is non-blocking on some channel implementations.
-            # Avoid a busy loop while retaining sub-frame receive latency.
-            ins_receiver_stop_event.wait(0.001)
-        except Exception as exc:
-            print(f"[ins-thread][WARN] receive/update failed: {exc}")
-            ins_receiver_stop_event.wait(0.01)
         #这个地方可能会缓存上回合遗留的自车位置信息。
-
-def start_ins_receiver_thread():
-    thread = threading.Thread(
-        target=ins_receiver_loop,
-        name="ins-receiver",
-        daemon=True,
-    )
-    thread.start()
-    return thread
 
 def abort_test():
     global session_id
@@ -3020,73 +2933,36 @@ def create_runtime_channels(
     retry_interval=1.0,
     startup_timeout=0.0,
 ):
-    """Create channels once, replacing the process before a retry.
-
-    The native library is not safe to initialise repeatedly in one process.
-    When daemon/config-center startup races this script, exec the same command
-    again after a delay. A timeout of zero keeps trying indefinitely.
-    """
+    """Create the native channel set exactly once, matching run_ori.py."""
+    del retry_interval, startup_timeout
     required_names = set(required_names)
-    retry_interval = max(0.1, float(retry_interval))
-    startup_timeout = max(0.0, float(startup_timeout))
-    attempt = int(
-        os.environ.get("E2E_CHANNEL_STARTUP_ATTEMPT", "0")
-    ) + 1
-    started_at = float(
-        os.environ.get("E2E_CHANNEL_STARTUP_STARTED_AT", time.time())
-    )
     channels = libMulticastNetwork.ChannelPtrVector()
     channel_map = {}
-    ret = None
-    error = None
     try:
         ret = libMulticastNetwork.create_channels(param, channels)
-        # SWIG builds return 0, None, or an empty proxy on success.
-        # Match the original library usage: any false-like value means
-        # success.
-        if not ret:
-            for channel in channels:
-                channel_map[channel.name()] = channel
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-
-    missing = sorted(required_names.difference(channel_map))
-    elapsed = max(0.0, time.time() - started_at)
-    if not ret and not missing:
-        print(
-            "[channel-startup] ready "
-            f"attempt={attempt} elapsed={elapsed:.1f}s "
-            f"channels={','.join(sorted(channel_map))}"
-        )
-        os.environ.pop("E2E_CHANNEL_STARTUP_ATTEMPT", None)
-        os.environ.pop("E2E_CHANNEL_STARTUP_STARTED_AT", None)
-        # Keep the owning vector alive as well as the individual SWIG
-        # channel wrappers. Some libMulticastNetwork builds tie wrapper
-        # lifetime to the vector returned by create_channels().
-        return channels, channel_map
-
-    detail = (
-        f"exception={error}"
-        if error is not None
-        else f"ret={ret!r} missing={','.join(missing) or '-'}"
-    )
-    if startup_timeout > 0.0 and elapsed >= startup_timeout:
         raise RuntimeError(
-            "multicast channels did not become ready within "
-            f"{startup_timeout:.1f}s ({detail})"
+            "single multicast channel creation raised "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if ret:
+        raise RuntimeError(
+            f"single multicast channel creation failed: ret={ret!r}"
+        )
+    for channel in channels:
+        channel_map[channel.name()] = channel
+    missing = sorted(required_names.difference(channel_map))
+    if missing:
+        raise RuntimeError(
+            "single multicast channel creation returned an incomplete set: "
+            f"missing={','.join(missing)} "
+            f"available={','.join(sorted(channel_map)) or '-'}"
         )
     print(
-        "[channel-startup][WAIT] daemon/config center not ready; "
-        f"attempt={attempt} elapsed={elapsed:.1f}s {detail}; "
-        f"restart_in={retry_interval:.1f}s"
+        "[channel-startup] ready single_create=true "
+        f"channels={','.join(sorted(channel_map))}"
     )
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.environ["E2E_CHANNEL_STARTUP_ATTEMPT"] = str(attempt)
-    os.environ["E2E_CHANNEL_STARTUP_STARTED_AT"] = str(started_at)
-    time.sleep(retry_interval)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-    raise RuntimeError("failed to replace process for channel startup retry")
+    return channels, channel_map
 
 
 def main():
@@ -3122,6 +2998,11 @@ def main():
             map_ready = False
             time.sleep(0.1)
             continue
+        # Match run_ori.py's single-consumer message model: INS is read by
+        # the main loop after NT_START_TEST, never by a parallel receiver
+        # thread. This keeps one native subscriber and one deterministic
+        # get_ins() call sequence for the lifetime of the process.
+        get_vehicle_pose()
         if hold_until_ego_ready():
             drain_sensor_queues()
             get_vehicle_feedback()
@@ -3185,15 +3066,18 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help=(
-            "seconds to wait for daemon/config center and all multicast "
-            "channels; 0 waits forever (default)"
+            "deprecated compatibility option; channel creation is attempted "
+            "once, matching run_ori.py"
         ),
     )
     arg_parser.add_argument(
         "--channel-retry-interval",
         type=float,
         default=1.0,
-        help="seconds between multicast channel startup attempts (default: 1)",
+        help=(
+            "deprecated compatibility option; automatic channel retries "
+            "are disabled"
+        ),
     )
     arg_parser.add_argument(
         "--max_speed",
@@ -4640,12 +4524,9 @@ if __name__ == "__main__":
     )
     pre_map_name = None
     map_name = None
-    ins_receiver_thread = start_ins_receiver_thread()
     try:
         main()
     finally:
-        ins_receiver_stop_event.set()
-        ins_receiver_thread.join(timeout=1.0)
         model.close()
         if drive_trace_logger is not None:
             drive_trace_logger.close()
