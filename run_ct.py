@@ -11,6 +11,7 @@ import math
 import os
 import runpy
 import sys
+import time
 
 import numpy as np
 
@@ -153,6 +154,17 @@ def _ct_parser():
         ),
     )
     parser.add_argument(
+        "--ct-channel-settle-duration",
+        type=float,
+        default=float(
+            os.environ.get("CT_CHANNEL_SETTLE_DURATION", "8.0")
+        ),
+        help=(
+            "wait before the one native create_channels call so daemon and "
+            "LinuxNoEditor registrations can settle (default: 8.0)"
+        ),
+    )
+    parser.add_argument(
         "--ct-help",
         action="store_true",
         help="show run_ct.py-specific options and exit",
@@ -211,6 +223,13 @@ def _validate_ct_args(parser, args):
                 f"--{name.replace('_', '-')} must be finite and "
                 "greater than zero"
             )
+    if (
+        not math.isfinite(args.ct_channel_settle_duration)
+        or args.ct_channel_settle_duration < 0.0
+    ):
+        parser.error(
+            "--ct-channel-settle-duration must be finite and non-negative"
+        )
 
 
 def _has_option(arguments, *names):
@@ -750,6 +769,11 @@ def main():
     # nor PointPillars and always supplies an empty obstacle set.
     forwarded.extend(["--perception_source", "none"])
     os.environ["E2E_NPC_TRUTH_ENABLED"] = "0"
+    # DriveSim's synchronous get_ins() occasionally interleaves a cached
+    # sequence-1 sample from another field/session after current sequence
+    # numbers have advanced. Holding the last accepted pose prevents those
+    # stale samples from alternating SPRINT and emergency STOP.
+    os.environ["E2E_INS_MONOTONIC_SEQUENCE"] = "1"
 
     print(
         "[ct-score] isolated scoring entrypoint active "
@@ -769,8 +793,16 @@ def main():
         f"{ct_args.ct_straight_max_lateral_accel:.3f}m/s2 "
         f"straight_lat_jerk="
         f"{ct_args.ct_straight_max_lateral_jerk:.3f}m/s3 "
-        "background_vehicles=IGNORED gt_subscription=DISABLED"
+        "background_vehicles=IGNORED gt_subscription=DISABLED "
+        "ins_sequence_filter=MONOTONIC"
     )
+    if ct_args.ct_channel_settle_duration > 0.0:
+        print(
+            "[ct-startup][WAIT] allowing daemon/LinuxNoEditor channel "
+            "registrations to settle before the single native channel "
+            f"creation; wait={ct_args.ct_channel_settle_duration:.1f}s"
+        )
+        time.sleep(ct_args.ct_channel_settle_duration)
     run_path = os.path.join(os.path.dirname(__file__), "run.py")
     sys.argv = [run_path] + forwarded
     runpy.run_path(run_path, run_name="__main__")

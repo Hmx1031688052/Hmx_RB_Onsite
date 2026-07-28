@@ -231,6 +231,11 @@ last_ins_sequence = None
 last_ins_position = None
 duplicate_ins_count = 0
 last_duplicate_ins_warn_ts = 0.0
+ins_monotonic_sequence_enabled = (
+    os.environ.get("E2E_INS_MONOTONIC_SEQUENCE", "0") == "1"
+)
+nonmonotonic_ins_count = 0
+last_nonmonotonic_ins_warn_ts = 0.0
 invalid_ins_count = 0
 last_invalid_ins_warn_ts = 0.0
 map_loading = False
@@ -850,6 +855,42 @@ def _warn_duplicate_ins(sequence, xy):
         f"seq={sequence} repeats={duplicate_ins_count} pos={pos_text}; "
         "sequence and position are unchanged, likely stale sample from previous cycle"
     )
+
+
+def _warn_nonmonotonic_ins(sequence, xy):
+    global last_nonmonotonic_ins_warn_ts
+
+    now = time.time()
+    if now - last_nonmonotonic_ins_warn_ts < 1.0:
+        return
+    last_nonmonotonic_ins_warn_ts = now
+    pos_text = (
+        "unknown"
+        if xy is None
+        else f"({xy[0]:.3f}, {xy[1]:.3f})"
+    )
+    print(
+        "[ins][WARN] non-monotonic INS sample ignored "
+        f"seq={sequence} accepted_high_water={last_ins_sequence} "
+        f"count={nonmonotonic_ins_count} pos={pos_text}; "
+        "the current episode pose is held"
+    )
+
+
+def should_reject_nonmonotonic_ins(ins_sequence, ins_xy):
+    global nonmonotonic_ins_count
+
+    if (
+        not ins_monotonic_sequence_enabled
+        or last_ins_sequence is None
+        or int(ins_sequence) > int(last_ins_sequence)
+    ):
+        nonmonotonic_ins_count = 0
+        return False
+
+    nonmonotonic_ins_count += 1
+    _warn_nonmonotonic_ins(ins_sequence, ins_xy)
+    return True
 
 
 def _ins_attr_float(ins, object_name, attr_name):
@@ -1653,6 +1694,8 @@ def get_prepare():
     global last_ins_position
     global duplicate_ins_count
     global last_duplicate_ins_warn_ts
+    global nonmonotonic_ins_count
+    global last_nonmonotonic_ins_warn_ts
     global invalid_ins_count
     global last_invalid_ins_warn_ts
     global ins_start_gate_xy
@@ -1717,6 +1760,8 @@ def get_prepare():
         last_ins_position = None
         duplicate_ins_count = 0
         last_duplicate_ins_warn_ts = 0.0
+        nonmonotonic_ins_count = 0
+        last_nonmonotonic_ins_warn_ts = 0.0
         invalid_ins_count = 0
         last_invalid_ins_warn_ts = 0.0
         reset_ins_start_gate()
@@ -2670,6 +2715,8 @@ def process_notify():
     global last_ins_position
     global duplicate_ins_count
     global last_duplicate_ins_warn_ts
+    global nonmonotonic_ins_count
+    global last_nonmonotonic_ins_warn_ts
     global invalid_ins_count
     global last_invalid_ins_warn_ts
     global ins_start_gate_xy
@@ -2720,6 +2767,8 @@ def process_notify():
             last_ins_position = None
             duplicate_ins_count = 0
             last_duplicate_ins_warn_ts = 0.0
+            nonmonotonic_ins_count = 0
+            last_nonmonotonic_ins_warn_ts = 0.0
             invalid_ins_count = 0
             last_invalid_ins_warn_ts = 0.0
             reset_ins_start_gate()
@@ -2856,6 +2905,8 @@ def get_vehicle_pose():
 
     invalid_ins_count = 0
     if should_reject_pre_first_ins(ins_sequence, ins_xy):
+        return
+    if should_reject_nonmonotonic_ins(ins_sequence, ins_xy):
         return
 
     if (
