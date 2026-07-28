@@ -41,8 +41,26 @@ def _ct_parser():
         type=float,
         default=float(os.environ.get("CT_PULSE_DURATION", "0.03")),
         help=(
-            "fixed acceleration pulse time in seconds; 0.03 matches one "
-            "DriveSim interval (default: 0.03)"
+            "minimum acceleration publication time before speed feedback may "
+            "acknowledge the boost (default: 0.03)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-boost-ack-speed",
+        type=float,
+        default=float(os.environ.get("CT_BOOST_ACK_SPEED", "5.0")),
+        help=(
+            "measured ego speed that confirms DriveSim consumed the boost, "
+            "in m/s (default: 5.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-boost-max-duration",
+        type=float,
+        default=float(os.environ.get("CT_BOOST_MAX_DURATION", "0.30")),
+        help=(
+            "maximum boost publication time if no speed acknowledgement is "
+            "received, in seconds (default: 0.30)"
         ),
     )
     parser.add_argument(
@@ -126,6 +144,22 @@ def _validate_ct_args(parser, args):
         parser.error("--ct-pulse-duration must be at least 0.01 seconds")
     if not math.isfinite(args.ct_accel) or args.ct_accel <= 0.0:
         parser.error("--ct-accel must be finite and greater than zero")
+    if (
+        not math.isfinite(args.ct_boost_ack_speed)
+        or args.ct_boost_ack_speed <= args.ct_alignment_speed
+    ):
+        parser.error(
+            "--ct-boost-ack-speed must be finite and greater than "
+            "--ct-alignment-speed"
+        )
+    if (
+        not math.isfinite(args.ct_boost_max_duration)
+        or args.ct_boost_max_duration < args.ct_pulse_duration
+    ):
+        parser.error(
+            "--ct-boost-max-duration must be finite and no shorter than "
+            "--ct-pulse-duration"
+        )
     for name in (
         "ct_alignment_speed",
         "ct_alignment_accel",
@@ -273,7 +307,7 @@ def _install_score_config(ct_args):
     rule_based_planner.RuleBasedPlanner = CtRuleBasedPlanner
 
     class CtStableController(base_controller):
-        """Low-speed line alignment followed by one fixed boost pulse."""
+        """Low-speed line alignment followed by an acknowledged boost."""
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -292,11 +326,10 @@ def _install_score_config(ct_args):
             self._reset_ct_alignment()
 
         def control(self, *args, **kwargs):
-            # Once moving alignment has completed, pulse duration is governed
-            # only by CT simulation time. Temporarily disable the base
-            # controller's INS-speed acknowledgement so an already-moving
-            # vehicle cannot collapse a 30 ms pulse to one 20 ms publication.
-            force_fixed_pulse = (
+            # The base acknowledgement threshold (0.1 m/s) is already met by
+            # moving alignment. Disable it here and acknowledge only after
+            # the measured speed proves that DriveSim consumed the boost.
+            wait_for_boost_ack = (
                 self.ct_alignment_complete
                 and not self.sprint_pulse_acknowledged
             )
@@ -306,7 +339,7 @@ def _install_score_config(ct_args):
             )
             if not self.ct_alignment_complete:
                 self.config.sprint_alignment_duration = float("inf")
-            if force_fixed_pulse:
+            if wait_for_boost_ack:
                 self.config.sprint_pulse_ack_speed = float("inf")
             try:
                 output = super().control(*args, **kwargs)
@@ -458,22 +491,61 @@ def _install_score_config(ct_args):
                     )
                 return output
 
-            if (
+            ego = args[0] if args else kwargs.get("ego")
+            try:
+                ego_speed = max(
+                    0.0, float(getattr(ego, "speed", 0.0))
+                )
+            except (TypeError, ValueError):
+                ego_speed = 0.0
+            minimum_elapsed = (
+                self.sprint_pulse_elapsed
+                >= self.config.sprint_pulse_min_duration - 1e-9
+            )
+            speed_acknowledged = (
+                minimum_elapsed
+                and ego_speed >= ct_args.ct_boost_ack_speed
+            )
+            boost_timed_out = (
                 self.sprint_phase == "PULSE"
                 and self.sprint_pulse_elapsed
-                >= self.config.sprint_pulse_min_duration - 1e-9
+                >= ct_args.ct_boost_max_duration - 1e-9
+            )
+            if (
+                self.sprint_phase == "PULSE"
+                and (speed_acknowledged or boost_timed_out)
             ):
-                # The normal controller waits for delayed INS speed feedback
-                # and can repeat a nominal 20 ms pulse for hundreds of
-                # milliseconds. CT mode deliberately limits the violation to
-                # the configured simulation-time window.
                 self.sprint_pulse_acknowledged = True
-                self.last_debug["ct_fixed_pulse_end"] = True
-                print(
-                    "[ct-score] fixed acceleration pulse completed "
-                    f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
-                    "next control is COAST without waiting for INS ack"
+                self.sprint_phase = "COAST"
+                output.acc = 0.0
+                self.last_acc = 0.0
+                self.last_debug.update(
+                    {
+                        "sprint_phase": self.sprint_phase,
+                        "sprint_pulse_acknowledged": True,
+                        "sprint_accel_pulse_active": False,
+                        "output_acc": 0.0,
+                        "ct_boost_speed_acknowledged": (
+                            speed_acknowledged
+                        ),
+                        "ct_boost_timed_out": boost_timed_out,
+                        "ct_boost_feedback_speed": ego_speed,
+                    }
                 )
+                if speed_acknowledged:
+                    print(
+                        "[ct-score] boost acknowledged by chassis "
+                        f"ego_v={ego_speed:.3f}m/s "
+                        f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
+                        "entering COAST"
+                    )
+                else:
+                    print(
+                        "[ct-score][WARN] boost acknowledgement timeout "
+                        f"ego_v={ego_speed:.3f}m/s "
+                        f"elapsed={self.sprint_pulse_elapsed:.3f}s; "
+                        "stopping acceleration publication"
+                    )
             return output
 
     CtStableController.__name__ = "CtStableController"
@@ -545,6 +617,8 @@ def main():
         f"speed_factor={ct_args.ct_speed_factor:.3f} "
         f"alignment={ct_args.ct_alignment_duration:.3f}s "
         f"pulse={ct_args.ct_pulse_duration:.3f}s "
+        f"boost_ack_speed={ct_args.ct_boost_ack_speed:.3f}m/s "
+        f"boost_max={ct_args.ct_boost_max_duration:.3f}s "
         f"accel={ct_args.ct_accel:.1f}m/s2 "
         f"alignment_speed={ct_args.ct_alignment_speed:.3f}m/s "
         f"alignment_jerk={ct_args.ct_alignment_jerk:.3f}m/s3 "
