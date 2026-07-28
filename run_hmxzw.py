@@ -25,6 +25,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 
 # The onsite SDK keeps the generated ``chassis`` and ``main`` protobuf
 # packages beside Hmx_RB_Onsite. When this file is launched as
@@ -102,6 +107,39 @@ from main.proto.messages_pb2 import (
 
 TASK_TIMEOUT_RESTART_EXIT_CODE = 75
 SIMULATOR_STALL_RESTART_EXIT_CODE = 76
+SUPERVISOR_LOCK_PATH = Path("/tmp/run_hmxzw-supervisor.lock")
+
+
+def acquire_supervisor_lock():
+    """Prevent two supervisors from competing for daemon/DriverSim."""
+    if fcntl is None:
+        return None
+    lock_file = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(
+            lock_file.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        print(
+            "[run3][supervisor][FATAL] another supervisor is already "
+            f"running pid={owner}; refuse duplicate startup",
+            flush=True,
+        )
+        return False
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    print(
+        "[run3][supervisor] singleton lock acquired "
+        f"pid={os.getpid()} path={SUPERVISOR_LOCK_PATH}",
+        flush=True,
+    )
+    return lock_file
 
 
 def wrap_angle(angle):
@@ -558,6 +596,9 @@ class Run3:
                 return
             self.started = True
             self.test_started_monotonic = time.monotonic()
+            # Do not count an INS received before START as proof that the
+            # newly loaded scene is alive.
+            self.last_ins_monotonic = None
             print(
                 "[run3][notify] START "
                 f"session={self.session_id} role={self.role_id} "
@@ -735,23 +776,27 @@ class Run3:
         ):
             return
         elapsed = time.monotonic() - self.test_started_monotonic
+        waiting_for_first_ins = self.last_ins_monotonic is None
         last_ins_time = (
             self.test_started_monotonic
-            if self.last_ins_monotonic is None
-            else max(
-                self.test_started_monotonic,
-                self.last_ins_monotonic,
-            )
+            if waiting_for_first_ins
+            else self.last_ins_monotonic
         )
         ins_silence = time.monotonic() - last_ins_time
+        active_ins_timeout = (
+            self.args.first_ins_timeout
+            if waiting_for_first_ins
+            else self.args.ins_stall_timeout
+        )
         if (
-            self.args.ins_stall_timeout > 0.0
-            and ins_silence >= self.args.ins_stall_timeout
+            active_ins_timeout > 0.0
+            and ins_silence >= active_ins_timeout
         ):
             print(
-                "[run3][WATCHDOG] INS stalled "
+                "[run3][WATCHDOG] "
+                f"{'first INS timeout' if waiting_for_first_ins else 'INS stalled'} "
                 f"for {ins_silence:.3f}s "
-                f"(limit={self.args.ins_stall_timeout:.1f}s); "
+                f"(limit={active_ins_timeout:.1f}s); "
                 f"session={self.session_id}; "
                 "restart DriverSim and runtime",
                 flush=True,
@@ -910,8 +955,20 @@ def parse_args():
     parser.add_argument(
         "--simulator-ready-delay",
         type=float,
-        default=6.0,
-        help="wait after DriverSim start before launching runtime (default: 6)",
+        default=2.0,
+        help=(
+            "wait for runtime daemon registration before DriverSim start "
+            "(default: 2)"
+        ),
+    )
+    parser.add_argument(
+        "--first-ins-timeout",
+        type=float,
+        default=15.0,
+        help=(
+            "allow map loading this long for the first post-START INS; "
+            "<=0 disables (default: 15)"
+        ),
     )
     parser.add_argument(
         "--ins-stall-timeout",
@@ -1084,31 +1141,12 @@ def supervise_runtime(args):
                     args.simulator_dir,
                     reason="before_start",
                 )
-                simulator = _start_managed_simulator(args)
-                ready_delay = max(
-                    0.0, float(args.simulator_ready_delay)
-                )
-                ready_deadline = time.monotonic() + ready_delay
-                while time.monotonic() < ready_deadline:
-                    simulator_code = simulator.poll()
-                    if simulator_code is not None:
-                        print(
-                            "[run3][supervisor] DriverSim exited during "
-                            f"startup code={simulator_code}",
-                            flush=True,
-                        )
-                        break
-                    time.sleep(0.2)
-                if simulator.poll() is not None:
-                    restart_count += 1
-                    time.sleep(max(0.0, float(args.restart_delay)))
-                    simulator = None
-                    continue
 
             print(
                 "[run3][supervisor] start runtime "
                 f"attempt={restart_count + 1} "
                 f"task_timeout={args.task_timeout:.1f}s "
+                f"first_ins_timeout={args.first_ins_timeout:.1f}s "
                 f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
                 flush=True,
             )
@@ -1116,6 +1154,26 @@ def supervise_runtime(args):
                 child_argv,
                 start_new_session=True,
             )
+
+            if not args.no_manage_simulator:
+                registration_delay = max(
+                    0.0, float(args.simulator_ready_delay)
+                )
+                print(
+                    "[run3][supervisor] wait for runtime daemon "
+                    f"registration delay={registration_delay:.1f}s",
+                    flush=True,
+                )
+                registration_deadline = (
+                    time.monotonic() + registration_delay
+                )
+                while time.monotonic() < registration_deadline:
+                    if runtime.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                if runtime.poll() is None:
+                    simulator = _start_managed_simulator(args)
+
             restart_reason = None
             return_code = None
             while restart_reason is None:
@@ -1193,6 +1251,9 @@ def main():
     try:
         args = parse_args()
         if not args.runtime_child:
+            supervisor_lock = acquire_supervisor_lock()
+            if supervisor_lock is False:
+                raise SystemExit(2)
             raise SystemExit(supervise_runtime(args))
         Run3(args).run()
     except KeyboardInterrupt:
