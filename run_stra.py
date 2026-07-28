@@ -7,7 +7,7 @@
 1. 使用 ActorPrepare 中给出的真实起点和终点；
 2. 规划参考线仅为“起点 -> 终点”的直线；
 3. 忽略道路中心线、全局路径和旁车；
-4. 从有效控制开始持续给出 2.0 m/s^2 的正加速度；
+4. 从有效控制开始持续给出云端安全的 0.8 m/s^2 正加速度；
 5. 到达终点前不主动减速、不制动。
 
 说明：
@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 
-CONSTANT_ACCEL_MPS2 = 2.0
+CONSTANT_ACCEL_MPS2 = 0.8
 SPRINT_SPEED_FACTOR = 1.19
 
 
