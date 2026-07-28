@@ -239,6 +239,17 @@ def _ct_parser():
         ),
     )
     parser.add_argument(
+        "--ct-ins-start-gate-tolerance",
+        type=float,
+        default=float(
+            os.environ.get("CT_INS_START_GATE_TOLERANCE", "3.0")
+        ),
+        help=(
+            "maximum distance from ActorPrepare init_state for the first "
+            "accepted INS, in metres (default: 3.0)"
+        ),
+    )
+    parser.add_argument(
         "--ct-first-prepare-timeout",
         type=float,
         default=float(
@@ -358,6 +369,14 @@ def _validate_ct_args(parser, args):
     ):
         parser.error(
             "--ct-first-ins-timeout must be finite and greater than zero"
+        )
+    if (
+        not math.isfinite(args.ct_ins_start_gate_tolerance)
+        or args.ct_ins_start_gate_tolerance <= 0.0
+    ):
+        parser.error(
+            "--ct-ins-start-gate-tolerance must be finite and "
+            "greater than zero"
         )
     if (
         not math.isfinite(args.ct_first_prepare_timeout)
@@ -599,6 +618,18 @@ def _install_score_config(ct_args):
                 )
             if not bool(self.last_debug.get("sprint_mode", False)):
                 self._reset_ct_alignment()
+                # CT has no non-sprint driving policy. In particular, never
+                # preserve the previous 42-degree alignment command when the
+                # planner temporarily returns STOP or no trajectory.
+                output.steer = 0.0
+                self.last_steer = 0.0
+                self.filtered_steer = 0.0
+                self.last_debug.update(
+                    {
+                        "output_steer": 0.0,
+                        "ct_non_sprint_wheel_centered": True,
+                    }
+                )
                 return output
 
             dt = max(
@@ -1158,6 +1189,10 @@ def main():
     os.environ["E2E_FIRST_INS_TIMEOUT"] = str(
         ct_args.ct_first_ins_timeout
     )
+    os.environ["E2E_INS_START_GATE_ENABLED"] = "1"
+    os.environ["E2E_INS_START_GATE_TOL"] = str(
+        ct_args.ct_ins_start_gate_tolerance
+    )
     runtime_attempt = int(os.environ.get("CT_RUNTIME_ATTEMPT", "0"))
     os.environ["E2E_FIRST_PREPARE_TIMEOUT"] = (
         str(ct_args.ct_first_prepare_timeout)
@@ -1197,6 +1232,8 @@ def main():
         f"prepare_resend="
         f"{ct_args.ct_prepare_resend_interval:.1f}s "
         f"first_ins_timeout={ct_args.ct_first_ins_timeout:.1f}s "
+        f"ins_start_gate="
+        f"{ct_args.ct_ins_start_gate_tolerance:.1f}m "
         "background_vehicles=IGNORED gt_subscription=DISABLED "
         "ins_sequence_filter=MONOTONIC"
     )
