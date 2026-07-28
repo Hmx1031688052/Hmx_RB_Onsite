@@ -976,6 +976,27 @@ def _path_is_within(path, root):
         return False
 
 
+def _find_driver_sim_pids(simulator_dir):
+    """Return actual DriverSim PIDs, ignoring the short-lived start.sh."""
+    if os.name != "posix":
+        return []
+
+    simulator_root = Path(simulator_dir).expanduser().resolve()
+    driver_pids = []
+    for proc_dir in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(proc_dir.name)
+            exe_path = Path(os.readlink(proc_dir / "exe"))
+        except (ValueError, OSError):
+            continue
+        if (
+            exe_path.name.lower().startswith("driversim")
+            and _path_is_within(exe_path, simulator_root)
+        ):
+            driver_pids.append(pid)
+    return sorted(driver_pids)
+
+
 def _kill_simulator_residuals(simulator_dir, reason):
     """SIGKILL detached DriverSim/crash-window processes under one build."""
     if os.name != "posix":
@@ -1090,20 +1111,34 @@ def supervise_runtime(args):
                 )
                 ready_deadline = time.monotonic() + ready_delay
                 while time.monotonic() < ready_deadline:
-                    simulator_code = simulator.poll()
-                    if simulator_code is not None:
-                        print(
-                            "[run3][supervisor] DriverSim exited during "
-                            f"startup code={simulator_code}",
-                            flush=True,
-                        )
-                        break
                     time.sleep(0.2)
-                if simulator.poll() is not None:
+
+                driver_pids = _find_driver_sim_pids(
+                    args.simulator_dir
+                )
+                if not driver_pids:
+                    launcher_code = simulator.poll()
+                    print(
+                        "[run3][supervisor] DriverSim process not found "
+                        f"after startup wait; launcher_code={launcher_code}",
+                        flush=True,
+                    )
+                    _terminate_managed_process(
+                        simulator, "DriverSim launcher"
+                    )
+                    _kill_simulator_residuals(
+                        args.simulator_dir,
+                        reason="startup_process_missing",
+                    )
                     restart_count += 1
                     time.sleep(max(0.0, float(args.restart_delay)))
                     simulator = None
                     continue
+                print(
+                    "[run3][supervisor] DriverSim process ready "
+                    f"pids={driver_pids} launcher_code={simulator.poll()}",
+                    flush=True,
+                )
 
             print(
                 "[run3][supervisor] start runtime "
@@ -1131,13 +1166,10 @@ def supervise_runtime(args):
                     else:
                         break
                 if (
-                    simulator is not None
-                    and simulator.poll() is not None
+                    not args.no_manage_simulator
+                    and not _find_driver_sim_pids(args.simulator_dir)
                 ):
-                    restart_reason = (
-                        "simulator_exit_"
-                        f"{simulator.returncode}"
-                    )
+                    restart_reason = "simulator_process_missing"
                 if restart_reason is None and return_code is None:
                     time.sleep(0.2)
         except KeyboardInterrupt:
