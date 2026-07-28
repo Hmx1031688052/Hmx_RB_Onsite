@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 
-CONSTANT_ACCEL_MPS2 = 2000.0
+CONSTANT_ACCEL_MPS2 = 2.5
 SPRINT_SPEED_FACTOR = 1.19
 
 
