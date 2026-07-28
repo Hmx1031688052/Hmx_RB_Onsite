@@ -1743,6 +1743,36 @@ def prepare(result=True):
     )
 
 
+def publish_first_control_before_prepare():
+    """Put one neutral control frame on the wire before PrepareResult."""
+    global first_control_sent
+    global first_control_sent_ts
+
+    if first_control_sent:
+        return True
+
+    control_speed = startup_hold_speed()
+    ret = _put_control_cmd(0.0, control_speed, 0.0)
+    if ret != 0:
+        print(
+            "[prepare-timing][WAIT] first control publish failed; "
+            "PrepareResult remains inhibited",
+            flush=True,
+        )
+        return False
+
+    first_control_sent = True
+    first_control_sent_ts = time.time()
+    print(
+        "[prepare-timing] first_control_sent "
+        f"wall_time={first_control_sent_ts:.3f} "
+        "phase=before_prepare_result "
+        f"acc=0.000m/s2 speed={control_speed:.3f}m/s steer=0.000deg",
+        flush=True,
+    )
+    return True
+
+
 def should_send_prepare_result(now=None):
     if prepare_sent_ts is None:
         return True
@@ -3473,6 +3503,9 @@ def main():
                     continue
             now = time.time()
             if should_send_prepare_result(now):
+                if not publish_first_control_before_prepare():
+                    time.sleep(0.03)
+                    continue
                 prepare()
                 pre_map_name = map_name
             time.sleep(0.1)
