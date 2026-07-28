@@ -1072,13 +1072,17 @@ def _start_managed_simulator(args):
         errors="replace",
         bufsize=1,
     )
-    startup_failure = threading.Event()
+    simulator_failure = threading.Event()
+    failure_state = {"reason": None}
 
     def forward_simulator_output():
         failure_markers = (
-            "登录失败",
-            "http request failed",
-            "channels info is empty",
+            ("登录失败", "login_failure"),
+            ("http request failed", "login_failure"),
+            ("channels info is empty", "login_failure"),
+            ("fatal error:", "fatal_error"),
+            ("crashreportclientversion=", "crash_report"),
+            ("crashreportcorelog:", "crash_report"),
         )
         output = process.stdout
         if output is None:
@@ -1086,20 +1090,26 @@ def _start_managed_simulator(args):
         for line in output:
             print(line, end="", flush=True)
             lowered = line.lower()
-            if any(marker.lower() in lowered for marker in failure_markers):
-                startup_failure.set()
-                print(
-                    "[run3][supervisor] DriverSim network/login "
-                    "failure detected from log",
-                    flush=True,
-                )
+            for marker, reason in failure_markers:
+                if marker.lower() not in lowered:
+                    continue
+                if not simulator_failure.is_set():
+                    failure_state["reason"] = reason
+                    simulator_failure.set()
+                    print(
+                        "[run3][supervisor] DriverSim failure "
+                        f"detected from log reason={reason} "
+                        f"marker={marker!r}",
+                        flush=True,
+                    )
+                break
 
     threading.Thread(
         target=forward_simulator_output,
         name="DriverSim-log-monitor",
         daemon=True,
     ).start()
-    return process, startup_failure
+    return process, simulator_failure, failure_state
 
 
 def supervise_runtime(args):
@@ -1112,6 +1122,7 @@ def supervise_runtime(args):
     restart_count = 0
     simulator = None
     simulator_failure = None
+    simulator_failure_state = None
     runtime = None
     while True:
         try:
@@ -1120,7 +1131,11 @@ def supervise_runtime(args):
                     args.simulator_dir,
                     reason="before_start",
                 )
-                simulator, simulator_failure = (
+                (
+                    simulator,
+                    simulator_failure,
+                    simulator_failure_state,
+                ) = (
                     _start_managed_simulator(args)
                 )
                 ready_delay = max(
@@ -1144,7 +1159,8 @@ def supervise_runtime(args):
                     or simulator_failure.is_set()
                 ):
                     startup_reason = (
-                        "simulator_login_failure"
+                        "simulator_"
+                        f"{simulator_failure_state['reason'] or 'log_failure'}"
                         if simulator_failure.is_set()
                         else f"simulator_start_exit_{simulator.returncode}"
                     )
@@ -1170,6 +1186,7 @@ def supervise_runtime(args):
                     time.sleep(restart_delay)
                     simulator = None
                     simulator_failure = None
+                    simulator_failure_state = None
                     continue
 
             print(
@@ -1209,7 +1226,10 @@ def supervise_runtime(args):
                     simulator_failure is not None
                     and simulator_failure.is_set()
                 ):
-                    restart_reason = "simulator_login_failure"
+                    restart_reason = (
+                        "simulator_"
+                        f"{simulator_failure_state['reason'] or 'log_failure'}"
+                    )
                 if restart_reason is None and return_code is None:
                     time.sleep(0.2)
         except KeyboardInterrupt:
@@ -1250,6 +1270,7 @@ def supervise_runtime(args):
         runtime = None
         simulator = None
         simulator_failure = None
+        simulator_failure_state = None
         restart_count += 1
         restart_delay = max(0.0, float(args.restart_delay))
         print(
