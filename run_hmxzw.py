@@ -1081,8 +1081,6 @@ def _start_managed_simulator(args):
             ("http request failed", "login_failure"),
             ("channels info is empty", "login_failure"),
             ("fatal error:", "fatal_error"),
-            ("crashreportclientversion=", "crash_report"),
-            ("crashreportcorelog:", "crash_report"),
         )
         output = process.stdout
         if output is None:
