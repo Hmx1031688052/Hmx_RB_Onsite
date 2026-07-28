@@ -559,6 +559,9 @@ class Run3:
                 return
             self.started = True
             self.test_started_monotonic = time.monotonic()
+            # Pre-START INS must not satisfy the running-simulator health
+            # check. Give map loading its own longer first-frame timeout.
+            self.last_ins_monotonic = None
             print(
                 "[run3][notify] START "
                 f"session={self.session_id} role={self.role_id} "
@@ -736,23 +739,27 @@ class Run3:
         ):
             return
         elapsed = time.monotonic() - self.test_started_monotonic
+        waiting_for_first_ins = self.last_ins_monotonic is None
         last_ins_time = (
             self.test_started_monotonic
-            if self.last_ins_monotonic is None
-            else max(
-                self.test_started_monotonic,
-                self.last_ins_monotonic,
-            )
+            if waiting_for_first_ins
+            else self.last_ins_monotonic
         )
         ins_silence = time.monotonic() - last_ins_time
+        active_ins_timeout = (
+            self.args.first_ins_timeout
+            if waiting_for_first_ins
+            else self.args.ins_stall_timeout
+        )
         if (
-            self.args.ins_stall_timeout > 0.0
-            and ins_silence >= self.args.ins_stall_timeout
+            active_ins_timeout > 0.0
+            and ins_silence >= active_ins_timeout
         ):
             print(
-                "[run3][WATCHDOG] INS stalled "
+                "[run3][WATCHDOG] "
+                f"{'first INS timeout' if waiting_for_first_ins else 'INS stalled'} "
                 f"for {ins_silence:.3f}s "
-                f"(limit={self.args.ins_stall_timeout:.1f}s); "
+                f"(limit={active_ins_timeout:.1f}s); "
                 f"session={self.session_id}; "
                 "restart DriverSim and runtime",
                 flush=True,
@@ -911,8 +918,20 @@ def parse_args():
     parser.add_argument(
         "--simulator-ready-delay",
         type=float,
-        default=6.0,
-        help="wait after DriverSim start before launching runtime (default: 6)",
+        default=2.0,
+        help=(
+            "wait after runtime registration before launching DriverSim "
+            "(default: 2)"
+        ),
+    )
+    parser.add_argument(
+        "--first-ins-timeout",
+        type=float,
+        default=15.0,
+        help=(
+            "allow this long for map loading and the first post-START INS; "
+            "<=0 disables (default: 15)"
+        ),
     )
     parser.add_argument(
         "--ins-stall-timeout",
@@ -966,6 +985,27 @@ def _terminate_managed_process(process, label):
         except ProcessLookupError:
             pass
         process.wait()
+
+
+def _kill_managed_process_now(process, label):
+    if process is None or process.poll() is not None:
+        return
+    print(
+        f"[run3][supervisor] SIGKILL {label} process group "
+        f"pid={process.pid}",
+        flush=True,
+    )
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _path_is_within(path, root):
@@ -1057,7 +1097,10 @@ def _cleanup_managed_stack(args, runtime, simulator, reason):
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         _terminate_managed_process(runtime, "runtime")
-        _terminate_managed_process(simulator, "DriverSim")
+        # Do not offer UE4 a graceful crash path here. SIGTERM can launch
+        # CrashReportClient and leave the visualization alive; killing the
+        # dedicated process group immediately is deterministic.
+        _kill_managed_process_now(simulator, "DriverSim")
         if not args.no_manage_simulator:
             # CrashReportClient can appear shortly after DriverSim dies.
             # Re-scan several times so a late error window cannot survive.
@@ -1158,74 +1201,20 @@ def supervise_runtime(args):
     simulator_failure_state = None
     runtime = None
     while True:
+        restart_reason = None
+        return_code = None
         try:
             if not args.no_manage_simulator:
                 _kill_simulator_residuals(
                     args.simulator_dir,
                     reason="before_start",
                 )
-                (
-                    simulator,
-                    simulator_failure,
-                    simulator_failure_state,
-                ) = (
-                    _start_managed_simulator(args)
-                )
-                ready_delay = max(
-                    0.0, float(args.simulator_ready_delay)
-                )
-                ready_deadline = time.monotonic() + ready_delay
-                while time.monotonic() < ready_deadline:
-                    if simulator_failure.is_set():
-                        break
-                    simulator_code = simulator.poll()
-                    if simulator_code is not None:
-                        print(
-                            "[run3][supervisor] DriverSim exited during "
-                            f"startup code={simulator_code}",
-                            flush=True,
-                        )
-                        break
-                    time.sleep(0.2)
-                if (
-                    simulator.poll() is not None
-                    or simulator_failure.is_set()
-                ):
-                    startup_reason = (
-                        "simulator_"
-                        f"{simulator_failure_state['reason'] or 'log_failure'}"
-                        if simulator_failure.is_set()
-                        else f"simulator_start_exit_{simulator.returncode}"
-                    )
-                    _terminate_managed_process(
-                        simulator,
-                        "DriverSim",
-                    )
-                    _kill_simulator_residuals(
-                        args.simulator_dir,
-                        reason=startup_reason,
-                    )
-                    restart_count += 1
-                    restart_delay = max(
-                        0.0, float(args.restart_delay)
-                    )
-                    print(
-                        "[run3][supervisor] DriverSim startup restart "
-                        f"reason={startup_reason} "
-                        f"count={restart_count} "
-                        f"delay={restart_delay:.1f}s",
-                        flush=True,
-                    )
-                    time.sleep(restart_delay)
-                    simulator = None
-                    simulator_failure = None
-                    simulator_failure_state = None
-                    continue
 
             print(
                 "[run3][supervisor] start runtime "
                 f"attempt={restart_count + 1} "
                 f"task_timeout={args.task_timeout:.1f}s "
+                f"first_ins_timeout={args.first_ins_timeout:.1f}s "
                 f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
                 flush=True,
             )
@@ -1233,8 +1222,31 @@ def supervise_runtime(args):
                 child_argv,
                 start_new_session=True,
             )
-            restart_reason = None
-            return_code = None
+
+            if not args.no_manage_simulator:
+                registration_delay = max(
+                    0.0, float(args.simulator_ready_delay)
+                )
+                print(
+                    "[run3][supervisor] wait for runtime registration "
+                    f"delay={registration_delay:.1f}s",
+                    flush=True,
+                )
+                registration_deadline = (
+                    time.monotonic() + registration_delay
+                )
+                while time.monotonic() < registration_deadline:
+                    return_code = runtime.poll()
+                    if return_code is not None:
+                        break
+                    time.sleep(0.2)
+                if return_code is None:
+                    (
+                        simulator,
+                        simulator_failure,
+                        simulator_failure_state,
+                    ) = _start_managed_simulator(args)
+
             while restart_reason is None:
                 return_code = runtime.poll()
                 if return_code is not None:
@@ -1280,12 +1292,12 @@ def supervise_runtime(args):
             return 130
 
         if restart_reason is None:
-            _terminate_managed_process(simulator, "DriverSim")
-            if not args.no_manage_simulator:
-                _kill_simulator_residuals(
-                    args.simulator_dir,
-                    reason="runtime_exit",
-                )
+            _cleanup_managed_stack(
+                args,
+                runtime,
+                simulator,
+                reason="runtime_exit",
+            )
             print(
                 "[run3][supervisor] runtime exited "
                 f"code={return_code}; supervisor stops",
@@ -1293,13 +1305,12 @@ def supervise_runtime(args):
             )
             return return_code
 
-        _terminate_managed_process(runtime, "runtime")
-        _terminate_managed_process(simulator, "DriverSim")
-        if not args.no_manage_simulator:
-            _kill_simulator_residuals(
-                args.simulator_dir,
-                reason=restart_reason,
-            )
+        _cleanup_managed_stack(
+            args,
+            runtime,
+            simulator,
+            reason=restart_reason,
+        )
         runtime = None
         simulator = None
         simulator_failure = None
