@@ -134,6 +134,10 @@ class StraightSprintController:
         self.steer_kp = float(args.steer_kp)
         self.steer_sign = float(args.steer_sign)
         self.steer_limit_deg = abs(float(args.steer_limit_deg))
+        self.steer_min_deg = min(
+            self.steer_limit_deg,
+            abs(float(args.steer_min_deg)),
+        )
         self.sprint_acceleration = float(args.sprint_acceleration)
         self.sprint_speed = max(0.0, float(args.sprint_speed))
         self.line_sample_step = max(0.1, float(args.line_sample_step))
@@ -262,14 +266,24 @@ class StraightSprintController:
         else:
             acceleration = self.align_acceleration
             target_speed = self.align_speed
-            steering = max(
-                -self.steer_limit_deg,
-                min(
-                    self.steer_limit_deg,
-                    self.steer_sign * self.steer_kp *
-                    heading_error_deg,
-                ),
-            )
+            if abs(heading_error_deg) <= self.align_tolerance_deg:
+                # Centre immediately inside the acceptance band so delayed
+                # steering feedback does not carry the chassis through it.
+                steering = 0.0
+            else:
+                raw_steering = (
+                    self.steer_sign
+                    * self.steer_kp
+                    * heading_error_deg
+                )
+                steering_magnitude = max(
+                    self.steer_min_deg,
+                    abs(raw_steering),
+                )
+                steering = math.copysign(
+                    min(self.steer_limit_deg, steering_magnitude),
+                    raw_steering,
+                )
 
         now = time.monotonic()
         if now - self.last_log_time >= 0.25:
@@ -738,20 +752,45 @@ def parse_args():
     )
     parser.add_argument("--actor-id", default="apollo_testee")
 
-    parser.add_argument("--align-speed", type=float, default=1.0)
     parser.add_argument(
-        "--align-acceleration", type=float, default=0.5
+        "--align-speed",
+        type=float,
+        default=3.0,
+        help="low-speed heading-alignment target (default: 3.0 m/s)",
+    )
+    parser.add_argument(
+        "--align-acceleration",
+        type=float,
+        default=2.0,
+        help="heading-alignment acceleration (default: 2.0 m/s^2)",
     )
     parser.add_argument(
         "--align-tolerance-deg", type=float, default=2.0
     )
     parser.add_argument(
-        "--align-confirm-frames", type=int, default=5
+        "--align-confirm-frames",
+        type=int,
+        default=3,
+        help="fresh in-tolerance INS frames before sprint (default: 3)",
     )
-    parser.add_argument("--steer-kp", type=float, default=1.2)
+    parser.add_argument(
+        "--steer-kp",
+        type=float,
+        default=2.0,
+        help="steering-wheel degrees per heading-error degree (default: 2.0)",
+    )
     parser.add_argument("--steer-sign", type=float, default=1.0)
     parser.add_argument(
-        "--steer-limit-deg", type=float, default=40.0
+        "--steer-min-deg",
+        type=float,
+        default=6.0,
+        help="minimum wheel command outside tolerance (default: 6 deg)",
+    )
+    parser.add_argument(
+        "--steer-limit-deg",
+        type=float,
+        default=42.0,
+        help="alignment steering-wheel limit (default: 42 deg)",
     )
     parser.add_argument(
         "--sprint-acceleration", type=float, default=10000.0
