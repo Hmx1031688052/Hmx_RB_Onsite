@@ -284,6 +284,9 @@ ins_start_gate_map = ""
 ins_start_gate_reject_count = 0
 last_ins_start_gate_warn_ts = 0.0
 test_start_received_ts = None
+first_ins_startup_timeout = max(
+    0.0, float(os.environ.get("E2E_FIRST_INS_TIMEOUT", "0.0"))
+)
 last_ego_hold_warn_ts = 0.0
 last_prepare_wait_warn_ts = 0.0
 last_start_wait_warn_ts = 0.0
@@ -1218,13 +1221,24 @@ def hold_until_ego_ready():
         return False
 
     now = time.time()
+    start_age = (
+        0.0
+        if test_start_received_ts is None
+        else max(0.0, now - test_start_received_ts)
+    )
+    if (
+        first_ins_startup_timeout > 0.0
+        and test_start_received_ts is not None
+        and start_age >= first_ins_startup_timeout
+    ):
+        print(
+            "[startup][RECONNECT] no valid INS arrived after "
+            f"{start_age:.1f}s invalid_count={invalid_ins_count}; "
+            "requesting one clean process-level channel reconnect"
+        )
+        raise SystemExit(75)
     if now - last_ego_hold_warn_ts >= 1.0:
         last_ego_hold_warn_ts = now
-        start_age = (
-            0.0
-            if test_start_received_ts is None
-            else max(0.0, now - test_start_received_ts)
-        )
         print(
             "[startup][WAIT] waiting for first valid INS "
             f"start_age={start_age:.1f}s; "

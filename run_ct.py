@@ -10,6 +10,7 @@ import argparse
 import math
 import os
 import runpy
+import subprocess
 import sys
 import time
 
@@ -165,6 +166,26 @@ def _ct_parser():
         ),
     )
     parser.add_argument(
+        "--ct-first-ins-timeout",
+        type=float,
+        default=float(
+            os.environ.get("CT_FIRST_INS_TIMEOUT", "8.0")
+        ),
+        help=(
+            "request a clean process reconnect when START_TEST receives no "
+            "valid INS for this many seconds (default: 8.0)"
+        ),
+    )
+    parser.add_argument(
+        "--ct-startup-reconnects",
+        type=int,
+        default=int(os.environ.get("CT_STARTUP_RECONNECTS", "1")),
+        help=(
+            "maximum automatic process-level reconnects for a dead initial "
+            "INS subscription (default: 1)"
+        ),
+    )
+    parser.add_argument(
         "--ct-help",
         action="store_true",
         help="show run_ct.py-specific options and exit",
@@ -230,6 +251,15 @@ def _validate_ct_args(parser, args):
         parser.error(
             "--ct-channel-settle-duration must be finite and non-negative"
         )
+    if (
+        not math.isfinite(args.ct_first_ins_timeout)
+        or args.ct_first_ins_timeout <= 0.0
+    ):
+        parser.error(
+            "--ct-first-ins-timeout must be finite and greater than zero"
+        )
+    if args.ct_startup_reconnects < 0 or args.ct_startup_reconnects > 1:
+        parser.error("--ct-startup-reconnects must be either 0 or 1")
 
 
 def _has_option(arguments, *names):
@@ -243,6 +273,41 @@ def _has_option(arguments, *names):
 def _append_default(arguments, value, *names):
     if not _has_option(arguments, *names):
         arguments.append(value)
+
+
+def _supervise_runtime(ct_args):
+    """Run native channels in a child and reconnect a dead INS only once."""
+    command = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    explicit_settle = _has_option(
+        sys.argv[1:], "--ct-channel-settle-duration"
+    )
+    for attempt in range(ct_args.ct_startup_reconnects + 1):
+        child_env = os.environ.copy()
+        child_env["CT_RUNTIME_CHILD"] = "1"
+        if attempt > 0 and not explicit_settle:
+            # The simulator has already been running throughout the first
+            # attempt. A short registration grace is sufficient on reconnect.
+            child_env["CT_CHANNEL_SETTLE_DURATION"] = "2.0"
+        if attempt > 0:
+            print(
+                "[ct-startup][RECONNECT] restarting runtime child once "
+                f"attempt={attempt + 1}/"
+                f"{ct_args.ct_startup_reconnects + 1}"
+            )
+            time.sleep(2.0)
+        try:
+            return_code = subprocess.call(command, env=child_env)
+        except KeyboardInterrupt:
+            return 130
+        if return_code != 75:
+            return return_code
+        if attempt >= ct_args.ct_startup_reconnects:
+            print(
+                "[ct-startup][FATAL] valid INS is still unavailable after "
+                "the permitted clean reconnect; automatic restart stopped"
+            )
+            return 75
+    return 75
 
 
 def _install_score_config(ct_args):
@@ -717,6 +782,8 @@ def main():
         parser.print_help()
         return 0
     _validate_ct_args(parser, ct_args)
+    if os.environ.get("CT_RUNTIME_CHILD") != "1":
+        return _supervise_runtime(ct_args)
 
     _install_score_config(ct_args)
 
@@ -774,6 +841,9 @@ def main():
     # numbers have advanced. Holding the last accepted pose prevents those
     # stale samples from alternating SPRINT and emergency STOP.
     os.environ["E2E_INS_MONOTONIC_SEQUENCE"] = "1"
+    os.environ["E2E_FIRST_INS_TIMEOUT"] = str(
+        ct_args.ct_first_ins_timeout
+    )
 
     print(
         "[ct-score] isolated scoring entrypoint active "
@@ -793,6 +863,7 @@ def main():
         f"{ct_args.ct_straight_max_lateral_accel:.3f}m/s2 "
         f"straight_lat_jerk="
         f"{ct_args.ct_straight_max_lateral_jerk:.3f}m/s3 "
+        f"first_ins_timeout={ct_args.ct_first_ins_timeout:.1f}s "
         "background_vehicles=IGNORED gt_subscription=DISABLED "
         "ins_sequence_filter=MONOTONIC"
     )
@@ -810,4 +881,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
