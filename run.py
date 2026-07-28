@@ -3055,6 +3055,17 @@ def activate_final_control_publisher():
         final_control_active = True
 
 
+def initialize_final_control_from_ego(ego_speed):
+    """Establish a missing episode baseline without emitting a zero command."""
+    global final_control_desired
+
+    if not final_control_enabled:
+        return
+    with final_control_lock:
+        final_control_limiter.reset(ego_speed)
+        final_control_desired = (0.0, float(ego_speed), 0.0)
+
+
 def deactivate_final_control_publisher():
     global final_control_active
     global final_control_desired
@@ -3249,6 +3260,10 @@ def get_vehicle_pose():
     if not first_ins_ready:
         first_ins_ready = True
         first_ins_ready_ts = time.time()
+        if episode_initial_speed is None:
+            initialize_final_control_from_ego(
+                float(getattr(model.ego, "speed", 0.0))
+            )
         print(
             "[prepare-timing] first_ins_ready "
             f"wall_time={first_ins_ready_ts:.3f} "

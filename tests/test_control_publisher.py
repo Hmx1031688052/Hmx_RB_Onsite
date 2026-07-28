@@ -41,6 +41,26 @@ class FinalSpeedLimiterTest(unittest.TestCase):
         self.assertAlmostEqual(speed, 0.915)
         self.assertAlmostEqual(accel, 2.0)
 
+    def test_acceleration_continues_while_chassis_catches_speed_target(self):
+        limiter = FinalSpeedLimiter(
+            safe_accel=2.0,
+            publish_interval=0.03,
+        )
+        limiter.reset(0.0)
+        first_speed, first_accel, _ = limiter.step(
+            39.667,
+            ego_speed=0.0,
+        )
+        second_speed, second_accel, _ = limiter.step(
+            39.667,
+            ego_speed=0.0,
+        )
+
+        self.assertAlmostEqual(first_speed, 0.06)
+        self.assertAlmostEqual(first_accel, 2.0)
+        self.assertAlmostEqual(second_speed, 0.06)
+        self.assertAlmostEqual(second_accel, 2.0)
+
     def test_same_episode_state_is_continuous_across_desired_modes(self):
         limiter = FinalSpeedLimiter(
             safe_accel=2.0,

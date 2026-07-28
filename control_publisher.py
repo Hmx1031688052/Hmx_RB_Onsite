@@ -55,9 +55,28 @@ class FinalSpeedLimiter:
                 high = intersection_high
 
         limited_speed = max(low, min(high, desired))
-        limited_accel = (
-            (limited_speed - previous) / self.publish_interval
+        reference_speed = previous if ego_speed is None else max(
+            0.0, ego_speed
         )
+        epsilon = 1e-6
+        if (
+            desired > reference_speed + epsilon
+            and limited_speed > reference_speed + epsilon
+        ):
+            # DriveSim needs the acceleration field to remain positive while
+            # the chassis catches the already-published speed target. Deriving
+            # zero merely because the target field is unchanged deadlocks the
+            # vehicle one step behind that target.
+            limited_accel = self.safe_accel
+        elif (
+            desired < reference_speed - epsilon
+            and limited_speed < reference_speed - epsilon
+        ):
+            limited_accel = -self.safe_accel
+        else:
+            limited_accel = (
+                (limited_speed - previous) / self.publish_interval
+            )
         limited_accel = max(
             -self.safe_accel,
             min(self.safe_accel, limited_accel),
