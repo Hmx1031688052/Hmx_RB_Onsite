@@ -816,9 +816,16 @@ class Predictor:
             )
         else:
             self.model = None
-            print(
-                "[perception] source=GT; PointPillars model loading skipped"
-            )
+            if self.perception_source == "gt":
+                print(
+                    "[perception] source=GT; "
+                    "PointPillars model loading skipped"
+                )
+            else:
+                print(
+                    "[perception] source=NONE; detector model loading "
+                    "skipped and all background objects are ignored"
+                )
         self.perception_web_visualizer = None
         if os.environ.get("E2E_PERCEPTION_WEB", "1") == "1":
             self.perception_web_visualizer = PerceptionWebVisualizer(

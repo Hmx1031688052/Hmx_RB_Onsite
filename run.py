@@ -206,6 +206,9 @@ DEBUG_DRIVE = os.environ.get("E2E_DEBUG_DRIVE", "0") == "1"
 PERCEPTION_SOURCE = os.environ.get(
     "E2E_PERCEPTION_SOURCE", "gt"
 ).strip().lower()
+NPC_TRUTH_ENABLED = (
+    os.environ.get("E2E_NPC_TRUTH_ENABLED", "1") == "1"
+)
 GT_STARTUP_GRACE_SECONDS = max(
     0.0,
     float(os.environ.get("E2E_GT_STARTUP_GRACE_SECONDS", "0.50")),
@@ -655,6 +658,8 @@ def _print_npc_truth_debug(
 
 def process_npc_truth(max_messages=128):
     """Decode NPC truth for visualization; optionally record raw frames."""
+    if not NPC_TRUTH_ENABLED:
+        return 0
     if npc_channel is None:
         return 0
     received = 0
@@ -2103,7 +2108,9 @@ def get_pointcloud_msg():
     gt_ready = False
     fresh_gt = False
     gt_age = float("inf")
-    if PERCEPTION_SOURCE == "gt":
+    if PERCEPTION_SOURCE == "none":
+        obstacles = []
+    elif PERCEPTION_SOURCE == "gt":
         if npc_truth_frames:
             candidate = npc_truth_frames[-1]
             gt_age = (
@@ -3854,13 +3861,13 @@ if __name__ == "__main__":
         "--perception_source",
         "--perception-source",
         dest="perception_source",
-        choices=("gt", "lidar"),
+        choices=("gt", "lidar", "none"),
         default=os.environ.get(
             "E2E_PERCEPTION_SOURCE", "gt"
         ).strip().lower(),
         help=(
             "planning obstacle source: simulator NPC ground truth "
-            "(default) or PointPillars lidar detections"
+            "(default), PointPillars lidar detections, or none"
         ),
     )
     arg_parser.add_argument(
@@ -4326,7 +4333,16 @@ if __name__ == "__main__":
     prepare_channel = channel_map["prepare"]
     ins_channel = channel_map["ins"]
     image_channel = channel_map["camera"]
-    npc_channel = channel_map.get("npc")
+    npc_channel = (
+        channel_map.get("npc")
+        if NPC_TRUTH_ENABLED
+        else None
+    )
+    if not NPC_TRUTH_ENABLED:
+        print(
+            "[npc-truth] disabled by isolated entrypoint; "
+            "background vehicles are not read or decoded"
+        )
     if PERCEPTION_SOURCE == "gt" and npc_channel is None:
         print(
             "[perception][FATAL] GT planning requested but channel "
