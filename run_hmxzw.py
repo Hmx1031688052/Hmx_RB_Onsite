@@ -1049,6 +1049,41 @@ def _kill_simulator_residuals(simulator_dir, reason):
         time.sleep(0.5)
 
 
+def _cleanup_managed_stack(args, runtime, simulator, reason):
+    """Finish cleanup even if the user presses Ctrl+C more than once."""
+    previous_sigint_handler = None
+    if os.name == "posix":
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        _terminate_managed_process(runtime, "runtime")
+        _terminate_managed_process(simulator, "DriverSim")
+        if not args.no_manage_simulator:
+            # CrashReportClient can appear shortly after DriverSim dies.
+            # Re-scan several times so a late error window cannot survive.
+            for cleanup_pass in range(1, 4):
+                _kill_simulator_residuals(
+                    args.simulator_dir,
+                    reason=f"{reason}_pass_{cleanup_pass}",
+                )
+                if cleanup_pass < 3:
+                    time.sleep(0.3)
+        print(
+            "[run3][supervisor] managed cleanup complete "
+            f"reason={reason}",
+            flush=True,
+        )
+    finally:
+        if (
+            os.name == "posix"
+            and previous_sigint_handler is not None
+        ):
+            signal.signal(
+                signal.SIGINT,
+                previous_sigint_handler,
+            )
+
+
 def _start_managed_simulator(args):
     simulator_dir = Path(args.simulator_dir).expanduser().resolve()
     start_script = simulator_dir / "start.sh"
@@ -1232,16 +1267,16 @@ def supervise_runtime(args):
                     time.sleep(0.2)
         except KeyboardInterrupt:
             print(
-                "[run3][supervisor] interrupted; stop managed processes",
+                "[run3][supervisor] interrupted; locked cleanup begins "
+                "(additional Ctrl+C is ignored)",
                 flush=True,
             )
-            _terminate_managed_process(runtime, "runtime")
-            _terminate_managed_process(simulator, "DriverSim")
-            if not args.no_manage_simulator:
-                _kill_simulator_residuals(
-                    args.simulator_dir,
-                    reason="supervisor_interrupted",
-                )
+            _cleanup_managed_stack(
+                args,
+                runtime,
+                simulator,
+                reason="supervisor_interrupted",
+            )
             return 130
 
         if restart_reason is None:
