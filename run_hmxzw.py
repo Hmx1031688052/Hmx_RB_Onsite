@@ -746,6 +746,9 @@ class Run3:
         self.start_gate_tolerance = max(
             0.0, float(args.ins_start_gate_tolerance)
         )
+        self.prepare_prime_duration = max(
+            0.0, float(args.prepare_prime_duration)
+        )
 
         self.controller = StraightSprintController(args)
         self.latest_feedback = None
@@ -874,6 +877,30 @@ class Run3:
         )
         return True
 
+    def prime_ins_subscription(self):
+        deadline = time.monotonic() + self.prepare_prime_duration
+        poll_count = 0
+        last_sequence = None
+        while True:
+            ins = self.ins_channel.get_ins()
+            poll_count += 1
+            try:
+                last_sequence = int(ins.sequence_num)
+            except Exception:
+                last_sequence = None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.005, remaining))
+
+        print(
+            "[run3][prepare] INS subscription primed "
+            f"duration={self.prepare_prime_duration:.3f}s "
+            f"polls={poll_count} last_seq={last_sequence}",
+            flush=True,
+        )
+
     def handle_prepare(self, prepare_message):
         incoming_session = str(
             prepare_message.session_id or ""
@@ -954,6 +981,23 @@ class Run3:
             f"map={self.map_name}",
             flush=True,
         )
+        if self.prepared:
+            neutral_sent = self.send_control(0.0, 0.0, 0.0)
+            if neutral_sent:
+                print(
+                    "[run3][prepare] neutral control sent before "
+                    "PrepareResult acc=0 speed=0 steer=0",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[run3][prepare][ERROR] neutral control before "
+                    "PrepareResult failed; reject prepare",
+                    flush=True,
+                )
+                self.prepared = False
+        if self.prepared:
+            self.prime_ins_subscription()
         self.send_prepare_result(self.prepared)
 
     def poll_prepare(self):
@@ -1001,9 +1045,21 @@ class Run3:
                 )
                 return
             self.started = True
+            startup_speed = (
+                float(self.ego["speed"])
+                if self.ego is not None
+                else 0.0
+            )
+            neutral_sent = self.send_control(
+                acceleration=0.0,
+                speed=startup_speed,
+                steering=0.0,
+            )
             print(
                 "[run3][notify] START "
-                f"session={self.session_id} role={self.role_id}",
+                f"session={self.session_id} role={self.role_id} "
+                f"neutral_control={int(neutral_sent)} "
+                f"startup_speed={startup_speed:.3f}m/s",
                 flush=True,
             )
             return
@@ -1488,6 +1544,15 @@ def parse_args():
         "--ins-start-gate-tolerance",
         type=float,
         default=50.0,
+    )
+    parser.add_argument(
+        "--prepare-prime-duration",
+        type=float,
+        default=0.10,
+        help=(
+            "poll and prime the INS subscription for this long before "
+            "ActorPrepareResult (default: 0.10 s)"
+        ),
     )
     parser.add_argument(
         "--debug",
