@@ -27,10 +27,18 @@ import json
 import math
 import os
 import re
+import select
 import sys
 import threading
 import time
 from pathlib import Path
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 
 
 # The onsite tree may contain more than one generated ``chassis`` package.
@@ -217,8 +225,53 @@ def is_newer_session(candidate, current):
     )
 
 
+class TerminalKeyReader:
+    def __init__(self):
+        self.fd = None
+        self.saved_attributes = None
+
+    def open(self):
+        if (
+            termios is None
+            or tty is None
+            or not sys.stdin.isatty()
+        ):
+            return False
+        self.fd = sys.stdin.fileno()
+        self.saved_attributes = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return True
+
+    def poll(self):
+        if self.fd is None:
+            return ""
+        readable, _, _ = select.select([self.fd], [], [], 0.0)
+        if not readable:
+            return ""
+        return os.read(self.fd, 64).decode("utf-8", errors="ignore")
+
+    def close(self):
+        if self.fd is None or self.saved_attributes is None:
+            return
+        termios.tcsetattr(
+            self.fd, termios.TCSADRAIN, self.saved_attributes
+        )
+        self.fd = None
+        self.saved_attributes = None
+
+
 class StraightSprintController:
     def __init__(self, args):
+        self.manual_start = not bool(args.auto_align)
+        self.manual_speed_step = max(
+            0.1, float(args.manual_speed_step)
+        )
+        self.manual_max_speed = max(
+            self.manual_speed_step, float(args.manual_max_speed)
+        )
+        self.manual_steer_step_deg = max(
+            0.1, abs(float(args.manual_steer_step_deg))
+        )
         self.align_speed = max(0.0, float(args.align_speed))
         self.align_acceleration = float(args.align_acceleration)
         self.align_speed_kp = max(
@@ -303,6 +356,9 @@ class StraightSprintController:
         self.sprint_pulse_started_time = None
         self.sprint_pulse_entry_speed = 0.0
         self.sprint_pulse_complete = False
+        self.manual_speed = 0.0
+        self.manual_steering_deg = 0.0
+        self.manual_launch_requested = False
         self.last_log_time = 0.0
 
     def reset(self):
@@ -321,6 +377,9 @@ class StraightSprintController:
         self.sprint_pulse_started_time = None
         self.sprint_pulse_entry_speed = 0.0
         self.sprint_pulse_complete = False
+        self.manual_speed = 0.0
+        self.manual_steering_deg = 0.0
+        self.manual_launch_requested = False
         self.last_log_time = 0.0
 
     def configure(self, init_state, target_state):
@@ -357,14 +416,62 @@ class StraightSprintController:
 
         self.goal_xy = (goal_x, goal_y)
         self._set_tracking_line(start_x, start_y)
-        self.state = "ALIGN"
+        self.state = "MANUAL" if self.manual_start else "ALIGN"
         print(
             "[run3][straight-line] ready "
             f"start=({start_x:.3f},{start_y:.3f}) "
             f"goal=({goal_x:.3f},{goal_y:.3f}) "
             f"length={line_length:.3f}m "
             f"heading={math.degrees(self.line_heading):.3f}deg "
-            f"points={len(self.line_points)}",
+            f"points={len(self.line_points)} "
+            f"mode={'MANUAL' if self.manual_start else 'AUTO'}",
+            flush=True,
+        )
+        return True
+
+    def handle_manual_key(self, key):
+        if self.state != "MANUAL":
+            return False
+
+        normalized = str(key).lower()
+        if normalized == "w":
+            self.manual_speed = min(
+                self.manual_max_speed,
+                self.manual_speed + self.manual_speed_step,
+            )
+        elif normalized == "s":
+            self.manual_speed = max(
+                0.0,
+                self.manual_speed - self.manual_speed_step,
+            )
+        elif normalized == "a":
+            self.manual_steering_deg = min(
+                self.steer_limit_deg,
+                self.manual_steering_deg
+                + self.manual_steer_step_deg,
+            )
+        elif normalized == "d":
+            self.manual_steering_deg = max(
+                -self.steer_limit_deg,
+                self.manual_steering_deg
+                - self.manual_steer_step_deg,
+            )
+        elif key == " ":
+            self.manual_launch_requested = True
+            print(
+                "[run3][manual] SPACE launch requested; "
+                "centre steering before sprint",
+                flush=True,
+            )
+            return True
+        else:
+            return False
+
+        print(
+            "[run3][manual] "
+            f"key={normalized.upper()} "
+            f"speed={self.manual_speed:.2f}m/s "
+            f"steer={self.manual_steering_deg:.1f}deg",
             flush=True,
         )
         return True
@@ -387,6 +494,16 @@ class StraightSprintController:
             )
             for index in range(segment_count + 1)
         ]
+
+    def _set_manual_sprint_line(
+        self, start_x, start_y, straight_heading
+    ):
+        self.start_xy = (float(start_x), float(start_y))
+        self.line_heading = wrap_angle(float(straight_heading))
+        goal_dx = self.goal_xy[0] - start_x
+        goal_dy = self.goal_xy[1] - start_y
+        self.line_length = math.hypot(goal_dx, goal_dy)
+        self.line_points = []
 
     def _speed_acceleration(self, target_speed, ego_speed):
         command = self.align_speed_kp * (
@@ -432,7 +549,14 @@ class StraightSprintController:
         ins_sequence,
     ):
         if (
-            self.state not in ("ALIGN", "SETTLE", "SPRINT")
+            self.state
+            not in (
+                "MANUAL",
+                "MANUAL_CENTER",
+                "ALIGN",
+                "SETTLE",
+                "SPRINT",
+            )
             or self.goal_xy is None
             or self.line_heading is None
         ):
@@ -520,11 +644,74 @@ class StraightSprintController:
                     flush=True,
                 )
 
+        if self.state == "MANUAL" and self.manual_launch_requested:
+            self.manual_launch_requested = False
+            self.state = "MANUAL_CENTER"
+            self.settle_started_time = now
+            self.settle_confirm_count = 0
+            print(
+                "[run3] MANUAL -> MANUAL_CENTER "
+                f"ego_heading={math.degrees(ego_heading):.3f}deg "
+                f"speed={ego_speed:.3f}m/s "
+                f"commanded_steer={self.manual_steering_deg:.3f}deg",
+                flush=True,
+            )
+
         settle_elapsed = (
             0.0
             if self.settle_started_time is None
             else now - self.settle_started_time
         )
+        if self.state == "MANUAL_CENTER":
+            yaw_ok = (
+                abs(ego_yaw_rate_deg)
+                <= self.settle_yaw_rate_deg
+            )
+            steering_ok = (
+                not steering_feedback_valid
+                or abs(steering_feedback_deg)
+                <= self.settle_steering_deg
+            )
+            stable_now = (
+                settle_elapsed >= self.settle_duration
+                and yaw_ok
+                and steering_ok
+            )
+            if fresh_ins:
+                if stable_now:
+                    self.settle_confirm_count += 1
+                else:
+                    self.settle_confirm_count = 0
+            if (
+                self.settle_confirm_count
+                >= self.settle_confirm_frames
+            ):
+                self._set_manual_sprint_line(
+                    ego_x, ego_y, ego_heading
+                )
+                tx = math.cos(self.line_heading)
+                ty = math.sin(self.line_heading)
+                along_track = 0.0
+                cross_track = 0.0
+                remaining_along = self.line_length
+                guidance_heading = self.line_heading
+                heading_error = 0.0
+                heading_error_deg = 0.0
+                self.state = "SPRINT"
+                self.sprint_pulse_started_time = now
+                self.sprint_pulse_entry_speed = float(ego_speed)
+                self.sprint_pulse_complete = False
+                print(
+                    "[run3] MANUAL_CENTER -> SPRINT "
+                    f"straight_heading="
+                    f"{math.degrees(self.line_heading):.3f}deg "
+                    f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
+                    f"steer_feedback={steering_feedback_deg:.3f}deg "
+                    f"stable={self.settle_confirm_count}/"
+                    f"{self.settle_confirm_frames}",
+                    flush=True,
+                )
+
         if self.state == "SETTLE":
             if (
                 fresh_ins
@@ -683,6 +870,18 @@ class StraightSprintController:
             )
             target_speed = self.settle_speed
             steering = 0.0
+        elif self.state == "MANUAL_CENTER":
+            acceleration = self._speed_acceleration(
+                self.manual_speed, ego_speed
+            )
+            target_speed = self.manual_speed
+            steering = 0.0
+        elif self.state == "MANUAL":
+            acceleration = self._speed_acceleration(
+                self.manual_speed, ego_speed
+            )
+            target_speed = self.manual_speed
+            steering = self.manual_steering_deg
         else:
             # Keep closing the speed error on every control frame. A lost
             # first frame can no longer leave the vehicle stopped forever.
@@ -751,6 +950,7 @@ class Run3:
         )
 
         self.controller = StraightSprintController(args)
+        self.keyboard = TerminalKeyReader()
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
@@ -1263,10 +1463,33 @@ class Run3:
         )
         self.send_control(acceleration, speed, steering)
 
+    def poll_keyboard(self):
+        keys = self.keyboard.poll()
+        if not keys or not self.started:
+            return
+        for key in keys:
+            self.controller.handle_manual_key(key)
+
     def run(self):
         self.create_channels()
+        if self.controller.manual_start:
+            if not self.keyboard.open():
+                raise RuntimeError(
+                    "manual start requires an interactive terminal (TTY)"
+                )
+            print(
+                "[run3][manual] controls ready: "
+                "W/S speed +/- "
+                f"{self.controller.manual_speed_step:.1f}m/s, "
+                "A/D steering +/- "
+                f"{self.controller.manual_steer_step_deg:.1f}deg, "
+                "SPACE centre wheel and sprint",
+                flush=True,
+            )
         print(
             "[run3] minimal straight sprint started "
+            f"start_mode="
+            f"{'MANUAL_WASD' if self.controller.manual_start else 'AUTO'} "
             f"align_speed={self.controller.align_speed:.2f}m/s "
             f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
             f"control_hz={1.0 / self.control_period:.1f} "
@@ -1300,13 +1523,17 @@ class Run3:
             f"sprint_speed={self.controller.sprint_speed:.1f}",
             flush=True,
         )
-        while True:
-            self.poll_prepare()
-            self.poll_notify()
-            self.poll_ins()
-            self.poll_feedback()
-            self.send_active_control()
-            time.sleep(min(0.002, 0.25 * self.control_period))
+        try:
+            while True:
+                self.poll_prepare()
+                self.poll_notify()
+                self.poll_ins()
+                self.poll_feedback()
+                self.poll_keyboard()
+                self.send_active_control()
+                time.sleep(min(0.002, 0.25 * self.control_period))
+        finally:
+            self.keyboard.close()
 
 
 def parse_args():
@@ -1326,6 +1553,29 @@ def parse_args():
         default="usb0",
     )
     parser.add_argument("--actor-id", default="apollo_testee")
+    parser.add_argument(
+        "--auto-align",
+        action="store_true",
+        help="use automatic heading alignment instead of manual WASD",
+    )
+    parser.add_argument(
+        "--manual-speed-step",
+        type=float,
+        default=0.5,
+        help="W/S target-speed increment (default: 0.5 m/s)",
+    )
+    parser.add_argument(
+        "--manual-max-speed",
+        type=float,
+        default=3.0,
+        help="maximum manual alignment speed (default: 3.0 m/s)",
+    )
+    parser.add_argument(
+        "--manual-steer-step-deg",
+        type=float,
+        default=3.0,
+        help="A/D steering-wheel increment (default: 3.0 deg)",
+    )
 
     parser.add_argument(
         "--align-speed",
