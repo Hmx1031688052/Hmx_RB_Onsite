@@ -1216,6 +1216,9 @@ class StraightSprintController:
         self.manual_max_speed = max(
             0.0, float(args.manual_max_speed)
         )
+        self.manual_acceleration = max(
+            0.0, float(args.manual_acceleration)
+        )
         self.manual_brake_deceleration = max(
             0.0, float(args.manual_brake_deceleration)
         )
@@ -1514,13 +1517,23 @@ class StraightSprintController:
         self.line_length = math.hypot(goal_dx, goal_dy)
         self.line_points = []
 
-    def _speed_acceleration(self, target_speed, ego_speed):
+    def _speed_acceleration(
+        self,
+        target_speed,
+        ego_speed,
+        max_acceleration=None,
+    ):
         command = self.align_speed_kp * (
             float(target_speed) - float(ego_speed)
         )
+        acceleration_limit = (
+            self.align_acceleration
+            if max_acceleration is None
+            else max(0.0, float(max_acceleration))
+        )
         return max(
             -self.align_max_deceleration,
-            min(self.align_acceleration, command),
+            min(acceleration_limit, command),
         )
 
     def _alignment_steering(
@@ -1881,13 +1894,17 @@ class StraightSprintController:
             steering = 0.0
         elif self.state == "MANUAL_CENTER":
             acceleration = self._speed_acceleration(
-                self.manual_speed, ego_speed
+                self.manual_speed,
+                ego_speed,
+                self.manual_acceleration,
             )
             target_speed = self.manual_speed
             steering = 0.0
         elif self.state == "MANUAL":
             acceleration = self._speed_acceleration(
-                self.manual_speed, ego_speed
+                self.manual_speed,
+                ego_speed,
+                self.manual_acceleration,
             )
             target_speed = self.manual_speed
             steering = self.manual_steering_deg
@@ -2528,6 +2545,8 @@ class Run3:
                 "[run3][manual] controls ready: "
                 f"device={keyboard_device} "
                 f"hold W/UP={self.controller.manual_max_speed:.1f}m/s, "
+                f"manual_acc_limit="
+                f"{self.controller.manual_acceleration:.1f}m/s2, "
                 "release W/UP=hold target, "
                 "hold S/DOWN=slow target reduction at "
                 f"{self.controller.manual_brake_deceleration:.1f}m/s2, "
@@ -2644,6 +2663,15 @@ def parse_args():
         type=float,
         default=20.0,
         help="maximum manual driving speed (default: 20.0 m/s)",
+    )
+    parser.add_argument(
+        "--manual-acceleration",
+        type=float,
+        default=3.0,
+        help=(
+            "maximum acceleration in MANUAL/MANUAL_CENTER "
+            "(default: 3.0 m/s^2)"
+        ),
     )
     parser.add_argument(
         "--manual-brake-deceleration",
