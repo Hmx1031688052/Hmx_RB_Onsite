@@ -955,14 +955,37 @@ class X11AlignmentWindow:
                 return False
         return True
 
-    def _world_to_screen(self, points):
+    def _world_to_screen(
+        self,
+        points,
+        view_heading=None,
+        view_origin=None,
+    ):
         plot_left = 45.0
         plot_right = float(self.width - 45)
         plot_top = 125.0
         plot_bottom = float(self.height - 45)
 
-        xs = [point[0] for point in points]
-        ys = [point[1] for point in points]
+        transformed_points = list(points)
+        if view_heading is not None:
+            if view_origin is None:
+                view_origin = points[-1]
+            rotation = math.pi / 2.0 - float(view_heading)
+            rotation_cos = math.cos(rotation)
+            rotation_sin = math.sin(rotation)
+            transformed_points = []
+            for point in points:
+                dx = point[0] - view_origin[0]
+                dy = point[1] - view_origin[1]
+                transformed_points.append(
+                    (
+                        rotation_cos * dx - rotation_sin * dy,
+                        rotation_sin * dx + rotation_cos * dy,
+                    )
+                )
+
+        xs = [point[0] for point in transformed_points]
+        ys = [point[1] for point in transformed_points]
         center_x = 0.5 * (min(xs) + max(xs))
         center_y = 0.5 * (min(ys) + max(ys))
         span_x = max(xs) - min(xs)
@@ -983,7 +1006,7 @@ class X11AlignmentWindow:
                 screen_center_y - (point[1] - center_y) * scale,
             )
 
-        return [transform(point) for point in points]
+        return [transform(point) for point in transformed_points]
 
     def _draw_waiting(self):
         self.x11.XClearWindow(self.display, self.window)
@@ -1019,8 +1042,15 @@ class X11AlignmentWindow:
             if ego_available
             else start
         )
+        ego_heading = (
+            float(ego["heading"]) if ego_available else None
+        )
         start_screen, goal_screen, ego_screen = (
-            self._world_to_screen([start, goal, ego_point])
+            self._world_to_screen(
+                [start, goal, ego_point],
+                view_heading=ego_heading,
+                view_origin=ego_point,
+            )
         )
 
         target_heading = math.atan2(
@@ -1029,7 +1059,6 @@ class X11AlignmentWindow:
 
         self._text(22, 28, "Run3 Manual Alignment")
         if ego_available:
-            ego_heading = float(ego["heading"])
             heading_error = wrap_angle(
                 target_heading - ego_heading
             )
@@ -1038,6 +1067,7 @@ class X11AlignmentWindow:
                 52,
                 f"state={controller.state} "
                 f"started={int(bool(started))}  "
+                "view=EGO-UP  "
                 f"speed={float(ego['speed']):.2f}m/s  "
                 f"target={controller.manual_speed:.2f}m/s  "
                 f"steer={controller.manual_steering_deg:.1f}deg",
@@ -1113,12 +1143,8 @@ class X11AlignmentWindow:
                 ego_screen[0], ego_screen[1], 9, "ego", True
             )
             arrow_length = 72.0
-            arrow_x = ego_screen[0] + arrow_length * math.cos(
-                ego_heading
-            )
-            arrow_y = ego_screen[1] - arrow_length * math.sin(
-                ego_heading
-            )
+            arrow_x = ego_screen[0]
+            arrow_y = ego_screen[1] - arrow_length
             self._line(
                 ego_screen[0],
                 ego_screen[1],
@@ -1127,18 +1153,28 @@ class X11AlignmentWindow:
                 "heading",
                 4,
             )
-            for wing_angle in (
-                ego_heading + math.radians(150),
-                ego_heading - math.radians(150),
-            ):
-                self._line(
-                    arrow_x,
-                    arrow_y,
-                    arrow_x + 18.0 * math.cos(wing_angle),
-                    arrow_y - 18.0 * math.sin(wing_angle),
-                    "heading",
-                    3,
-                )
+            self._line(
+                arrow_x,
+                arrow_y,
+                arrow_x - 12.0,
+                arrow_y + 18.0,
+                "heading",
+                3,
+            )
+            self._line(
+                arrow_x,
+                arrow_y,
+                arrow_x + 12.0,
+                arrow_y + 18.0,
+                "heading",
+                3,
+            )
+            self._text(
+                arrow_x + 10,
+                arrow_y,
+                "FRONT",
+                "heading",
+            )
             self._text(
                 ego_screen[0] + 12,
                 ego_screen[1] + 20,
