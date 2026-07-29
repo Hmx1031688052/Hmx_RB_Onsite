@@ -1450,25 +1450,25 @@ def parse_args():
     parser.add_argument(
         "--align-tolerance-deg",
         type=float,
-        default=0.5,
-        help="heading tolerance before settling (default: 0.5 deg)",
+        default=1.0,
+        help="heading tolerance before settling (default: 1.0 deg)",
     )
     parser.add_argument(
         "--sprint-heading-tolerance-deg",
         type=float,
-        default=2.0,
+        default=6.0,
         help=(
             "maximum re-anchored heading error allowed before sprint "
-            "(default: 2.0 deg)"
+            "(default: 6.0 deg)"
         ),
     )
     parser.add_argument(
         "--sprint-max-lateral-miss",
         type=float,
-        default=0.5,
+        default=2.5,
         help=(
             "maximum predicted lateral miss at the goal when sprint steering "
-            "is locked to zero (default: 0.5 m)"
+            "is locked to zero (default: 2.5 m)"
         ),
     )
     parser.add_argument(
