@@ -1411,12 +1411,12 @@ class StraightSprintController:
         self.manual_last_input_time = now
 
         if launch_requested:
-            self.manual_speed = 0.0
             self.manual_steering_deg = 0.0
             self.manual_launch_requested = True
             print(
                 "[run3][manual] SPACE launch requested; "
-                "stop manual drive, centre steering, then sprint",
+                f"hold speed target={self.manual_speed:.2f}m/s, "
+                "centre steering, then sprint",
                 flush=True,
             )
             return True
@@ -2534,7 +2534,7 @@ class Run3:
                 "hold A/LEFT or D/RIGHT="
                 f"{self.controller.manual_steer_command_deg:.1f}deg, "
                 "simultaneous keys enabled, "
-                "SPACE stop/centre then sprint",
+                "SPACE hold speed/centre then sprint",
                 flush=True,
             )
         print(
@@ -2642,8 +2642,8 @@ def parse_args():
     parser.add_argument(
         "--manual-max-speed",
         type=float,
-        default=3.0,
-        help="maximum manual alignment speed (default: 3.0 m/s)",
+        default=20.0,
+        help="maximum manual driving speed (default: 20.0 m/s)",
     )
     parser.add_argument(
         "--manual-brake-deceleration",
