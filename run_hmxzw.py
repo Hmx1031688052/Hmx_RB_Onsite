@@ -22,6 +22,8 @@ Control policy:
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import math
@@ -226,8 +228,8 @@ def is_newer_session(candidate, current):
     )
 
 
-class LinuxEvdevKeyReader:
-    """Track key press/release state from a Linux evdev keyboard."""
+class LinuxKeyboardStateReader:
+    """Track held keys through X11 (remote) or Linux evdev (local)."""
 
     EV_KEY = 0x01
     KEY_W = 17
@@ -240,10 +242,25 @@ class LinuxEvdevKeyReader:
     KEY_RIGHT = 106
     KEY_DOWN = 108
     _EVENT = struct.Struct("@llHHi")
+    _X11_KEYSYMS = {
+        KEY_W: 0x0077,
+        KEY_S: 0x0073,
+        KEY_A: 0x0061,
+        KEY_D: 0x0064,
+        KEY_SPACE: 0x0020,
+        KEY_UP: 0xFF52,
+        KEY_LEFT: 0xFF51,
+        KEY_RIGHT: 0xFF53,
+        KEY_DOWN: 0xFF54,
+    }
 
     def __init__(self):
+        self.backend = None
         self.fd = None
         self.device_path = None
+        self.x11 = None
+        self.x11_display = None
+        self.x11_keycodes = {}
         self.pressed = set()
         self.launch_requested = False
         self.buffer = b""
@@ -304,7 +321,66 @@ class LinuxEvdevKeyReader:
                 unique.append(candidate)
         return unique
 
-    def open(self, configured_device=""):
+    def _open_x11(self):
+        display_name = str(os.environ.get("DISPLAY") or "").strip()
+        if not display_name:
+            raise RuntimeError("DISPLAY is not set")
+
+        library_name = ctypes.util.find_library("X11")
+        if not library_name:
+            raise RuntimeError("libX11 was not found")
+        try:
+            x11 = ctypes.CDLL(library_name)
+        except OSError as exc:
+            raise RuntimeError(f"cannot load {library_name}: {exc}") from exc
+
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.restype = ctypes.c_int
+        x11.XKeysymToKeycode.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+        x11.XQueryKeymap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_char),
+        ]
+        x11.XQueryKeymap.restype = ctypes.c_int
+
+        display = x11.XOpenDisplay(display_name.encode("utf-8"))
+        if not display:
+            raise RuntimeError(
+                f"cannot open X11 display {display_name!r}"
+            )
+
+        try:
+            keycodes = {
+                control_code: int(
+                    x11.XKeysymToKeycode(display, keysym)
+                )
+                for control_code, keysym in self._X11_KEYSYMS.items()
+            }
+            missing = [
+                code for code, keycode in keycodes.items()
+                if keycode <= 0
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"X11 keycode lookup failed for controls={missing}"
+                )
+        except Exception:
+            x11.XCloseDisplay(display)
+            raise
+
+        self.x11 = x11
+        self.x11_display = display
+        self.x11_keycodes = keycodes
+        self.backend = "x11"
+        self.device_path = f"X11(display={display_name})"
+
+    def _open_evdev(self, configured_device=""):
         if sys.platform != "linux":
             raise RuntimeError(
                 "manual simultaneous-key control requires Linux evdev"
@@ -340,24 +416,54 @@ class LinuxEvdevKeyReader:
                 "--keyboard-device /dev/input/eventN. "
                 f"Attempts: {detail}"
             )
+        self.backend = "evdev"
 
-        # evdev supplies the actual key state. cbreak is used only to keep
-        # W/A/S/D and escape sequences out of the shell's pending input.
+    def _suppress_terminal_input(self):
+        # X11/evdev supplies the actual key state. cbreak is used only to
+        # keep W/A/S/D and escape sequences out of the shell's pending input.
         if (
-            termios is not None
-            and tty is not None
-            and sys.stdin.isatty()
+            termios is None
+            or tty is None
+            or not sys.stdin.isatty()
         ):
-            try:
-                self.stdin_fd = sys.stdin.fileno()
-                self.saved_terminal_attributes = termios.tcgetattr(
-                    self.stdin_fd
-                )
-                tty.setcbreak(self.stdin_fd)
-            except (OSError, termios.error):
-                self.stdin_fd = None
-                self.saved_terminal_attributes = None
+            return
+        try:
+            self.stdin_fd = sys.stdin.fileno()
+            self.saved_terminal_attributes = termios.tcgetattr(
+                self.stdin_fd
+            )
+            tty.setcbreak(self.stdin_fd)
+        except (OSError, termios.error):
+            self.stdin_fd = None
+            self.saved_terminal_attributes = None
 
+    def open(self, configured_device=""):
+        if sys.platform != "linux":
+            raise RuntimeError(
+                "manual simultaneous-key control requires Linux"
+            )
+
+        errors = []
+        if not configured_device:
+            try:
+                self._open_x11()
+            except RuntimeError as exc:
+                errors.append(f"X11: {exc}")
+
+        if self.backend is None:
+            try:
+                self._open_evdev(configured_device)
+            except RuntimeError as exc:
+                errors.append(f"evdev: {exc}")
+                detail = " | ".join(errors)
+                raise RuntimeError(
+                    "cannot open a held-key input backend. Remote desktop "
+                    "control needs access to its X11 DISPLAY; local evdev "
+                    "control needs keyboard-device read permission. "
+                    f"Details: {detail}"
+                ) from exc
+
+        self._suppress_terminal_input()
         self.clear_state()
         return self.device_path
 
@@ -389,11 +495,7 @@ class LinuxEvdevKeyReader:
             if key_code == self.KEY_SPACE and value == 1:
                 self.launch_requested = True
 
-    def poll(self):
-        if self.fd is None:
-            return
-
-        # Drain duplicated terminal input without using it for control.
+    def _drain_terminal_input(self):
         if self.stdin_fd is not None:
             try:
                 readable, _, _ = select.select(
@@ -404,6 +506,26 @@ class LinuxEvdevKeyReader:
             except OSError:
                 pass
 
+    def _poll_x11(self):
+        keymap = (ctypes.c_char * 32)()
+        self.x11.XQueryKeymap(self.x11_display, keymap)
+        keymap_bytes = bytes(keymap)
+        new_pressed = {
+            control_code
+            for control_code, keycode in self.x11_keycodes.items()
+            if (
+                keymap_bytes[keycode // 8]
+                & (1 << (keycode % 8))
+            )
+        }
+        if (
+            self.KEY_SPACE in new_pressed
+            and self.KEY_SPACE not in self.pressed
+        ):
+            self.launch_requested = True
+        self.pressed = new_pressed
+
+    def _poll_evdev(self):
         while True:
             readable, _, _ = select.select([self.fd], [], [], 0.0)
             if not readable:
@@ -415,6 +537,15 @@ class LinuxEvdevKeyReader:
             if not chunk:
                 break
             self._process_bytes(chunk)
+
+    def poll(self):
+        if self.backend is None:
+            return
+        self._drain_terminal_input()
+        if self.backend == "x11":
+            self._poll_x11()
+        elif self.backend == "evdev":
+            self._poll_evdev()
 
     def consume_launch_request(self):
         requested = self.launch_requested
@@ -436,9 +567,15 @@ class LinuxEvdevKeyReader:
                 pass
         self.stdin_fd = None
         self.saved_terminal_attributes = None
+        if self.x11_display is not None:
+            self.x11.XCloseDisplay(self.x11_display)
+        self.x11 = None
+        self.x11_display = None
+        self.x11_keycodes = {}
         if self.fd is not None:
             os.close(self.fd)
         self.fd = None
+        self.backend = None
         self.device_path = None
         self.clear_state()
 
@@ -1192,7 +1329,7 @@ class Run3:
         )
 
         self.controller = StraightSprintController(args)
-        self.keyboard = LinuxEvdevKeyReader()
+        self.keyboard = LinuxKeyboardStateReader()
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
@@ -1486,7 +1623,11 @@ class Run3:
                     flush=True,
                 )
                 return
-            self.keyboard.clear_state()
+            # Synchronize the current remote/local key state and discard
+            # any SPACE edge received before START. Do not clear held keys:
+            # X11 reports them continuously, while evdev reports edges.
+            self.keyboard.poll()
+            self.keyboard.consume_launch_request()
             self.started = True
             startup_speed = (
                 float(self.ego["speed"])
@@ -1833,7 +1974,8 @@ def parse_args():
         "--keyboard-device",
         default="",
         help=(
-            "Linux evdev keyboard path; auto-detected by default "
+            "force a Linux evdev keyboard path; by default remote-capable "
+            "X11 input is tried first, then evdev is auto-detected "
             "(example: /dev/input/event3)"
         ),
     )
