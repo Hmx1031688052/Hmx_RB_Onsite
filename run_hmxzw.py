@@ -12,6 +12,11 @@ Removed:
   - Predictor
   - ROS and global planning
   - map loading and obstacle handling
+
+Control policy:
+  - move and align towards the goal for 1-2 seconds
+  - apply one INS-frame acceleration pulse
+  - hold a constant speed target with acceleration/steering locked to zero
 """
 
 import argparse
@@ -177,6 +182,13 @@ class StraightSprintController:
         self.align_confirm_frames = max(
             1, int(args.align_confirm_frames)
         )
+        self.align_min_duration = max(
+            0.0, float(args.align_min_duration)
+        )
+        self.align_max_duration = max(
+            self.align_min_duration,
+            float(args.align_max_duration),
+        )
         self.steer_kp = float(args.steer_kp)
         self.steer_sign = float(args.steer_sign)
         self.steer_limit_deg = abs(float(args.steer_limit_deg))
@@ -186,24 +198,6 @@ class StraightSprintController:
         )
         self.sprint_acceleration = float(args.sprint_acceleration)
         self.sprint_speed = max(0.0, float(args.sprint_speed))
-        self.sprint_steer_kp = max(
-            0.0, float(args.sprint_steer_kp)
-        )
-        self.sprint_steer_limit_deg = abs(
-            float(args.sprint_steer_limit_deg)
-        )
-        self.sprint_cross_track_gain = max(
-            0.0, float(args.sprint_cross_track_gain)
-        )
-        self.sprint_cross_track_softening = max(
-            0.01, float(args.sprint_cross_track_softening)
-        )
-        self.goal_aim_distance = max(
-            0.1, float(args.goal_aim_distance)
-        )
-        self.goal_pass_distance = max(
-            0.0, float(args.goal_pass_distance)
-        )
         self.line_sample_step = max(0.1, float(args.line_sample_step))
 
         self.start_xy = None
@@ -214,6 +208,9 @@ class StraightSprintController:
         self.state = "IDLE"
         self.confirm_count = 0
         self.last_confirm_sequence = None
+        self.align_started_time = None
+        self.sprint_pulse_sequence = None
+        self.sprint_pulse_complete = False
         self.last_log_time = 0.0
 
     def reset(self):
@@ -225,6 +222,9 @@ class StraightSprintController:
         self.state = "IDLE"
         self.confirm_count = 0
         self.last_confirm_sequence = None
+        self.align_started_time = None
+        self.sprint_pulse_sequence = None
+        self.sprint_pulse_complete = False
         self.last_log_time = 0.0
 
     def configure(self, init_state, target_state):
@@ -300,6 +300,11 @@ class StraightSprintController:
         ):
             return 0.0, 0.0, 0.0
 
+        now = time.monotonic()
+        if self.align_started_time is None:
+            self.align_started_time = now
+        align_elapsed = now - self.align_started_time
+
         goal_dx = self.goal_xy[0] - ego_x
         goal_dy = self.goal_xy[1] - ego_y
         distance_to_goal = math.hypot(goal_dx, goal_dy)
@@ -313,9 +318,8 @@ class StraightSprintController:
         cross_track = relative_y * tx - relative_x * ty
         remaining_along = self.line_length - along_track
 
-        # During moving alignment, aim at the actual goal rather than the
-        # original start heading.  Otherwise the turning arc can finish
-        # several metres beside the start-goal line.
+        # Moving alignment always aims at the actual goal.  Once alignment
+        # ends, steering is permanently zero for this episode.
         guidance_heading = goal_heading
         heading_error = wrap_angle(guidance_heading - ego_heading)
         heading_error_deg = math.degrees(heading_error)
@@ -334,10 +338,17 @@ class StraightSprintController:
                 else:
                     self.confirm_count = 0
 
-            if self.confirm_count >= self.align_confirm_frames:
-                # The car moved while aligning.  Anchor the sprint line at
-                # the current position so the remaining line intersects the
-                # exact goal instead of retaining the alignment-arc offset.
+            aligned_after_minimum = (
+                align_elapsed >= self.align_min_duration
+                and self.confirm_count >= self.align_confirm_frames
+            )
+            forced_after_maximum = (
+                align_elapsed >= self.align_max_duration
+            )
+            if aligned_after_minimum or forced_after_maximum:
+                # Freeze the straight-line heading at the end of the
+                # alignment window.  No lateral/heading feedback is applied
+                # during the high-speed portion.
                 self._set_tracking_line(ego_x, ego_y)
                 tx = math.cos(self.line_heading)
                 ty = math.sin(self.line_heading)
@@ -350,8 +361,13 @@ class StraightSprintController:
                 )
                 heading_error_deg = math.degrees(heading_error)
                 self.state = "SPRINT"
+                self.sprint_pulse_sequence = ins_sequence
+                self.sprint_pulse_complete = False
                 print(
                     "[run3] ALIGN -> SPRINT "
+                    f"reason="
+                    f"{'aligned' if aligned_after_minimum else 'timeout'} "
+                    f"elapsed={align_elapsed:.3f}s "
                     f"heading_error={heading_error_deg:.3f}deg "
                     f"confirm={self.confirm_count}/"
                     f"{self.align_confirm_frames} "
@@ -363,63 +379,31 @@ class StraightSprintController:
                 )
 
         if self.state == "SPRINT":
-            acceleration = self.sprint_acceleration
-            target_speed = self.sprint_speed
             if (
-                remaining_along <= -self.goal_pass_distance
-                or distance_to_goal <= self.goal_pass_distance
+                not self.sprint_pulse_complete
+                and fresh_ins
+                and self.sprint_pulse_sequence is not None
+                and ins_sequence != self.sprint_pulse_sequence
             ):
-                # Continue straight after crossing the scoring point.  Do
-                # not turn back towards a goal that is now behind the car.
-                guidance_heading = self.line_heading
-                heading_error = wrap_angle(
-                    guidance_heading - ego_heading
+                self.sprint_pulse_complete = True
+                print(
+                    "[run3] SPRINT pulse complete -> HOLD "
+                    f"speed={self.sprint_speed:.3f}m/s "
+                    "acc=0 steer=0",
+                    flush=True,
                 )
-                heading_error_deg = math.degrees(heading_error)
-                steering = 0.0
-            else:
-                speed_scale = max(
-                    abs(ego_speed),
-                    self.sprint_cross_track_softening,
-                )
-                cross_track_correction = math.atan2(
-                    -self.sprint_cross_track_gain * cross_track,
-                    speed_scale,
-                )
-                line_guidance = wrap_angle(
-                    self.line_heading + cross_track_correction
-                )
-
-                # Blend into direct goal interception near the endpoint.
-                # Angular interpolation avoids the +/-pi discontinuity.
-                goal_blend = min(
-                    1.0,
-                    max(
-                        0.0,
-                        (
-                            self.goal_aim_distance - distance_to_goal
-                        )
-                        / self.goal_aim_distance,
-                    ),
-                )
-                guidance_heading = wrap_angle(
-                    line_guidance
-                    + goal_blend
-                    * wrap_angle(goal_heading - line_guidance)
-                )
-                heading_error = wrap_angle(
-                    guidance_heading - ego_heading
-                )
-                heading_error_deg = math.degrees(heading_error)
-                raw_steering = (
-                    self.steer_sign
-                    * self.sprint_steer_kp
-                    * heading_error_deg
-                )
-                steering = max(
-                    -self.sprint_steer_limit_deg,
-                    min(self.sprint_steer_limit_deg, raw_steering),
-                )
+            acceleration = (
+                0.0
+                if self.sprint_pulse_complete
+                else self.sprint_acceleration
+            )
+            target_speed = self.sprint_speed
+            guidance_heading = self.line_heading
+            heading_error = wrap_angle(
+                guidance_heading - ego_heading
+            )
+            heading_error_deg = math.degrees(heading_error)
+            steering = 0.0
         else:
             acceleration = self.align_acceleration
             target_speed = self.align_speed
@@ -442,7 +426,6 @@ class StraightSprintController:
                     raw_steering,
                 )
 
-        now = time.monotonic()
         if now - self.last_log_time >= 0.25:
             self.last_log_time = now
             print(
@@ -456,6 +439,9 @@ class StraightSprintController:
                 f"heading_error={heading_error_deg:.3f}deg "
                 f"cross_track={cross_track:.3f}m "
                 f"remaining_along={remaining_along:.3f}m "
+                f"align_elapsed={align_elapsed:.3f}s "
+                f"pulse_active="
+                f"{int(self.state == 'SPRINT' and not self.sprint_pulse_complete)} "
                 f"ego_speed={ego_speed:.3f}m/s "
                 f"goal_distance={distance_to_goal:.3f}m "
                 f"acc={acceleration:.1f} speed={target_speed:.1f} "
@@ -944,17 +930,15 @@ class Run3:
             f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
             f"confirm_frames={self.controller.align_confirm_frames} "
+            f"align_window="
+            f"[{self.controller.align_min_duration:.1f},"
+            f"{self.controller.align_max_duration:.1f}]s "
             f"steer_kp={self.controller.steer_kp:.2f} "
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
-            f"sprint_steer_kp={self.controller.sprint_steer_kp:.2f} "
-            f"sprint_steer_limit="
-            f"{self.controller.sprint_steer_limit_deg:.1f}deg "
-            f"cross_track_gain="
-            f"{self.controller.sprint_cross_track_gain:.2f} "
-            f"goal_aim_distance="
-            f"{self.controller.goal_aim_distance:.1f}m "
+            "sprint_steer=LOCKED_ZERO "
+            "sprint_acc_mode=ONE_INS_PULSE_THEN_ZERO "
             f"sprint_acc={self.controller.sprint_acceleration:.1f} "
             f"sprint_speed={self.controller.sprint_speed:.1f}",
             flush=True,
@@ -1009,6 +993,18 @@ def parse_args():
         help="fresh in-tolerance INS frames before sprint (default: 2)",
     )
     parser.add_argument(
+        "--align-min-duration",
+        type=float,
+        default=1.0,
+        help="minimum moving-alignment time (default: 1.0 s)",
+    )
+    parser.add_argument(
+        "--align-max-duration",
+        type=float,
+        default=2.0,
+        help="force straight sprint after this time (default: 2.0 s)",
+    )
+    parser.add_argument(
         "--steer-kp",
         type=float,
         default=3.0,
@@ -1032,45 +1028,6 @@ def parse_args():
     )
     parser.add_argument(
         "--sprint-speed", type=float, default=10000.0
-    )
-    parser.add_argument(
-        "--sprint-steer-kp",
-        type=float,
-        default=1.5,
-        help=(
-            "sprint steering-wheel degrees per guidance-error degree "
-            "(default: 1.5)"
-        ),
-    )
-    parser.add_argument(
-        "--sprint-steer-limit-deg",
-        type=float,
-        default=11.0,
-        help="sprint steering-wheel limit (default: 11 deg)",
-    )
-    parser.add_argument(
-        "--sprint-cross-track-gain",
-        type=float,
-        default=3.0,
-        help="Stanley cross-track convergence gain (default: 3.0)",
-    )
-    parser.add_argument(
-        "--sprint-cross-track-softening",
-        type=float,
-        default=2.0,
-        help="low-speed denominator floor in m/s (default: 2.0)",
-    )
-    parser.add_argument(
-        "--goal-aim-distance",
-        type=float,
-        default=25.0,
-        help="distance for blending towards exact goal interception",
-    )
-    parser.add_argument(
-        "--goal-pass-distance",
-        type=float,
-        default=1.0,
-        help="inside/after this distance, hold heading and pass through",
     )
     parser.add_argument(
         "--line-sample-step", type=float, default=1.0
