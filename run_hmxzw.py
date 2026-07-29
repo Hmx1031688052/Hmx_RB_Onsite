@@ -17,7 +17,7 @@ Control policy:
   - speed-controlled alignment towards the goal (2 s is warning only)
   - zero steering and wait for heading/yaw/steering feedback to settle
   - re-anchor the goal line and align again if the new bearing has drifted
-  - repeat one logical acceleration pulse until DriverSim samples it
+  - repeat one logical acceleration pulse until the chassis samples it
   - hold a constant speed target with acceleration/steering locked to zero
 """
 
@@ -27,18 +27,10 @@ import json
 import math
 import os
 import re
-import shutil
-import signal
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 
 # The onsite tree may contain more than one generated ``chassis`` package.
@@ -148,13 +140,8 @@ from main.proto.messages_pb2 import (
 )
 
 
-TASK_TIMEOUT_RESTART_EXIT_CODE = 75
-SIMULATOR_STALL_RESTART_EXIT_CODE = 76
-SUPERVISOR_LOCK_PATH = Path("/tmp/run_hmxzw-supervisor.lock")
-
-
 class _TeeTextIO:
-    """Mirror supervisor/runtime text to the terminal and one archive."""
+    """Mirror single-process runtime text to the terminal and one archive."""
 
     def __init__(self, terminal, archive, lock):
         self.terminal = terminal
@@ -181,7 +168,7 @@ class _TeeTextIO:
 
 
 def _install_run_logging(args):
-    """Archive the supervisor plus every restarted runtime child."""
+    """Archive the single communication/control process."""
     log_dir = Path(args.run_log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -204,71 +191,6 @@ def _install_run_logging(args):
         flush=True,
     )
     return archive
-
-
-def _start_runtime_child(child_argv):
-    """Start a child and relay its output through the supervisor tee."""
-    process = subprocess.Popen(
-        child_argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        start_new_session=True,
-    )
-
-    def relay_output():
-        if process.stdout is None:
-            return
-        try:
-            for line in process.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-        finally:
-            process.stdout.close()
-
-    output_thread = threading.Thread(
-        target=relay_output,
-        name=f"run3-runtime-output-{process.pid}",
-        daemon=True,
-    )
-    output_thread.start()
-    process.run3_output_thread = output_thread
-    return process
-
-
-def acquire_supervisor_lock():
-    """Allow only one process to manage this runtime and DriverSim."""
-    if fcntl is None:
-        return None
-    lock_file = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8")
-    try:
-        fcntl.flock(
-            lock_file.fileno(),
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
-        )
-    except BlockingIOError:
-        lock_file.seek(0)
-        owner = lock_file.read().strip() or "unknown"
-        lock_file.close()
-        print(
-            "[run3][supervisor][FATAL] another supervisor is running "
-            f"pid={owner}",
-            flush=True,
-        )
-        return False
-    lock_file.seek(0)
-    lock_file.truncate()
-    lock_file.write(str(os.getpid()))
-    lock_file.flush()
-    print(
-        "[run3][supervisor] singleton lock acquired "
-        f"pid={os.getpid()}",
-        flush=True,
-    )
-    return lock_file
 
 
 def wrap_angle(angle):
@@ -813,9 +735,6 @@ class Run3:
         self.prepared = False
         self.started = False
         self.prepare_result_sent = False
-        self.test_started_monotonic = None
-        self.last_ins_monotonic = None
-
         self.ego = None
         self.first_current_ins_ready = False
         self.last_ins_sequence = None
@@ -832,8 +751,6 @@ class Run3:
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
-        self.first_control_before_prepare_sent = False
-
         self.prepare_channel = None
         self.notify_channel = None
         self.ins_channel = None
@@ -918,8 +835,6 @@ class Run3:
         self.prepared = False
         self.started = False
         self.prepare_result_sent = False
-        self.test_started_monotonic = None
-        self.last_ins_monotonic = None
         self.map_name = ""
         self.role_id = self.actor_id
         self.ego = None
@@ -930,7 +845,6 @@ class Run3:
         self.filtered_yaw_rate = 0.0
         self.latest_feedback = None
         self.start_gate_xy = None
-        self.first_control_before_prepare_sent = False
         self.controller.reset()
         if not keep_session:
             self.session_id = ""
@@ -1040,26 +954,6 @@ class Run3:
             f"map={self.map_name}",
             flush=True,
         )
-        if self.prepared:
-            # The official run.py publishes one neutral VehicleControl frame
-            # before acknowledging Prepare. This establishes control
-            # ownership/mode in DriverSim before the scenario starts.
-            self.first_control_before_prepare_sent = self.send_control(
-                0.0, 0.0, 0.0
-            )
-            if not self.first_control_before_prepare_sent:
-                print(
-                    "[run3][prepare][ERROR] neutral control before "
-                    "PrepareResult failed; reject prepare",
-                    flush=True,
-                )
-                self.prepared = False
-            else:
-                print(
-                    "[run3][prepare] first neutral control sent before "
-                    "PrepareResult acc=0 speed=0 steer=0",
-                    flush=True,
-                )
         self.send_prepare_result(self.prepared)
 
     def poll_prepare(self):
@@ -1107,24 +1001,9 @@ class Run3:
                 )
                 return
             self.started = True
-            self.test_started_monotonic = time.monotonic()
-            self.last_ins_monotonic = None
-            startup_speed = (
-                float(self.ego["speed"])
-                if self.ego is not None
-                else 0.0
-            )
-            startup_control_sent = self.send_control(
-                acceleration=0.0,
-                speed=startup_speed,
-                steering=0.0,
-            )
             print(
                 "[run3][notify] START "
-                f"session={self.session_id} role={self.role_id} "
-                f"timeout={self.args.task_timeout:.1f}s "
-                f"neutral_control={int(startup_control_sent)} "
-                f"startup_speed={startup_speed:.3f}m/s",
+                f"session={self.session_id} role={self.role_id}",
                 flush=True,
             )
             return
@@ -1246,7 +1125,6 @@ class Run3:
         self.last_heading = heading
         self.last_heading_monotonic = sample_time
         self.last_ins_sequence = sequence
-        self.last_ins_monotonic = sample_time
         self.ego = {
             "x": x,
             "y": y,
@@ -1329,59 +1207,6 @@ class Run3:
         )
         self.send_control(acceleration, speed, steering)
 
-    def enforce_task_timeout(self):
-        if (
-            not self.started
-            or self.test_started_monotonic is None
-        ):
-            return
-        elapsed = time.monotonic() - self.test_started_monotonic
-        waiting_for_first_ins = self.last_ins_monotonic is None
-        last_ins_time = (
-            self.test_started_monotonic
-            if waiting_for_first_ins
-            else self.last_ins_monotonic
-        )
-        ins_silence = time.monotonic() - last_ins_time
-        active_ins_timeout = (
-            self.args.first_ins_timeout
-            if waiting_for_first_ins
-            else self.args.ins_stall_timeout
-        )
-        if (
-            active_ins_timeout > 0.0
-            and ins_silence >= active_ins_timeout
-        ):
-            print(
-                "[run3][WATCHDOG] "
-                f"{'first INS timeout' if waiting_for_first_ins else 'INS stalled'} "
-                f"for {ins_silence:.3f}s "
-                f"(limit={active_ins_timeout:.1f}s); "
-                f"session={self.session_id}; "
-                "restart DriverSim and runtime",
-                flush=True,
-            )
-            self.send_control(0.0, 0.0, 0.0)
-            os._exit(SIMULATOR_STALL_RESTART_EXIT_CODE)
-
-        if self.args.task_timeout <= 0.0:
-            return
-        if elapsed < self.args.task_timeout:
-            return
-
-        print(
-            "[run3][WATCHDOG] task did not finish within "
-            f"{self.args.task_timeout:.1f}s; "
-            f"session={self.session_id} elapsed={elapsed:.3f}s; "
-            "terminate runtime child for a clean reconnect",
-            flush=True,
-        )
-        self.send_control(0.0, 0.0, 0.0)
-        # A process-level exit is intentional. It guarantees that native
-        # multicast channels and sockets are released before the supervisor
-        # starts a fresh runtime and re-registers the testee.
-        os._exit(TASK_TIMEOUT_RESTART_EXIT_CODE)
-
     def run(self):
         self.create_channels()
         print(
@@ -1425,7 +1250,6 @@ class Run3:
             self.poll_ins()
             self.poll_feedback()
             self.send_active_control()
-            self.enforce_task_timeout()
             time.sleep(min(0.002, 0.25 * self.control_period))
 
 
@@ -1673,757 +1497,14 @@ def parse_args():
     parser.add_argument(
         "--run-log-dir",
         default=str(_SCRIPT_DIR / "debug_logs" / "run_hmxzw"),
-        help="supervisor/runtime log archive directory",
+        help="single-process runtime log archive directory",
     )
     parser.add_argument(
         "--no-run-log",
         action="store_true",
         help="disable the top-level run_hmxzw terminal log archive",
     )
-    parser.add_argument(
-        "--task-timeout",
-        type=float,
-        default=20.0,
-        help=(
-            "restart the complete runtime if a started task has not ended "
-            "within this many seconds; <=0 disables (default: 20)"
-        ),
-    )
-    parser.add_argument(
-        "--restart-delay",
-        type=float,
-        default=3.0,
-        help=(
-            "delay allowing the daemon to observe the disconnect before "
-            "reconnecting (default: 3.0)"
-        ),
-    )
-    parser.add_argument(
-        "--simulator-dir",
-        default=(
-            "/media/pc/FanXiang2T/Onsite_FirstWithForth/"
-            "LinuxNoEditor416"
-        ),
-        help="directory containing the managed DriverSim start.sh",
-    )
-    parser.add_argument(
-        "--simulator-ready-delay",
-        type=float,
-        default=2.0,
-        help=(
-            "extra settling delay after DriverSim PID appears "
-            "(default: 2)"
-        ),
-    )
-    parser.add_argument(
-        "--simulator-start-timeout",
-        type=float,
-        default=30.0,
-        help=(
-            "maximum wait for a real DriverSim PID after start.sh "
-            "(default: 30)"
-        ),
-    )
-    parser.add_argument(
-        "--max-simulator-start-failures",
-        type=int,
-        default=3,
-        help=(
-            "stop after this many consecutive startup failures; "
-            "<=0 retries forever (default: 3)"
-        ),
-    )
-    parser.add_argument(
-        "--simulator-log-dir",
-        default="",
-        help=(
-            "DriverSim launch/crash archive directory; default is "
-            "Hmx_RB_Onsite/debug_logs/simulator"
-        ),
-    )
-    parser.add_argument(
-        "--first-ins-timeout",
-        type=float,
-        default=15.0,
-        help=(
-            "allow this long for the first post-START INS while loading "
-            "the scene; <=0 disables (default: 15)"
-        ),
-    )
-    parser.add_argument(
-        "--ins-stall-timeout",
-        type=float,
-        default=4.0,
-        help=(
-            "after START, restart DriverSim if no fresh INS arrives for this "
-            "many seconds; <=0 disables (default: 4)"
-        ),
-    )
-    parser.add_argument(
-        "--no-manage-simulator",
-        action="store_true",
-        help="leave LinuxNoEditor external and restart only this runtime",
-    )
-    parser.add_argument(
-        "--runtime-child",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     return parser.parse_args()
-
-
-def _terminate_managed_process(process, label):
-    if process is None or process.poll() is not None:
-        return
-    print(
-        f"[run3][supervisor] terminate {label} pid={process.pid}",
-        flush=True,
-    )
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-        process.wait(timeout=5.0)
-        return
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        pass
-    if process.poll() is None:
-        print(
-            f"[run3][supervisor] kill unresponsive {label} "
-            f"pid={process.pid}",
-            flush=True,
-        )
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass
-        process.wait()
-
-
-def _path_is_within(path, root):
-    try:
-        return os.path.commonpath(
-            (str(Path(path).resolve()), str(Path(root).resolve()))
-        ) == str(Path(root).resolve())
-    except (OSError, ValueError):
-        return False
-
-
-def _find_driver_sim_pids(simulator_dir):
-    """Return actual DriverSim PIDs, ignoring the short-lived start.sh."""
-    if os.name != "posix":
-        return []
-
-    simulator_root = Path(simulator_dir).expanduser().resolve()
-    driver_pids = []
-    for proc_dir in Path("/proc").glob("[0-9]*"):
-        try:
-            pid = int(proc_dir.name)
-            exe_path = Path(os.readlink(proc_dir / "exe"))
-        except (ValueError, OSError):
-            continue
-        if (
-            exe_path.name.lower().startswith("driversim")
-            and _path_is_within(exe_path, simulator_root)
-        ):
-            driver_pids.append(pid)
-    return sorted(driver_pids)
-
-
-def _kill_simulator_residuals(simulator_dir, reason):
-    """SIGKILL detached DriverSim/crash-window processes under one build."""
-    if os.name != "posix":
-        return
-
-    simulator_root = Path(simulator_dir).expanduser().resolve()
-    own_pid = os.getpid()
-    residual_pids = []
-    for proc_dir in Path("/proc").glob("[0-9]*"):
-        try:
-            pid = int(proc_dir.name)
-        except ValueError:
-            continue
-        if pid == own_pid:
-            continue
-
-        try:
-            exe_path = Path(os.readlink(proc_dir / "exe"))
-        except OSError:
-            exe_path = None
-        try:
-            cwd_path = Path(os.readlink(proc_dir / "cwd"))
-        except OSError:
-            cwd_path = None
-        try:
-            command_parts = (
-                (proc_dir / "cmdline")
-                .read_bytes()
-                .decode(errors="replace")
-                .split("\0")
-            )
-        except OSError:
-            command_parts = []
-
-        executable_name = (
-            "" if exe_path is None else exe_path.name.lower()
-        )
-        managed_binary = (
-            exe_path is not None
-            and _path_is_within(exe_path, simulator_root)
-            and (
-                executable_name.startswith("driversim")
-                or "crashreport" in executable_name
-            )
-        )
-        managed_launcher = (
-            cwd_path is not None
-            and _path_is_within(cwd_path, simulator_root)
-            and any(
-                Path(part).name == "start.sh"
-                for part in command_parts
-                if part
-            )
-        )
-        if managed_binary or managed_launcher:
-            residual_pids.append(pid)
-
-    for pid in sorted(set(residual_pids), reverse=True):
-        print(
-            "[run3][supervisor] SIGKILL simulator residual "
-            f"pid={pid} reason={reason}",
-            flush=True,
-        )
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-    if residual_pids:
-        time.sleep(0.5)
-
-
-def _simulator_log_root(args):
-    configured = str(args.simulator_log_dir or "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return (_SCRIPT_DIR / "debug_logs" / "simulator").resolve()
-
-
-def _diagnostic_stamp():
-    milliseconds = int(time.time() * 1000) % 1000
-    return f"{time.strftime('%Y%m%d_%H%M%S')}_{milliseconds:03d}"
-
-
-def _copy_recent_simulator_artifacts(source_dir, target_dir, limit=8):
-    if not source_dir.is_dir():
-        return []
-    candidates = []
-    for path in source_dir.rglob("*"):
-        try:
-            if path.is_file():
-                candidates.append((path.stat().st_mtime, path))
-        except OSError:
-            continue
-    copied = []
-    for _, source in sorted(candidates, reverse=True)[:limit]:
-        relative = source.relative_to(source_dir)
-        target = target_dir / relative
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-            copied.append(str(relative))
-        except OSError as exc:
-            copied.append(f"ERROR {relative}: {exc}")
-    return copied
-
-
-def _capture_diagnostic_command(target, command):
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            timeout=8.0,
-            check=False,
-        )
-        output = result.stdout or ""
-        if len(output) > 200_000:
-            output = output[-200_000:]
-        target.write_text(
-            f"command={command!r}\nreturncode={result.returncode}\n"
-            f"{output}",
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        target.write_text(
-            f"command={command!r}\n"
-            f"capture_error={type(exc).__name__}: {exc}\n",
-            encoding="utf-8",
-        )
-
-
-def _write_simulator_crash_summary(event_dir, launch_log_path):
-    rules = (
-        (
-            "UE4 checked-cast fatal（场景对象类型不匹配）",
-            re.compile(
-                r"Cast of .* to .* failed|CastChecked",
-                re.IGNORECASE,
-            ),
-        ),
-        (
-            "GPU/Vulkan 设备丢失或显卡驱动异常",
-            re.compile(
-                r"VK_ERROR_DEVICE_LOST|GPU.?Crash|NVRM: Xid|"
-                r"device lost",
-                re.IGNORECASE,
-            ),
-        ),
-        (
-            "内存或显存不足",
-            re.compile(
-                r"out of memory|oom-kill|killed process|"
-                r"memory allocation failed",
-                re.IGNORECASE,
-            ),
-        ),
-        (
-            "动态库缺失或加载失败",
-            re.compile(
-                r"error while loading shared libraries|"
-                r"cannot open shared object file|undefined symbol",
-                re.IGNORECASE,
-            ),
-        ),
-        (
-            "云端登录或 channels 配置失败",
-            re.compile(
-                r"登录失败|http request failed|channels info is empty",
-                re.IGNORECASE,
-            ),
-        ),
-        (
-            "原生崩溃（段错误/异常终止）",
-            re.compile(
-                r"segmentation fault|signal 11|core dumped|"
-                r"fatal error",
-                re.IGNORECASE,
-            ),
-        ),
-    )
-
-    sources = []
-    if launch_log_path:
-        sources.append(Path(launch_log_path))
-    for path in event_dir.rglob("*"):
-        if (
-            path.is_file()
-            and path.suffix.lower()
-            in {".log", ".txt", ".xml", ".json"}
-        ):
-            sources.append(path)
-
-    findings = []
-    seen = set()
-    for source in sources:
-        try:
-            data = source.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            continue
-        if len(data) > 500_000:
-            data = data[-500_000:]
-        for line in data.splitlines():
-            for cause, pattern in rules:
-                if not pattern.search(line):
-                    continue
-                key = (cause, line.strip())
-                if key in seen:
-                    continue
-                seen.add(key)
-                findings.append(
-                    (cause, str(source), line.strip()[:1000])
-                )
-                break
-            if len(findings) >= 30:
-                break
-        if len(findings) >= 30:
-            break
-
-    summary_lines = []
-    if findings:
-        summary_lines.append(f"初步判断：{findings[0][0]}")
-        summary_lines.append("")
-        summary_lines.append("匹配证据：")
-        for cause, source, line in findings:
-            summary_lines.append(f"- [{cause}] {source}")
-            summary_lines.append(f"  {line}")
-    else:
-        summary_lines.extend(
-            (
-                "初步判断：未匹配到常见崩溃特征。",
-                "",
-                "请重点检查 Saved/Logs、Saved/Crashes、"
-                "coredumpctl.txt 和 kernel-warnings.txt。",
-            )
-        )
-    (event_dir / "summary.txt").write_text(
-        "\n".join(summary_lines) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _archive_simulator_diagnostics(args, reason, launcher=None):
-    """Copy existing UE logs/crash data before killing or restarting it."""
-    try:
-        log_root = _simulator_log_root(args)
-        event_dir = (
-            log_root
-            / "events"
-            / f"{_diagnostic_stamp()}_{reason}"
-        )
-        suffix = 1
-        while event_dir.exists():
-            event_dir = event_dir.with_name(
-                f"{event_dir.name}_{suffix}"
-            )
-            suffix += 1
-        event_dir.mkdir(parents=True, exist_ok=False)
-
-        simulator_root = Path(
-            args.simulator_dir
-        ).expanduser().resolve()
-        saved_root = simulator_root / "DriverSim" / "Saved"
-        copied_logs = _copy_recent_simulator_artifacts(
-            saved_root / "Logs",
-            event_dir / "Saved" / "Logs",
-        )
-
-        copied_crash = []
-        crashes_root = saved_root / "Crashes"
-        if crashes_root.is_dir():
-            crash_dirs = []
-            for crash_dir in crashes_root.iterdir():
-                try:
-                    if crash_dir.is_dir():
-                        crash_dirs.append(
-                            (crash_dir.stat().st_mtime, crash_dir)
-                        )
-                except OSError:
-                    continue
-            if crash_dirs:
-                newest_crash = max(
-                    crash_dirs, key=lambda item: item[0]
-                )[1]
-                target = (
-                    event_dir
-                    / "Saved"
-                    / "Crashes"
-                    / newest_crash.name
-                )
-                try:
-                    shutil.copytree(newest_crash, target)
-                    copied_crash.append(newest_crash.name)
-                except OSError as exc:
-                    copied_crash.append(
-                        f"ERROR {newest_crash.name}: {exc}"
-                    )
-
-        metadata = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "reason": reason,
-            "simulator_dir": str(simulator_root),
-            "driver_pids": _find_driver_sim_pids(
-                args.simulator_dir
-            ),
-            "launcher_pid": (
-                None if launcher is None else launcher.pid
-            ),
-            "launcher_code": (
-                None if launcher is None else launcher.poll()
-            ),
-            "launch_log": (
-                None
-                if launcher is None
-                else getattr(launcher, "run3_log_path", None)
-            ),
-            "copied_logs": copied_logs,
-            "copied_crash": copied_crash,
-        }
-        (event_dir / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        if os.name == "posix":
-            _capture_diagnostic_command(
-                event_dir / "nvidia-smi.txt",
-                ["nvidia-smi"],
-            )
-            _capture_diagnostic_command(
-                event_dir / "kernel-warnings.txt",
-                ["dmesg", "--ctime", "--level=err,warn"],
-            )
-            _capture_diagnostic_command(
-                event_dir / "coredumpctl.txt",
-                [
-                    "coredumpctl",
-                    "--no-pager",
-                    "info",
-                    "DriverSim",
-                ],
-            )
-        _write_simulator_crash_summary(
-            event_dir,
-            metadata["launch_log"],
-        )
-        print(
-            "[run3][supervisor] simulator diagnostics archived "
-            f"reason={reason} path={event_dir}",
-            flush=True,
-        )
-        return event_dir
-    except Exception as exc:
-        print(
-            "[run3][supervisor][WARN] diagnostic archive failed "
-            f"reason={reason} error={type(exc).__name__}: {exc}",
-            flush=True,
-        )
-        return None
-
-
-def _start_managed_simulator(args):
-    simulator_dir = Path(args.simulator_dir).expanduser().resolve()
-    start_script = simulator_dir / "start.sh"
-    if not start_script.is_file():
-        raise FileNotFoundError(
-            f"DriverSim start script not found: {start_script}"
-        )
-    if start_script.stat().st_size == 0:
-        raise RuntimeError(
-            f"DriverSim start script is empty: {start_script}; "
-            "refuse to enter the restart loop"
-        )
-    launch_log_dir = _simulator_log_root(args) / "launches"
-    launch_log_dir.mkdir(parents=True, exist_ok=True)
-    launch_log_path = (
-        launch_log_dir
-        / f"driversim_{_diagnostic_stamp()}_{os.getpid()}.log"
-    )
-    print(
-        "[run3][supervisor] start DriverSim "
-        f"cwd={simulator_dir} command='bash start.sh' "
-        f"log={launch_log_path}",
-        flush=True,
-    )
-    with launch_log_path.open("ab", buffering=0) as launch_log:
-        process = subprocess.Popen(
-            ["bash", "start.sh"],
-            cwd=str(simulator_dir),
-            stdout=launch_log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    process.run3_log_path = str(launch_log_path)
-    (
-        _simulator_log_root(args) / "latest_launch_log.txt"
-    ).write_text(str(launch_log_path), encoding="utf-8")
-    return process
-
-
-def _wait_for_driver_sim(args, launcher):
-    timeout = max(0.1, float(args.simulator_start_timeout))
-    deadline = time.monotonic() + timeout
-    launcher_exit_seen = None
-    while time.monotonic() < deadline:
-        driver_pids = _find_driver_sim_pids(args.simulator_dir)
-        if driver_pids:
-            settle_delay = max(
-                0.0, float(args.simulator_ready_delay)
-            )
-            if settle_delay:
-                time.sleep(settle_delay)
-            return _find_driver_sim_pids(args.simulator_dir)
-
-        launcher_code = launcher.poll()
-        if launcher_code is not None:
-            if launcher_exit_seen is None:
-                launcher_exit_seen = time.monotonic()
-            elif time.monotonic() - launcher_exit_seen >= 1.0:
-                break
-        time.sleep(0.2)
-    return []
-
-
-def supervise_runtime(args):
-    child_argv = [
-        sys.executable,
-        "-u",
-        str(Path(__file__).resolve()),
-        *sys.argv[1:],
-        "--runtime-child",
-    ]
-    restart_count = 0
-    simulator_start_failures = 0
-    simulator = None
-    runtime = None
-    while True:
-        try:
-            if not args.no_manage_simulator:
-                driver_pids = _find_driver_sim_pids(args.simulator_dir)
-                if driver_pids:
-                    simulator = None
-                    print(
-                        "[run3][supervisor] attach existing DriverSim "
-                        f"pids={driver_pids}",
-                        flush=True,
-                    )
-                else:
-                    simulator = _start_managed_simulator(args)
-                    driver_pids = _wait_for_driver_sim(args, simulator)
-
-                if not driver_pids:
-                    launcher_code = simulator.poll()
-                    simulator_start_failures += 1
-                    print(
-                        "[run3][supervisor] DriverSim process not found "
-                        "after startup wait "
-                        f"launcher_code={launcher_code} "
-                        f"failure={simulator_start_failures}",
-                        flush=True,
-                    )
-                    _archive_simulator_diagnostics(
-                        args,
-                        reason="startup_process_missing",
-                        launcher=simulator,
-                    )
-                    _terminate_managed_process(
-                        simulator, "DriverSim launcher"
-                    )
-                    _kill_simulator_residuals(
-                        args.simulator_dir,
-                        reason="startup_process_missing",
-                    )
-                    simulator = None
-                    failure_limit = int(
-                        args.max_simulator_start_failures
-                    )
-                    if (
-                        failure_limit > 0
-                        and simulator_start_failures >= failure_limit
-                    ):
-                        print(
-                            "[run3][supervisor][FATAL] stop after "
-                            f"{simulator_start_failures} consecutive "
-                            "DriverSim startup failures",
-                            flush=True,
-                        )
-                        return 1
-                    time.sleep(max(0.0, float(args.restart_delay)))
-                    continue
-                simulator_start_failures = 0
-                launcher_code = (
-                    None if simulator is None else simulator.poll()
-                )
-                print(
-                    "[run3][supervisor] DriverSim process ready "
-                    f"pids={driver_pids} launcher_code={launcher_code}",
-                    flush=True,
-                )
-
-            print(
-                "[run3][supervisor] start runtime "
-                f"attempt={restart_count + 1} "
-                f"task_timeout={args.task_timeout:.1f}s "
-                f"first_ins_timeout={args.first_ins_timeout:.1f}s "
-                f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
-                flush=True,
-            )
-            runtime = _start_runtime_child(child_argv)
-            restart_reason = None
-            return_code = None
-            while restart_reason is None:
-                return_code = runtime.poll()
-                if return_code is not None:
-                    if return_code == TASK_TIMEOUT_RESTART_EXIT_CODE:
-                        restart_reason = "task_timeout"
-                    elif (
-                        return_code
-                        == SIMULATOR_STALL_RESTART_EXIT_CODE
-                    ):
-                        restart_reason = "ins_stall"
-                    else:
-                        break
-                if (
-                    not args.no_manage_simulator
-                    and not _find_driver_sim_pids(args.simulator_dir)
-                ):
-                    restart_reason = "simulator_process_missing"
-                if restart_reason is None and return_code is None:
-                    time.sleep(0.2)
-        except KeyboardInterrupt:
-            print(
-                "[run3][supervisor] interrupted; stop managed processes",
-                flush=True,
-            )
-            _terminate_managed_process(runtime, "runtime")
-            _terminate_managed_process(simulator, "DriverSim")
-            if not args.no_manage_simulator:
-                _kill_simulator_residuals(
-                    args.simulator_dir,
-                    reason="supervisor_interrupted",
-                )
-            return 130
-
-        if restart_reason is None:
-            _terminate_managed_process(simulator, "DriverSim")
-            if not args.no_manage_simulator:
-                _kill_simulator_residuals(
-                    args.simulator_dir,
-                    reason="runtime_exit",
-                )
-            print(
-                "[run3][supervisor] runtime exited "
-                f"code={return_code}; supervisor stops",
-                flush=True,
-            )
-            return return_code
-
-        if not args.no_manage_simulator:
-            if restart_reason == "simulator_process_missing":
-                # Give UE's crash handler a moment to finish CrashContext
-                # and minidump files before they are copied and killed.
-                time.sleep(1.0)
-            _archive_simulator_diagnostics(
-                args,
-                reason=restart_reason,
-                launcher=simulator,
-            )
-        _terminate_managed_process(runtime, "runtime")
-        _terminate_managed_process(simulator, "DriverSim")
-        if not args.no_manage_simulator:
-            _kill_simulator_residuals(
-                args.simulator_dir,
-                reason=restart_reason,
-            )
-        runtime = None
-        simulator = None
-        restart_count += 1
-        restart_delay = max(0.0, float(args.restart_delay))
-        print(
-            "[run3][supervisor] restart complete stack "
-            f"reason={restart_reason} count={restart_count} "
-            f"delay={restart_delay:.1f}s",
-            flush=True,
-        )
-        if restart_delay > 0.0:
-            time.sleep(restart_delay)
 
 
 def _log_source_identity():
@@ -2439,15 +1520,9 @@ def main():
     run_log_archive = None
     try:
         args = parse_args()
-        if not args.runtime_child:
-            if not args.no_run_log:
-                run_log_archive = _install_run_logging(args)
+        if not args.no_run_log:
+            run_log_archive = _install_run_logging(args)
         _log_source_identity()
-        if not args.runtime_child:
-            supervisor_lock = acquire_supervisor_lock()
-            if supervisor_lock is False:
-                raise SystemExit(2)
-            raise SystemExit(supervise_runtime(args))
         Run3(args).run()
     except KeyboardInterrupt:
         print("[run3] stopped by user", flush=True)
