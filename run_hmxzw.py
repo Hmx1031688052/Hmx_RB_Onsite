@@ -1315,6 +1315,7 @@ class StraightSprintController:
         self.manual_speed = 0.0
         self.manual_steering_deg = 0.0
         self.manual_launch_requested = False
+        self.auto_sprint_override_requested = False
         self.manual_last_input_time = None
         self.manual_last_held_state = None
         self.manual_last_input_log_time = 0.0
@@ -1339,6 +1340,7 @@ class StraightSprintController:
         self.manual_speed = 0.0
         self.manual_steering_deg = 0.0
         self.manual_launch_requested = False
+        self.auto_sprint_override_requested = False
         self.manual_last_input_time = None
         self.manual_last_held_state = None
         self.manual_last_input_log_time = 0.0
@@ -1488,6 +1490,19 @@ class StraightSprintController:
             )
         return changed or held_state_changed
 
+    def request_auto_sprint_override(self):
+        if self.manual_start or self.state not in ("ALIGN", "SETTLE"):
+            return False
+        if self.auto_sprint_override_requested:
+            return True
+        self.auto_sprint_override_requested = True
+        print(
+            "[run3][AUTO] SPACE override requested; "
+            "zero steering and sprint on current heading",
+            flush=True,
+        )
+        return True
+
     def _set_tracking_line(self, start_x, start_y):
         goal_x, goal_y = self.goal_xy
         dx = goal_x - start_x
@@ -1627,6 +1642,36 @@ class StraightSprintController:
         )
         if fresh_ins:
             self.last_confirm_sequence = ins_sequence
+
+        if (
+            self.auto_sprint_override_requested
+            and self.state in ("ALIGN", "SETTLE")
+        ):
+            previous_state = self.state
+            self.auto_sprint_override_requested = False
+            self._set_manual_sprint_line(
+                ego_x, ego_y, ego_heading
+            )
+            tx = math.cos(self.line_heading)
+            ty = math.sin(self.line_heading)
+            along_track = 0.0
+            cross_track = 0.0
+            remaining_along = self.line_length
+            guidance_heading = self.line_heading
+            heading_error = 0.0
+            heading_error_deg = 0.0
+            self.state = "SPRINT"
+            self.sprint_pulse_started_time = now
+            self.sprint_pulse_entry_speed = float(ego_speed)
+            self.sprint_pulse_complete = False
+            print(
+                f"[run3] {previous_state} -> SPRINT by SPACE override "
+                f"straight_heading="
+                f"{math.degrees(self.line_heading):.3f}deg "
+                f"speed={ego_speed:.3f}m/s "
+                "command_steer=0 without automatic settle wait",
+                flush=True,
+            )
 
         if self.state == "ALIGN":
             if fresh_ins:
@@ -1977,6 +2022,7 @@ class Run3:
 
         self.controller = StraightSprintController(args)
         self.keyboard = LinuxKeyboardStateReader()
+        self.keyboard_available = False
         self.alignment_window = X11AlignmentWindow(
             enabled=(
                 self.controller.manual_start
@@ -2503,11 +2549,15 @@ class Run3:
         self.send_control(acceleration, speed, steering)
 
     def poll_keyboard(self):
-        if not self.controller.manual_start:
+        if not self.keyboard_available:
             return
         self.keyboard.poll()
         launch_requested = self.keyboard.consume_launch_request()
         if not self.started:
+            return
+        if not self.controller.manual_start:
+            if launch_requested:
+                self.controller.request_auto_sprint_override()
             return
         self.controller.update_manual_inputs(
             forward=self.keyboard.is_pressed(
@@ -2536,10 +2586,22 @@ class Run3:
 
     def run(self):
         self.create_channels()
-        if self.controller.manual_start:
+        keyboard_device = None
+        try:
             keyboard_device = self.keyboard.open(
                 self.args.keyboard_device
             )
+            self.keyboard_available = True
+        except RuntimeError as exc:
+            if self.controller.manual_start:
+                raise
+            print(
+                "[run3][AUTO][WARN] SPACE sprint override disabled; "
+                f"automatic flow continues unchanged: {exc}",
+                flush=True,
+            )
+
+        if self.controller.manual_start:
             self.alignment_window.open()
             print(
                 "[run3][manual] controls ready: "
@@ -2554,6 +2616,14 @@ class Run3:
                 f"{self.controller.manual_steer_command_deg:.1f}deg, "
                 "simultaneous keys enabled, "
                 "SPACE hold speed/centre then sprint",
+                flush=True,
+            )
+        elif self.keyboard_available:
+            print(
+                "[run3][AUTO] SPACE override ready: "
+                f"device={keyboard_device}; "
+                "during ALIGN/SETTLE press SPACE to command steer=0 "
+                "and enter SPRINT immediately",
                 flush=True,
             )
         print(
