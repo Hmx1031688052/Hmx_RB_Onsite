@@ -14,7 +14,8 @@ Removed:
   - map loading and obstacle handling
 
 Control policy:
-  - move and align towards the goal for 1-2 seconds
+  - speed-controlled alignment towards the goal (2 s is warning only)
+  - zero steering and wait for heading/yaw/steering feedback to settle
   - apply one INS-frame acceleration pulse
   - hold a constant speed target with acceleration/steering locked to zero
 """
@@ -263,6 +264,12 @@ class StraightSprintController:
     def __init__(self, args):
         self.align_speed = max(0.0, float(args.align_speed))
         self.align_acceleration = float(args.align_acceleration)
+        self.align_speed_kp = max(
+            0.0, float(args.align_speed_kp)
+        )
+        self.align_max_deceleration = abs(
+            float(args.align_max_deceleration)
+        )
         self.align_tolerance_deg = max(
             0.0, float(args.align_tolerance_deg)
         )
@@ -275,6 +282,23 @@ class StraightSprintController:
         self.align_max_duration = max(
             self.align_min_duration,
             float(args.align_max_duration),
+        )
+        self.settle_speed = max(0.0, float(args.settle_speed))
+        self.settle_duration = max(
+            0.0, float(args.settle_duration)
+        )
+        self.settle_confirm_frames = max(
+            1, int(args.settle_confirm_frames)
+        )
+        self.settle_yaw_rate_deg = max(
+            0.0, float(args.settle_yaw_rate_deg)
+        )
+        self.settle_steering_deg = max(
+            0.0, float(args.settle_steering_deg)
+        )
+        self.align_reentry_error_deg = max(
+            self.align_tolerance_deg,
+            float(args.align_reentry_error_deg),
         )
         self.steer_kp = float(args.steer_kp)
         self.steer_sign = float(args.steer_sign)
@@ -296,6 +320,9 @@ class StraightSprintController:
         self.confirm_count = 0
         self.last_confirm_sequence = None
         self.align_started_time = None
+        self.align_timeout_warned = False
+        self.settle_started_time = None
+        self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
         self.sprint_pulse_complete = False
         self.last_log_time = 0.0
@@ -310,6 +337,9 @@ class StraightSprintController:
         self.confirm_count = 0
         self.last_confirm_sequence = None
         self.align_started_time = None
+        self.align_timeout_warned = False
+        self.settle_started_time = None
+        self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
         self.sprint_pulse_complete = False
         self.last_log_time = 0.0
@@ -379,9 +409,41 @@ class StraightSprintController:
             for index in range(segment_count + 1)
         ]
 
-    def command(self, ego_x, ego_y, ego_heading, ego_speed, ins_sequence):
+    def _speed_acceleration(self, target_speed, ego_speed):
+        command = self.align_speed_kp * (
+            float(target_speed) - float(ego_speed)
+        )
+        return max(
+            -self.align_max_deceleration,
+            min(self.align_acceleration, command),
+        )
+
+    def _alignment_steering(self, heading_error_deg):
+        if abs(heading_error_deg) <= self.align_tolerance_deg:
+            return 0.0
+        raw_steering = (
+            self.steer_sign * self.steer_kp * heading_error_deg
+        )
+        steering_magnitude = max(
+            self.steer_min_deg, abs(raw_steering)
+        )
+        return math.copysign(
+            min(self.steer_limit_deg, steering_magnitude),
+            raw_steering,
+        )
+
+    def command(
+        self,
+        ego_x,
+        ego_y,
+        ego_heading,
+        ego_speed,
+        ego_yaw_rate,
+        steering_feedback,
+        ins_sequence,
+    ):
         if (
-            self.state not in ("ALIGN", "SPRINT")
+            self.state not in ("ALIGN", "SETTLE", "SPRINT")
             or self.goal_xy is None
             or self.line_heading is None
         ):
@@ -410,6 +472,16 @@ class StraightSprintController:
         guidance_heading = goal_heading
         heading_error = wrap_angle(guidance_heading - ego_heading)
         heading_error_deg = math.degrees(heading_error)
+        ego_yaw_rate_deg = math.degrees(float(ego_yaw_rate))
+        steering_feedback_valid = (
+            steering_feedback is not None
+            and math.isfinite(float(steering_feedback))
+        )
+        steering_feedback_deg = (
+            float(steering_feedback)
+            if steering_feedback_valid
+            else float("nan")
+        )
 
         fresh_ins = (
             ins_sequence is not None
@@ -425,45 +497,115 @@ class StraightSprintController:
                 else:
                     self.confirm_count = 0
 
-            aligned_after_minimum = (
+            ready_for_settle = (
                 align_elapsed >= self.align_min_duration
                 and self.confirm_count >= self.align_confirm_frames
             )
-            forced_after_maximum = (
+            if (
                 align_elapsed >= self.align_max_duration
-            )
-            if aligned_after_minimum or forced_after_maximum:
-                # Freeze the straight-line heading at the end of the
-                # alignment window.  No lateral/heading feedback is applied
-                # during the high-speed portion.
-                self._set_tracking_line(ego_x, ego_y)
-                tx = math.cos(self.line_heading)
-                ty = math.sin(self.line_heading)
-                along_track = 0.0
-                cross_track = 0.0
-                remaining_along = self.line_length
-                guidance_heading = self.line_heading
-                heading_error = wrap_angle(
-                    guidance_heading - ego_heading
-                )
-                heading_error_deg = math.degrees(heading_error)
-                self.state = "SPRINT"
-                self.sprint_pulse_sequence = ins_sequence
-                self.sprint_pulse_complete = False
+                and not self.align_timeout_warned
+            ):
+                self.align_timeout_warned = True
                 print(
-                    "[run3] ALIGN -> SPRINT "
-                    f"reason="
-                    f"{'aligned' if aligned_after_minimum else 'timeout'} "
+                    "[run3][ALIGN][WARN] alignment window exceeded; "
+                    "continue aligning instead of unsafe sprint "
                     f"elapsed={align_elapsed:.3f}s "
                     f"heading_error={heading_error_deg:.3f}deg "
                     f"confirm={self.confirm_count}/"
-                    f"{self.align_confirm_frames} "
-                    f"anchor=({ego_x:.3f},{ego_y:.3f}) "
-                    f"remaining_line={self.line_length:.3f}m "
-                    f"acc={self.sprint_acceleration:.1f} "
-                    f"speed={self.sprint_speed:.1f}",
+                    f"{self.align_confirm_frames}",
                     flush=True,
                 )
+            if ready_for_settle:
+                self.state = "SETTLE"
+                self.settle_started_time = now
+                self.settle_confirm_count = 0
+                print(
+                    "[run3] ALIGN -> SETTLE "
+                    f"elapsed={align_elapsed:.3f}s "
+                    f"heading_error={heading_error_deg:.3f}deg "
+                    f"speed={ego_speed:.3f}m/s; "
+                    "command steer=0 and wait for yaw/steering decay",
+                    flush=True,
+                )
+
+        settle_elapsed = (
+            0.0
+            if self.settle_started_time is None
+            else now - self.settle_started_time
+        )
+        if self.state == "SETTLE":
+            if (
+                fresh_ins
+                and abs(heading_error_deg)
+                > self.align_reentry_error_deg
+            ):
+                self.state = "ALIGN"
+                self.confirm_count = 0
+                self.settle_confirm_count = 0
+                self.settle_started_time = None
+                print(
+                    "[run3] SETTLE -> ALIGN "
+                    f"heading drifted to {heading_error_deg:.3f}deg "
+                    f"(limit={self.align_reentry_error_deg:.3f}deg)",
+                    flush=True,
+                )
+            else:
+                heading_ok = (
+                    abs(heading_error_deg)
+                    <= self.align_tolerance_deg
+                )
+                yaw_ok = (
+                    abs(ego_yaw_rate_deg)
+                    <= self.settle_yaw_rate_deg
+                )
+                steering_ok = (
+                    not steering_feedback_valid
+                    or abs(steering_feedback_deg)
+                    <= self.settle_steering_deg
+                )
+                stable_now = (
+                    settle_elapsed >= self.settle_duration
+                    and heading_ok
+                    and yaw_ok
+                    and steering_ok
+                )
+                if fresh_ins:
+                    if stable_now:
+                        self.settle_confirm_count += 1
+                    else:
+                        self.settle_confirm_count = 0
+                if (
+                    self.settle_confirm_count
+                    >= self.settle_confirm_frames
+                ):
+                    self._set_tracking_line(ego_x, ego_y)
+                    tx = math.cos(self.line_heading)
+                    ty = math.sin(self.line_heading)
+                    along_track = 0.0
+                    cross_track = 0.0
+                    remaining_along = self.line_length
+                    guidance_heading = self.line_heading
+                    heading_error = wrap_angle(
+                        guidance_heading - ego_heading
+                    )
+                    heading_error_deg = math.degrees(
+                        heading_error
+                    )
+                    self.state = "SPRINT"
+                    self.sprint_pulse_sequence = ins_sequence
+                    self.sprint_pulse_complete = False
+                    print(
+                        "[run3] SETTLE -> SPRINT "
+                        f"heading_error={heading_error_deg:.3f}deg "
+                        f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
+                        f"steer_feedback="
+                        f"{steering_feedback_deg:.3f}deg "
+                        f"stable={self.settle_confirm_count}/"
+                        f"{self.settle_confirm_frames} "
+                        f"anchor=({ego_x:.3f},{ego_y:.3f}) "
+                        f"remaining_line={self.line_length:.3f}m",
+                        flush=True,
+                    )
 
         if self.state == "SPRINT":
             if (
@@ -491,27 +633,20 @@ class StraightSprintController:
             )
             heading_error_deg = math.degrees(heading_error)
             steering = 0.0
+        elif self.state == "SETTLE":
+            acceleration = self._speed_acceleration(
+                self.settle_speed, ego_speed
+            )
+            target_speed = self.settle_speed
+            steering = 0.0
         else:
-            acceleration = self.align_acceleration
+            acceleration = self._speed_acceleration(
+                self.align_speed, ego_speed
+            )
             target_speed = self.align_speed
-            if abs(heading_error_deg) <= self.align_tolerance_deg:
-                # Centre immediately inside the acceptance band so delayed
-                # steering feedback does not carry the chassis through it.
-                steering = 0.0
-            else:
-                raw_steering = (
-                    self.steer_sign
-                    * self.steer_kp
-                    * heading_error_deg
-                )
-                steering_magnitude = max(
-                    self.steer_min_deg,
-                    abs(raw_steering),
-                )
-                steering = math.copysign(
-                    min(self.steer_limit_deg, steering_magnitude),
-                    raw_steering,
-                )
+            steering = self._alignment_steering(
+                heading_error_deg
+            )
 
         if now - self.last_log_time >= 0.25:
             self.last_log_time = now
@@ -527,6 +662,11 @@ class StraightSprintController:
                 f"cross_track={cross_track:.3f}m "
                 f"remaining_along={remaining_along:.3f}m "
                 f"align_elapsed={align_elapsed:.3f}s "
+                f"settle_elapsed={settle_elapsed:.3f}s "
+                f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
+                f"steer_feedback={steering_feedback_deg:.3f}deg "
+                f"stable={self.settle_confirm_count}/"
+                f"{self.settle_confirm_frames} "
                 f"pulse_active="
                 f"{int(self.state == 'SPRINT' and not self.sprint_pulse_complete)} "
                 f"ego_speed={ego_speed:.3f}m/s "
@@ -555,6 +695,9 @@ class Run3:
         self.ego = None
         self.first_current_ins_ready = False
         self.last_ins_sequence = None
+        self.last_heading = None
+        self.last_heading_monotonic = None
+        self.filtered_yaw_rate = 0.0
         self.last_ins_warning_time = 0.0
         self.start_gate_xy = None
         self.start_gate_tolerance = max(
@@ -627,6 +770,10 @@ class Run3:
         self.ego = None
         self.first_current_ins_ready = False
         self.last_ins_sequence = None
+        self.last_heading = None
+        self.last_heading_monotonic = None
+        self.filtered_yaw_rate = 0.0
+        self.latest_feedback = None
         self.start_gate_xy = None
         self.controller.reset()
         if not keep_session:
@@ -887,13 +1034,37 @@ class Run3:
                 flush=True,
             )
 
+        sample_time = time.monotonic()
+        if (
+            self.last_heading is None
+            or self.last_heading_monotonic is None
+        ):
+            yaw_rate = 0.0
+        else:
+            sample_dt = max(
+                1e-3,
+                sample_time - self.last_heading_monotonic,
+            )
+            raw_yaw_rate = wrap_angle(
+                heading - self.last_heading
+            ) / sample_dt
+            # A small first-order filter suppresses INS quantization while
+            # retaining the residual turn rate needed by SETTLE.
+            filter_alpha = min(1.0, sample_dt / 0.10)
+            self.filtered_yaw_rate += filter_alpha * (
+                raw_yaw_rate - self.filtered_yaw_rate
+            )
+            yaw_rate = self.filtered_yaw_rate
+        self.last_heading = heading
+        self.last_heading_monotonic = sample_time
         self.last_ins_sequence = sequence
-        self.last_ins_monotonic = time.monotonic()
+        self.last_ins_monotonic = sample_time
         self.ego = {
             "x": x,
             "y": y,
             "heading": heading,
             "speed": math.hypot(vx, vy),
+            "yaw_rate": yaw_rate,
             "sequence": sequence,
         }
 
@@ -947,11 +1118,25 @@ class Run3:
             self.send_control(0.0, 0.0, 0.0)
             return
 
+        steering_feedback = None
+        if self.latest_feedback is not None:
+            try:
+                candidate = float(
+                    self.latest_feedback.steering_feedback
+                    .steering_wheel_angle
+                )
+                if math.isfinite(candidate):
+                    steering_feedback = candidate
+            except Exception:
+                steering_feedback = None
+
         acceleration, speed, steering = self.controller.command(
             self.ego["x"],
             self.ego["y"],
             self.ego["heading"],
             self.ego["speed"],
+            self.ego["yaw_rate"],
+            steering_feedback,
             self.ego["sequence"],
         )
         self.send_control(acceleration, speed, steering)
@@ -1015,15 +1200,21 @@ class Run3:
             "[run3] minimal straight sprint started "
             f"align_speed={self.controller.align_speed:.2f}m/s "
             f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
+            f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
             f"confirm_frames={self.controller.align_confirm_frames} "
-            f"align_window="
+            f"align_min/warn="
             f"[{self.controller.align_min_duration:.1f},"
             f"{self.controller.align_max_duration:.1f}]s "
             f"steer_kp={self.controller.steer_kp:.2f} "
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
+            f"settle={self.controller.settle_duration:.1f}s/"
+            f"{self.controller.settle_confirm_frames}frames "
+            f"yaw_limit={self.controller.settle_yaw_rate_deg:.2f}deg/s "
+            f"steer_feedback_limit="
+            f"{self.controller.settle_steering_deg:.2f}deg "
             "sprint_steer=LOCKED_ZERO "
             "sprint_acc_mode=ONE_INS_PULSE_THEN_ZERO "
             f"sprint_acc={self.controller.sprint_acceleration:.1f} "
@@ -1068,16 +1259,28 @@ def parse_args():
         "--align-acceleration",
         type=float,
         default=10.0,
-        help="fast heading-alignment acceleration (default: 10.0 m/s^2)",
+        help="maximum heading-alignment acceleration (default: 10 m/s^2)",
     )
     parser.add_argument(
-        "--align-tolerance-deg", type=float, default=3.0
+        "--align-speed-kp",
+        type=float,
+        default=2.0,
+        help="alignment speed proportional gain (default: 2.0 1/s)",
+    )
+    parser.add_argument(
+        "--align-max-deceleration",
+        type=float,
+        default=4.0,
+        help="maximum alignment/settling deceleration (default: 4 m/s^2)",
+    )
+    parser.add_argument(
+        "--align-tolerance-deg", type=float, default=0.3
     )
     parser.add_argument(
         "--align-confirm-frames",
         type=int,
-        default=2,
-        help="fresh in-tolerance INS frames before sprint (default: 2)",
+        default=5,
+        help="fresh in-tolerance INS frames before settling (default: 5)",
     )
     parser.add_argument(
         "--align-min-duration",
@@ -1089,7 +1292,46 @@ def parse_args():
         "--align-max-duration",
         type=float,
         default=2.0,
-        help="force straight sprint after this time (default: 2.0 s)",
+        help=(
+            "alignment warning time; never forces an unsafe sprint "
+            "(default: 2.0 s)"
+        ),
+    )
+    parser.add_argument(
+        "--settle-speed",
+        type=float,
+        default=3.0,
+        help="speed target while steering/yaw settle (default: 3 m/s)",
+    )
+    parser.add_argument(
+        "--settle-duration",
+        type=float,
+        default=0.4,
+        help="minimum steer-zero settling duration (default: 0.4 s)",
+    )
+    parser.add_argument(
+        "--settle-confirm-frames",
+        type=int,
+        default=5,
+        help="stable fresh INS frames before sprint (default: 5)",
+    )
+    parser.add_argument(
+        "--settle-yaw-rate-deg",
+        type=float,
+        default=0.5,
+        help="maximum absolute yaw rate before sprint (default: 0.5 deg/s)",
+    )
+    parser.add_argument(
+        "--settle-steering-deg",
+        type=float,
+        default=1.0,
+        help="maximum steering feedback before sprint (default: 1 deg)",
+    )
+    parser.add_argument(
+        "--align-reentry-error-deg",
+        type=float,
+        default=1.0,
+        help="return SETTLE to ALIGN above this error (default: 1 deg)",
     )
     parser.add_argument(
         "--steer-kp",
@@ -1101,8 +1343,8 @@ def parse_args():
     parser.add_argument(
         "--steer-min-deg",
         type=float,
-        default=12.0,
-        help="minimum wheel command outside tolerance (default: 12 deg)",
+        default=0.0,
+        help="minimum wheel command outside tolerance (default: 0 deg)",
     )
     parser.add_argument(
         "--steer-limit-deg",
