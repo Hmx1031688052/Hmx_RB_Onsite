@@ -1483,32 +1483,32 @@ def parse_args():
     parser.add_argument(
         "--align-tolerance-deg",
         type=float,
-        default=1.0,
-        help="heading tolerance before settling (default: 1.0 deg)",
+        default=3.0,
+        help="heading tolerance before settling (default: 3.0 deg)",
     )
     parser.add_argument(
         "--sprint-heading-tolerance-deg",
         type=float,
-        default=6.0,
+        default=8.0,
         help=(
             "maximum re-anchored heading error allowed before sprint "
-            "(default: 6.0 deg)"
+            "(default: 8.0 deg)"
         ),
     )
     parser.add_argument(
         "--sprint-max-lateral-miss",
         type=float,
-        default=2.5,
+        default=3.5,
         help=(
             "maximum predicted lateral miss at the goal when sprint steering "
-            "is locked to zero (default: 2.5 m)"
+            "is locked to zero (default: 3.5 m)"
         ),
     )
     parser.add_argument(
         "--align-confirm-frames",
         type=int,
-        default=5,
-        help="fresh in-tolerance INS frames before settling (default: 5)",
+        default=2,
+        help="fresh in-tolerance INS frames before settling (default: 2)",
     )
     parser.add_argument(
         "--align-min-duration",
@@ -1534,32 +1534,32 @@ def parse_args():
     parser.add_argument(
         "--settle-duration",
         type=float,
-        default=0.4,
-        help="minimum steer-zero settling duration (default: 0.4 s)",
+        default=0.1,
+        help="minimum steer-zero settling duration (default: 0.1 s)",
     )
     parser.add_argument(
         "--settle-confirm-frames",
         type=int,
-        default=5,
-        help="stable fresh INS frames before sprint (default: 5)",
+        default=2,
+        help="stable fresh INS frames before sprint (default: 2)",
     )
     parser.add_argument(
         "--settle-yaw-rate-deg",
         type=float,
-        default=0.5,
-        help="maximum absolute yaw rate before sprint (default: 0.5 deg/s)",
+        default=1.0,
+        help="maximum absolute yaw rate before sprint (default: 1.0 deg/s)",
     )
     parser.add_argument(
         "--settle-steering-deg",
         type=float,
-        default=1.0,
-        help="maximum steering feedback before sprint (default: 1 deg)",
+        default=2.0,
+        help="maximum steering feedback before sprint (default: 2 deg)",
     )
     parser.add_argument(
         "--align-reentry-error-deg",
         type=float,
-        default=1.0,
-        help="return SETTLE to ALIGN above this error (default: 1 deg)",
+        default=3.0,
+        help="return SETTLE to ALIGN above this error (default: 3 deg)",
     )
     parser.add_argument(
         "--steer-kp",
