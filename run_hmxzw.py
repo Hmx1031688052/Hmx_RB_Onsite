@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -114,6 +115,92 @@ from main.proto.messages_pb2 import (
 TASK_TIMEOUT_RESTART_EXIT_CODE = 75
 SIMULATOR_STALL_RESTART_EXIT_CODE = 76
 SUPERVISOR_LOCK_PATH = Path("/tmp/run_hmxzw-supervisor.lock")
+
+
+class _TeeTextIO:
+    """Mirror supervisor/runtime text to the terminal and one archive."""
+
+    def __init__(self, terminal, archive, lock):
+        self.terminal = terminal
+        self.archive = archive
+        self.lock = lock
+        self.encoding = getattr(terminal, "encoding", "utf-8")
+
+    def write(self, text):
+        with self.lock:
+            self.terminal.write(text)
+            self.archive.write(text)
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            self.terminal.flush()
+            self.archive.flush()
+
+    def isatty(self):
+        return bool(getattr(self.terminal, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self.terminal.fileno()
+
+
+def _install_run_logging(args):
+    """Archive the supervisor plus every restarted runtime child."""
+    log_dir = Path(args.run_log_dir).expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    archive_path = log_dir / (
+        f"run_hmxzw_{stamp}_{os.getpid()}.log"
+    )
+    archive = archive_path.open(
+        "a", encoding="utf-8", buffering=1
+    )
+    lock = threading.RLock()
+    sys.stdout = _TeeTextIO(sys.stdout, archive, lock)
+    sys.stderr = _TeeTextIO(sys.stderr, archive, lock)
+    latest_pointer = log_dir / "latest.txt"
+    latest_pointer.write_text(
+        str(archive_path) + "\n", encoding="utf-8"
+    )
+    print(
+        "[run3][log] "
+        f"archive={archive_path} latest={latest_pointer}",
+        flush=True,
+    )
+    return archive
+
+
+def _start_runtime_child(child_argv):
+    """Start a child and relay its output through the supervisor tee."""
+    process = subprocess.Popen(
+        child_argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        start_new_session=True,
+    )
+
+    def relay_output():
+        if process.stdout is None:
+            return
+        try:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        finally:
+            process.stdout.close()
+
+    output_thread = threading.Thread(
+        target=relay_output,
+        name=f"run3-runtime-output-{process.pid}",
+        daemon=True,
+    )
+    output_thread.start()
+    process.run3_output_thread = output_thread
+    return process
 
 
 def acquire_supervisor_lock():
@@ -1044,6 +1131,16 @@ def parse_args():
         help="accepted for launcher compatibility; control logs are always on",
     )
     parser.add_argument(
+        "--run-log-dir",
+        default=str(_SCRIPT_DIR / "debug_logs" / "run_hmxzw"),
+        help="supervisor/runtime log archive directory",
+    )
+    parser.add_argument(
+        "--no-run-log",
+        action="store_true",
+        help="disable the top-level run_hmxzw terminal log archive",
+    )
+    parser.add_argument(
         "--task-timeout",
         type=float,
         default=20.0,
@@ -1627,6 +1724,7 @@ def _wait_for_driver_sim(args, launcher):
 def supervise_runtime(args):
     child_argv = [
         sys.executable,
+        "-u",
         str(Path(__file__).resolve()),
         *sys.argv[1:],
         "--runtime-child",
@@ -1707,10 +1805,7 @@ def supervise_runtime(args):
                 f"ins_stall_timeout={args.ins_stall_timeout:.1f}s",
                 flush=True,
             )
-            runtime = subprocess.Popen(
-                child_argv,
-                start_new_session=True,
-            )
+            runtime = _start_runtime_child(child_argv)
             restart_reason = None
             return_code = None
             while restart_reason is None:
@@ -1792,9 +1887,12 @@ def supervise_runtime(args):
 
 
 def main():
+    run_log_archive = None
     try:
         args = parse_args()
         if not args.runtime_child:
+            if not args.no_run_log:
+                run_log_archive = _install_run_logging(args)
             supervisor_lock = acquire_supervisor_lock()
             if supervisor_lock is False:
                 raise SystemExit(2)
@@ -1808,6 +1906,9 @@ def main():
             flush=True,
         )
         raise
+    finally:
+        if run_log_archive is not None:
+            run_log_archive.flush()
 
 
 if __name__ == "__main__":
