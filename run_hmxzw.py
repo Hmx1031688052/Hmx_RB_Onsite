@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -978,6 +979,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--simulator-log-dir",
+        default="",
+        help=(
+            "DriverSim launch/crash archive directory; default is "
+            "Hmx_RB_Onsite/debug_logs/simulator"
+        ),
+    )
+    parser.add_argument(
         "--first-ins-timeout",
         type=float,
         default=15.0,
@@ -1142,6 +1151,298 @@ def _kill_simulator_residuals(simulator_dir, reason):
         time.sleep(0.5)
 
 
+def _simulator_log_root(args):
+    configured = str(args.simulator_log_dir or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (_SCRIPT_DIR / "debug_logs" / "simulator").resolve()
+
+
+def _diagnostic_stamp():
+    milliseconds = int(time.time() * 1000) % 1000
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{milliseconds:03d}"
+
+
+def _copy_recent_simulator_artifacts(source_dir, target_dir, limit=8):
+    if not source_dir.is_dir():
+        return []
+    candidates = []
+    for path in source_dir.rglob("*"):
+        try:
+            if path.is_file():
+                candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    copied = []
+    for _, source in sorted(candidates, reverse=True)[:limit]:
+        relative = source.relative_to(source_dir)
+        target = target_dir / relative
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied.append(str(relative))
+        except OSError as exc:
+            copied.append(f"ERROR {relative}: {exc}")
+    return copied
+
+
+def _capture_diagnostic_command(target, command):
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=8.0,
+            check=False,
+        )
+        output = result.stdout or ""
+        if len(output) > 200_000:
+            output = output[-200_000:]
+        target.write_text(
+            f"command={command!r}\nreturncode={result.returncode}\n"
+            f"{output}",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        target.write_text(
+            f"command={command!r}\n"
+            f"capture_error={type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+
+
+def _write_simulator_crash_summary(event_dir, launch_log_path):
+    rules = (
+        (
+            "UE4 checked-cast fatal（场景对象类型不匹配）",
+            re.compile(
+                r"Cast of .* to .* failed|CastChecked",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "GPU/Vulkan 设备丢失或显卡驱动异常",
+            re.compile(
+                r"VK_ERROR_DEVICE_LOST|GPU.?Crash|NVRM: Xid|"
+                r"device lost",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "内存或显存不足",
+            re.compile(
+                r"out of memory|oom-kill|killed process|"
+                r"memory allocation failed",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "动态库缺失或加载失败",
+            re.compile(
+                r"error while loading shared libraries|"
+                r"cannot open shared object file|undefined symbol",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "云端登录或 channels 配置失败",
+            re.compile(
+                r"登录失败|http request failed|channels info is empty",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "原生崩溃（段错误/异常终止）",
+            re.compile(
+                r"segmentation fault|signal 11|core dumped|"
+                r"fatal error",
+                re.IGNORECASE,
+            ),
+        ),
+    )
+
+    sources = []
+    if launch_log_path:
+        sources.append(Path(launch_log_path))
+    for path in event_dir.rglob("*"):
+        if (
+            path.is_file()
+            and path.suffix.lower()
+            in {".log", ".txt", ".xml", ".json"}
+        ):
+            sources.append(path)
+
+    findings = []
+    seen = set()
+    for source in sources:
+        try:
+            data = source.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            continue
+        if len(data) > 500_000:
+            data = data[-500_000:]
+        for line in data.splitlines():
+            for cause, pattern in rules:
+                if not pattern.search(line):
+                    continue
+                key = (cause, line.strip())
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    (cause, str(source), line.strip()[:1000])
+                )
+                break
+            if len(findings) >= 30:
+                break
+        if len(findings) >= 30:
+            break
+
+    summary_lines = []
+    if findings:
+        summary_lines.append(f"初步判断：{findings[0][0]}")
+        summary_lines.append("")
+        summary_lines.append("匹配证据：")
+        for cause, source, line in findings:
+            summary_lines.append(f"- [{cause}] {source}")
+            summary_lines.append(f"  {line}")
+    else:
+        summary_lines.extend(
+            (
+                "初步判断：未匹配到常见崩溃特征。",
+                "",
+                "请重点检查 Saved/Logs、Saved/Crashes、"
+                "coredumpctl.txt 和 kernel-warnings.txt。",
+            )
+        )
+    (event_dir / "summary.txt").write_text(
+        "\n".join(summary_lines) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _archive_simulator_diagnostics(args, reason, launcher=None):
+    """Copy existing UE logs/crash data before killing or restarting it."""
+    try:
+        log_root = _simulator_log_root(args)
+        event_dir = (
+            log_root
+            / "events"
+            / f"{_diagnostic_stamp()}_{reason}"
+        )
+        suffix = 1
+        while event_dir.exists():
+            event_dir = event_dir.with_name(
+                f"{event_dir.name}_{suffix}"
+            )
+            suffix += 1
+        event_dir.mkdir(parents=True, exist_ok=False)
+
+        simulator_root = Path(
+            args.simulator_dir
+        ).expanduser().resolve()
+        saved_root = simulator_root / "DriverSim" / "Saved"
+        copied_logs = _copy_recent_simulator_artifacts(
+            saved_root / "Logs",
+            event_dir / "Saved" / "Logs",
+        )
+
+        copied_crash = []
+        crashes_root = saved_root / "Crashes"
+        if crashes_root.is_dir():
+            crash_dirs = []
+            for crash_dir in crashes_root.iterdir():
+                try:
+                    if crash_dir.is_dir():
+                        crash_dirs.append(
+                            (crash_dir.stat().st_mtime, crash_dir)
+                        )
+                except OSError:
+                    continue
+            if crash_dirs:
+                newest_crash = max(
+                    crash_dirs, key=lambda item: item[0]
+                )[1]
+                target = (
+                    event_dir
+                    / "Saved"
+                    / "Crashes"
+                    / newest_crash.name
+                )
+                try:
+                    shutil.copytree(newest_crash, target)
+                    copied_crash.append(newest_crash.name)
+                except OSError as exc:
+                    copied_crash.append(
+                        f"ERROR {newest_crash.name}: {exc}"
+                    )
+
+        metadata = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "simulator_dir": str(simulator_root),
+            "driver_pids": _find_driver_sim_pids(
+                args.simulator_dir
+            ),
+            "launcher_pid": (
+                None if launcher is None else launcher.pid
+            ),
+            "launcher_code": (
+                None if launcher is None else launcher.poll()
+            ),
+            "launch_log": (
+                None
+                if launcher is None
+                else getattr(launcher, "run3_log_path", None)
+            ),
+            "copied_logs": copied_logs,
+            "copied_crash": copied_crash,
+        }
+        (event_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if os.name == "posix":
+            _capture_diagnostic_command(
+                event_dir / "nvidia-smi.txt",
+                ["nvidia-smi"],
+            )
+            _capture_diagnostic_command(
+                event_dir / "kernel-warnings.txt",
+                ["dmesg", "--ctime", "--level=err,warn"],
+            )
+            _capture_diagnostic_command(
+                event_dir / "coredumpctl.txt",
+                [
+                    "coredumpctl",
+                    "--no-pager",
+                    "info",
+                    "DriverSim",
+                ],
+            )
+        _write_simulator_crash_summary(
+            event_dir,
+            metadata["launch_log"],
+        )
+        print(
+            "[run3][supervisor] simulator diagnostics archived "
+            f"reason={reason} path={event_dir}",
+            flush=True,
+        )
+        return event_dir
+    except Exception as exc:
+        print(
+            "[run3][supervisor][WARN] diagnostic archive failed "
+            f"reason={reason} error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None
+
+
 def _start_managed_simulator(args):
     simulator_dir = Path(args.simulator_dir).expanduser().resolve()
     start_script = simulator_dir / "start.sh"
@@ -1154,16 +1455,31 @@ def _start_managed_simulator(args):
             f"DriverSim start script is empty: {start_script}; "
             "refuse to enter the restart loop"
         )
+    launch_log_dir = _simulator_log_root(args) / "launches"
+    launch_log_dir.mkdir(parents=True, exist_ok=True)
+    launch_log_path = (
+        launch_log_dir
+        / f"driversim_{_diagnostic_stamp()}_{os.getpid()}.log"
+    )
     print(
         "[run3][supervisor] start DriverSim "
-        f"cwd={simulator_dir} command='bash start.sh'",
+        f"cwd={simulator_dir} command='bash start.sh' "
+        f"log={launch_log_path}",
         flush=True,
     )
-    return subprocess.Popen(
-        ["bash", "start.sh"],
-        cwd=str(simulator_dir),
-        start_new_session=True,
-    )
+    with launch_log_path.open("ab", buffering=0) as launch_log:
+        process = subprocess.Popen(
+            ["bash", "start.sh"],
+            cwd=str(simulator_dir),
+            stdout=launch_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    process.run3_log_path = str(launch_log_path)
+    (
+        _simulator_log_root(args) / "latest_launch_log.txt"
+    ).write_text(str(launch_log_path), encoding="utf-8")
+    return process
 
 
 def _wait_for_driver_sim(args, launcher):
@@ -1225,6 +1541,11 @@ def supervise_runtime(args):
                         f"launcher_code={launcher_code} "
                         f"failure={simulator_start_failures}",
                         flush=True,
+                    )
+                    _archive_simulator_diagnostics(
+                        args,
+                        reason="startup_process_missing",
+                        launcher=simulator,
                     )
                     _terminate_managed_process(
                         simulator, "DriverSim launcher"
@@ -1321,6 +1642,16 @@ def supervise_runtime(args):
             )
             return return_code
 
+        if not args.no_manage_simulator:
+            if restart_reason == "simulator_process_missing":
+                # Give UE's crash handler a moment to finish CrashContext
+                # and minidump files before they are copied and killed.
+                time.sleep(1.0)
+            _archive_simulator_diagnostics(
+                args,
+                reason=restart_reason,
+                launcher=simulator,
+            )
         _terminate_managed_process(runtime, "runtime")
         _terminate_managed_process(simulator, "DriverSim")
         if not args.no_manage_simulator:
