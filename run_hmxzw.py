@@ -17,7 +17,7 @@ Control policy:
   - speed-controlled alignment towards the goal (2 s is warning only)
   - zero steering and wait for heading/yaw/steering feedback to settle
   - re-anchor the goal line and align again if the new bearing has drifted
-  - apply one INS-frame acceleration pulse
+  - repeat one logical acceleration pulse until DriverSim samples it
   - hold a constant speed target with acceleration/steering locked to zero
 """
 
@@ -354,6 +354,16 @@ class StraightSprintController:
         )
         self.sprint_acceleration = float(args.sprint_acceleration)
         self.sprint_speed = max(0.0, float(args.sprint_speed))
+        self.sprint_pulse_min_duration = max(
+            0.01, float(args.sprint_pulse_min_duration)
+        )
+        self.sprint_pulse_max_duration = max(
+            self.sprint_pulse_min_duration,
+            float(args.sprint_pulse_max_duration),
+        )
+        self.sprint_pulse_speed_delta = max(
+            0.0, float(args.sprint_pulse_speed_delta)
+        )
         self.line_sample_step = max(0.1, float(args.line_sample_step))
 
         self.start_xy = None
@@ -368,7 +378,8 @@ class StraightSprintController:
         self.align_timeout_warned = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
-        self.sprint_pulse_sequence = None
+        self.sprint_pulse_started_time = None
+        self.sprint_pulse_entry_speed = 0.0
         self.sprint_pulse_complete = False
         self.last_log_time = 0.0
 
@@ -385,7 +396,8 @@ class StraightSprintController:
         self.align_timeout_warned = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
-        self.sprint_pulse_sequence = None
+        self.sprint_pulse_started_time = None
+        self.sprint_pulse_entry_speed = 0.0
         self.sprint_pulse_complete = False
         self.last_log_time = 0.0
 
@@ -682,7 +694,8 @@ class StraightSprintController:
                         )
                     else:
                         self.state = "SPRINT"
-                        self.sprint_pulse_sequence = ins_sequence
+                        self.sprint_pulse_started_time = now
+                        self.sprint_pulse_entry_speed = float(ego_speed)
                         self.sprint_pulse_complete = False
                         print(
                             "[run3] SETTLE -> SPRINT "
@@ -700,15 +713,32 @@ class StraightSprintController:
                         )
 
         if self.state == "SPRINT":
+            pulse_elapsed = (
+                0.0
+                if self.sprint_pulse_started_time is None
+                else now - self.sprint_pulse_started_time
+            )
+            pulse_speed_delta = (
+                float(ego_speed) - self.sprint_pulse_entry_speed
+            )
+            pulse_acknowledged = (
+                pulse_elapsed >= self.sprint_pulse_min_duration
+                and pulse_speed_delta >= self.sprint_pulse_speed_delta
+            )
+            pulse_timed_out = (
+                pulse_elapsed >= self.sprint_pulse_max_duration
+            )
             if (
                 not self.sprint_pulse_complete
-                and fresh_ins
-                and self.sprint_pulse_sequence is not None
-                and ins_sequence != self.sprint_pulse_sequence
+                and (pulse_acknowledged or pulse_timed_out)
             ):
                 self.sprint_pulse_complete = True
                 print(
                     "[run3] SPRINT pulse complete -> HOLD "
+                    f"reason="
+                    f"{'speed_ack' if pulse_acknowledged else 'timeout'} "
+                    f"elapsed={pulse_elapsed:.3f}s "
+                    f"speed_delta={pulse_speed_delta:.3f}m/s "
                     f"speed={self.sprint_speed:.3f}m/s "
                     "acc=0 steer=0",
                     flush=True,
@@ -1381,7 +1411,10 @@ class Run3:
             f"steer_feedback_limit="
             f"{self.controller.settle_steering_deg:.2f}deg "
             "sprint_steer=LOCKED_ZERO "
-            "sprint_acc_mode=ONE_INS_PULSE_THEN_ZERO "
+            "sprint_acc_mode=REPEATED_LOGICAL_PULSE "
+            f"sprint_pulse={self.controller.sprint_pulse_min_duration:.2f}-"
+            f"{self.controller.sprint_pulse_max_duration:.2f}s/"
+            f"{self.controller.sprint_pulse_speed_delta:.2f}m/s "
             f"sprint_acc={self.controller.sprint_acceleration:.1f} "
             f"sprint_speed={self.controller.sprint_speed:.1f}",
             flush=True,
@@ -1587,6 +1620,33 @@ def parse_args():
     )
     parser.add_argument(
         "--sprint-speed", type=float, default=10000.0
+    )
+    parser.add_argument(
+        "--sprint-pulse-min-duration",
+        type=float,
+        default=0.08,
+        help=(
+            "minimum duration for repeating the logical acceleration pulse "
+            "(default: 0.08 s)"
+        ),
+    )
+    parser.add_argument(
+        "--sprint-pulse-max-duration",
+        type=float,
+        default=0.20,
+        help=(
+            "maximum duration for repeating the logical acceleration pulse "
+            "(default: 0.20 s)"
+        ),
+    )
+    parser.add_argument(
+        "--sprint-pulse-speed-delta",
+        type=float,
+        default=0.10,
+        help=(
+            "measured speed increase acknowledging the sprint pulse "
+            "(default: 0.10 m/s)"
+        ),
     )
     parser.add_argument(
         "--line-sample-step", type=float, default=1.0
