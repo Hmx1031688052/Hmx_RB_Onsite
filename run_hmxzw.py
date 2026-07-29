@@ -335,10 +335,6 @@ class StraightSprintController:
             self.align_tolerance_deg,
             float(args.align_reentry_error_deg),
         )
-        self.goal_bearing_capture_deg = max(
-            self.align_tolerance_deg,
-            float(args.goal_bearing_capture_deg),
-        )
         self.steer_kp = float(args.steer_kp)
         self.align_yaw_damping = max(
             0.0, float(args.align_yaw_damping)
@@ -363,7 +359,6 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
-        self.goal_bearing_guidance = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -381,7 +376,6 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
-        self.goal_bearing_guidance = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -521,37 +515,12 @@ class StraightSprintController:
         cross_track = relative_y * tx - relative_x * ty
         remaining_along = self.line_length - along_track
 
-        # Use the immutable start-to-goal axis while the initial error is
-        # large, so a moving goal bearing cannot run away from the chassis.
-        # Once the axis is captured, follow the current position-to-goal
-        # bearing. This absorbs the small offset created by the initial turn
-        # and avoids a complete second ALIGN cycle after re-anchoring.
-        axis_heading_error = wrap_angle(
-            self.line_heading - ego_heading
-        )
-        axis_heading_error_deg = math.degrees(axis_heading_error)
-        if (
-            self.state == "ALIGN"
-            and not self.goal_bearing_guidance
-            and abs(axis_heading_error_deg)
-            <= self.goal_bearing_capture_deg
-        ):
-            self.goal_bearing_guidance = True
-            self.confirm_count = 0
-            print(
-                "[run3][ALIGN] goal-bearing guidance captured "
-                f"axis_error={axis_heading_error_deg:.3f}deg "
-                f"goal_error="
-                f"{math.degrees(wrap_angle(goal_heading - ego_heading)):.3f}deg "
-                f"threshold={self.goal_bearing_capture_deg:.3f}deg",
-                flush=True,
-            )
-        guidance_heading = (
-            goal_heading
-            if self.goal_bearing_guidance
-            and self.state in ("ALIGN", "SETTLE")
-            else self.line_heading
-        )
+        # Align to the immutable start-to-goal axis. A moving pure-pursuit
+        # bearing can run away when the vehicle starts with a large heading
+        # error: while the car travels beside the line, the goal bearing
+        # rotates faster than the chassis can turn. Once alignment ends,
+        # steering is permanently zero for this episode.
+        guidance_heading = self.line_heading
         heading_error = wrap_angle(guidance_heading - ego_heading)
         heading_error_deg = math.degrees(heading_error)
         ego_yaw_rate_deg = math.degrees(float(ego_yaw_rate))
@@ -1377,8 +1346,6 @@ class Run3:
             f"steer_kp={self.controller.steer_kp:.2f} "
             f"yaw_damping="
             f"{self.controller.align_yaw_damping:.2f}s "
-            f"goal_capture="
-            f"{self.controller.goal_bearing_capture_deg:.1f}deg "
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
@@ -1437,7 +1404,7 @@ def parse_args():
     parser.add_argument(
         "--align-pulse-acceleration",
         type=float,
-        default=72.0,
+        default=7200.0,
         help=(
             "deprecated compatibility option; ignored because ALIGN now "
             "uses closed-loop acceleration"
@@ -1488,14 +1455,14 @@ def parse_args():
     parser.add_argument(
         "--settle-duration",
         type=float,
-        default=0.2,
-        help="minimum steer-zero settling duration (default: 0.2 s)",
+        default=0.4,
+        help="minimum steer-zero settling duration (default: 0.4 s)",
     )
     parser.add_argument(
         "--settle-confirm-frames",
         type=int,
-        default=3,
-        help="stable fresh INS frames before sprint (default: 3)",
+        default=5,
+        help="stable fresh INS frames before sprint (default: 5)",
     )
     parser.add_argument(
         "--settle-yaw-rate-deg",
@@ -1516,27 +1483,18 @@ def parse_args():
         help="return SETTLE to ALIGN above this error (default: 1 deg)",
     )
     parser.add_argument(
-        "--goal-bearing-capture-deg",
-        type=float,
-        default=5.0,
-        help=(
-            "switch from the immutable initial axis to the live goal bearing "
-            "below this error, avoiding a second alignment (default: 5 deg)"
-        ),
-    )
-    parser.add_argument(
         "--steer-kp",
         type=float,
-        default=4.5,
-        help="steering-wheel degrees per heading-error degree (default: 4.5)",
+        default=3.0,
+        help="steering-wheel degrees per heading-error degree (default: 3.0)",
     )
     parser.add_argument(
         "--align-yaw-damping",
         type=float,
-        default=0.3,
+        default=0.4,
         help=(
             "predictive yaw-rate damping horizon used to avoid alignment "
-            "overshoot (default: 0.3 s)"
+            "overshoot (default: 0.4 s)"
         ),
     )
     parser.add_argument("--steer-sign", type=float, default=1.0)
