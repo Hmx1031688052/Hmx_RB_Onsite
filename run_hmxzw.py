@@ -308,6 +308,13 @@ class StraightSprintController:
         self.align_tolerance_deg = max(
             0.0, float(args.align_tolerance_deg)
         )
+        self.sprint_heading_tolerance_deg = max(
+            self.align_tolerance_deg,
+            float(args.sprint_heading_tolerance_deg),
+        )
+        self.sprint_max_lateral_miss = max(
+            0.0, float(args.sprint_max_lateral_miss)
+        )
         self.align_confirm_frames = max(
             1, int(args.align_confirm_frames)
         )
@@ -642,10 +649,18 @@ class StraightSprintController:
                     heading_error_deg = math.degrees(
                         heading_error
                     )
-                    if (
+                    predicted_lateral_miss = abs(
+                        math.sin(heading_error) * self.line_length
+                    )
+                    sprint_heading_ok = (
                         abs(heading_error_deg)
-                        > self.align_tolerance_deg
-                    ):
+                        <= self.sprint_heading_tolerance_deg
+                    )
+                    sprint_miss_ok = (
+                        predicted_lateral_miss
+                        <= self.sprint_max_lateral_miss
+                    )
+                    if not (sprint_heading_ok and sprint_miss_ok):
                         self.state = "ALIGN"
                         self.confirm_count = 0
                         self.align_started_time = now
@@ -655,7 +670,12 @@ class StraightSprintController:
                         print(
                             "[run3] SETTLE -> ALIGN after re-anchor "
                             f"heading_error={heading_error_deg:.3f}deg "
-                            f"(limit={self.align_tolerance_deg:.3f}deg) "
+                            f"(sprint_limit="
+                            f"{self.sprint_heading_tolerance_deg:.3f}deg) "
+                            f"predicted_miss="
+                            f"{predicted_lateral_miss:.3f}m "
+                            f"(limit="
+                            f"{self.sprint_max_lateral_miss:.3f}m) "
                             f"anchor=({ego_x:.3f},{ego_y:.3f}) "
                             f"remaining_line={self.line_length:.3f}m",
                             flush=True,
@@ -667,6 +687,8 @@ class StraightSprintController:
                         print(
                             "[run3] SETTLE -> SPRINT "
                             f"heading_error={heading_error_deg:.3f}deg "
+                            f"predicted_miss="
+                            f"{predicted_lateral_miss:.3f}m "
                             f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
                             f"steer_feedback="
                             f"{steering_feedback_deg:.3f}deg "
@@ -1339,6 +1361,9 @@ class Run3:
             f"control_hz={1.0 / self.control_period:.1f} "
             f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
+            f"sprint_tolerance="
+            f"{self.controller.sprint_heading_tolerance_deg:.2f}deg/"
+            f"{self.controller.sprint_max_lateral_miss:.2f}m "
             f"confirm_frames={self.controller.align_confirm_frames} "
             f"align_min/warn="
             f"[{self.controller.align_min_duration:.1f},"
@@ -1423,7 +1448,28 @@ def parse_args():
         help="maximum alignment/settling deceleration (default: 4 m/s^2)",
     )
     parser.add_argument(
-        "--align-tolerance-deg", type=float, default=0.3
+        "--align-tolerance-deg",
+        type=float,
+        default=0.5,
+        help="heading tolerance before settling (default: 0.5 deg)",
+    )
+    parser.add_argument(
+        "--sprint-heading-tolerance-deg",
+        type=float,
+        default=2.0,
+        help=(
+            "maximum re-anchored heading error allowed before sprint "
+            "(default: 2.0 deg)"
+        ),
+    )
+    parser.add_argument(
+        "--sprint-max-lateral-miss",
+        type=float,
+        default=0.5,
+        help=(
+            "maximum predicted lateral miss at the goal when sprint steering "
+            "is locked to zero (default: 0.5 m)"
+        ),
     )
     parser.add_argument(
         "--align-confirm-frames",
