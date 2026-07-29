@@ -39,53 +39,86 @@ except ImportError:
     fcntl = None
 
 
-# The onsite SDK keeps the generated ``chassis`` and ``main`` protobuf
-# packages beside Hmx_RB_Onsite. When this file is launched as
-# ``python Hmx_RB_Onsite/run_hmxzw.py``, Python adds only the script directory
-# to sys.path, not its parent. Add both explicitly before importing the SDK.
+# The onsite tree may contain more than one generated ``chassis`` package.
+# Mixing a protobuf package from one SDK build with libMulticastNetwork from
+# another is especially dangerous: scalar fields can still appear to work
+# while nested fields (notably steering_control) are decoded incorrectly.
+# Select the SDK root with the same rule used by the known-good run.py.
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ONSITE_ROOT = _SCRIPT_DIR.parent
-for _module_root in (_ONSITE_ROOT, _SCRIPT_DIR):
+
+
+def _is_complete_sdk_root(path):
+    return (
+        path.is_dir()
+        and (path / "modules").is_dir()
+        and (
+            path / "chassis" / "proto" / "chassis_enums_pb2.py"
+        ).is_file()
+        and (
+            path / "chassis" / "proto" / "chassis_messages_pb2.py"
+        ).is_file()
+        and (path / "main" / "proto" / "enums_pb2.py").is_file()
+        and (path / "main" / "proto" / "messages_pb2.py").is_file()
+    )
+
+
+def _find_onsite_sdk_root():
+    """Find one coherent SDK root, matching run.py before any pb2 import."""
+    current = _SCRIPT_DIR
+    while True:
+        for candidate in (current, current / "e2e"):
+            if _is_complete_sdk_root(candidate):
+                return candidate
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    # Compatibility fallback for stripped deployments without ``modules``.
+    # Never silently choose between multiple protobuf copies.
+    candidates = set()
+    for base in (_ONSITE_ROOT, Path.cwd().resolve()):
+        if not base.is_dir():
+            continue
+        for pattern in (
+            "chassis/proto/chassis_enums_pb2.py",
+            "*/chassis/proto/chassis_enums_pb2.py",
+            "*/*/chassis/proto/chassis_enums_pb2.py",
+        ):
+            for enum_file in base.glob(pattern):
+                candidate = enum_file.parents[2]
+                if (
+                    candidate
+                    / "chassis"
+                    / "proto"
+                    / "chassis_messages_pb2.py"
+                ).is_file() and (
+                    candidate / "main" / "proto" / "messages_pb2.py"
+                ).is_file():
+                    candidates.add(candidate.resolve())
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if candidates:
+        choices = ", ".join(str(path) for path in sorted(candidates))
+        raise RuntimeError(
+            "multiple onsite protobuf roots found; refusing to mix SDK "
+            f"versions: {choices}"
+        )
+    raise ModuleNotFoundError(
+        "cannot locate a coherent onsite SDK root containing "
+        "chassis/proto and main/proto"
+    )
+
+
+_ONSITE_PROTO_ROOT = _find_onsite_sdk_root()
+for _module_root in (_ONSITE_ROOT, _SCRIPT_DIR, _ONSITE_PROTO_ROOT):
     _module_root_text = str(_module_root)
-    if _module_root_text not in sys.path:
-        sys.path.insert(0, _module_root_text)
+    if _module_root_text in sys.path:
+        sys.path.remove(_module_root_text)
+    sys.path.insert(0, _module_root_text)
 
 import libMulticastNetwork
-
-
-def _add_onsite_proto_root():
-    """Locate generated SDK protobuf packages in common onsite layouts."""
-    search_bases = [
-        _ONSITE_ROOT,
-        Path.cwd().resolve(),
-        Path(getattr(libMulticastNetwork, "__file__", _SCRIPT_DIR)).resolve().parent,
-    ]
-    patterns = (
-        "chassis/proto/chassis_enums_pb2.py",
-        "*/chassis/proto/chassis_enums_pb2.py",
-        "*/*/chassis/proto/chassis_enums_pb2.py",
-    )
-    checked = set()
-    for base in search_bases:
-        if base in checked or not base.is_dir():
-            continue
-        checked.add(base)
-        for pattern in patterns:
-            for enum_file in base.glob(pattern):
-                # .../<root>/chassis/proto/chassis_enums_pb2.py
-                proto_root = enum_file.parents[2]
-                if not (
-                    proto_root / "main" / "proto" / "enums_pb2.py"
-                ).is_file():
-                    continue
-                proto_root_text = str(proto_root)
-                if proto_root_text not in sys.path:
-                    sys.path.insert(0, proto_root_text)
-                return proto_root
-    return None
-
-
-_ONSITE_PROTO_ROOT = _add_onsite_proto_root()
 
 from chassis.proto.chassis_enums_pb2 import (
     VEHICLE_CONTROL,
@@ -467,9 +500,12 @@ class StraightSprintController:
         cross_track = relative_y * tx - relative_x * ty
         remaining_along = self.line_length - along_track
 
-        # Moving alignment always aims at the actual goal.  Once alignment
-        # ends, steering is permanently zero for this episode.
-        guidance_heading = goal_heading
+        # Align to the immutable start-to-goal axis. A moving pure-pursuit
+        # bearing can run away when the vehicle starts with a large heading
+        # error: while the car travels beside the line, the goal bearing
+        # rotates faster than the chassis can turn. Once alignment ends,
+        # steering is permanently zero for this episode.
+        guidance_heading = self.line_heading
         heading_error = wrap_angle(guidance_heading - ego_heading)
         heading_error_deg = math.degrees(heading_error)
         ego_yaw_rate_deg = math.degrees(float(ego_yaw_rate))
@@ -715,6 +751,27 @@ class Run3:
         self.control_channel = None
 
     def create_channels(self):
+        chassis_module = sys.modules.get(VehicleControl.__module__)
+        steering_field = VehicleControl.DESCRIPTOR.fields_by_name.get(
+            "steering_control"
+        )
+        target_field = None
+        if steering_field is not None:
+            target_field = steering_field.message_type.fields_by_name.get(
+                "target_steering_wheel_angle"
+            )
+        print(
+            "[run3][sdk] "
+            f"root={_ONSITE_PROTO_ROOT} "
+            f"pb2={getattr(chassis_module, '__file__', 'unknown')} "
+            f"network={getattr(libMulticastNetwork, '__file__', 'unknown')} "
+            f"vehicle_control={VehicleControl.DESCRIPTOR.full_name} "
+            f"steering_field_no="
+            f"{getattr(steering_field, 'number', 'missing')} "
+            f"target_angle_field_no="
+            f"{getattr(target_field, 'number', 'missing')}",
+            flush=True,
+        )
         param = libMulticastNetwork.CreateChannelsParam()
         param.config_center_addr = self.args.config_center
         param.local_ip = get_ip_address(self.args.net_interface)
