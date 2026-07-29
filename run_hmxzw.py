@@ -779,7 +779,14 @@ class Run3:
         self.steering_rate = max(
             0.0, float(args.steering_rate_deg)
         )
+        self.directive_steering_ratio = max(
+            1e-6, float(args.directive_steering_ratio)
+        )
+        self.steering_compat_fields = (
+            not bool(args.no_steering_compat_fields)
+        )
         self.steering_aux_logged = False
+        self.steering_compat_logged = False
         self.first_control_before_prepare_sent = False
 
         self.prepare_channel = None
@@ -1217,6 +1224,30 @@ class Run3:
         command.speed = float(speed)
         steering_control = command.steering_control
         steering_control.target_steering_wheel_angle = float(steering)
+        directive_angle = (
+            float(steering) / self.directive_steering_ratio
+        )
+        compat_fields = []
+        if self.steering_compat_fields:
+            if hasattr(
+                steering_control, "actual_steering_wheel_angle"
+            ):
+                steering_control.actual_steering_wheel_angle = float(
+                    steering
+                )
+                compat_fields.append(
+                    f"actual_steering_wheel_angle={float(steering):.3f}"
+                )
+            if hasattr(
+                steering_control, "target_directive_wheel_angle"
+            ):
+                steering_control.target_directive_wheel_angle = (
+                    directive_angle
+                )
+                compat_fields.append(
+                    "target_directive_wheel_angle="
+                    f"{directive_angle:.3f}"
+                )
         rate_fields = []
         enable_fields = []
         for field in steering_control.DESCRIPTOR.fields:
@@ -1261,6 +1292,19 @@ class Run3:
                 f"rate={rate_fields or 'none'} "
                 f"enable={enable_fields or 'none'} "
                 f"rate_value={self.steering_rate:.1f}",
+                flush=True,
+            )
+        if (
+            not self.steering_compat_logged
+            and abs(float(steering)) > 1e-6
+        ):
+            self.steering_compat_logged = True
+            print(
+                "[run3][control] steering compatibility fields "
+                f"enabled={int(self.steering_compat_fields)} "
+                f"steering_wheel={float(steering):.3f}deg "
+                f"ratio={self.directive_steering_ratio:.3f} "
+                f"fields={compat_fields or 'none'}",
                 flush=True,
             )
         payload = command.SerializeToString()
@@ -1385,6 +1429,8 @@ class Run3:
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
             f"steering_rate={self.steering_rate:.1f}deg/s "
+            f"directive_ratio={self.directive_steering_ratio:.2f} "
+            f"compat_fields={int(self.steering_compat_fields)} "
             f"settle={self.controller.settle_duration:.1f}s/"
             f"{self.controller.settle_confirm_frames}frames "
             f"yaw_limit={self.controller.settle_yaw_rate_deg:.2f}deg/s "
@@ -1555,6 +1601,23 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--directive-steering-ratio",
+        type=float,
+        default=6.3,
+        help=(
+            "steering-wheel/front-directive-wheel ratio used for the "
+            "compatibility field (default: 6.3, 42/6.3=6.667 deg)"
+        ),
+    )
+    parser.add_argument(
+        "--no-steering-compat-fields",
+        action="store_true",
+        help=(
+            "only populate target_steering_wheel_angle; do not populate "
+            "actual/directive wheel compatibility fields"
+        ),
+    )
+    parser.add_argument(
         "--sprint-acceleration", type=float, default=10000.0
     )
     parser.add_argument(
@@ -1566,10 +1629,10 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=20.0,
+        default=100.0 / 3.0,
         help=(
-            "VehicleControl publication rate; keep at simulator/INS rate "
-            "to avoid resetting steering actuation (default: 20 Hz)"
+            "VehicleControl publication rate matching the proven final "
+            "publisher (default: 33.333 Hz)"
         ),
     )
     parser.add_argument(
