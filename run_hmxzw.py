@@ -580,6 +580,600 @@ class LinuxKeyboardStateReader:
         self.clear_state()
 
 
+class _X11Color(ctypes.Structure):
+    _fields_ = [
+        ("pixel", ctypes.c_ulong),
+        ("red", ctypes.c_ushort),
+        ("green", ctypes.c_ushort),
+        ("blue", ctypes.c_ushort),
+        ("flags", ctypes.c_byte),
+        ("pad", ctypes.c_byte),
+    ]
+
+
+class _X11ClientMessageData(ctypes.Union):
+    _fields_ = [
+        ("b", ctypes.c_char * 20),
+        ("s", ctypes.c_short * 10),
+        ("l", ctypes.c_long * 5),
+    ]
+
+
+class _X11ClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", _X11ClientMessageData),
+    ]
+
+
+class X11AlignmentWindow:
+    """Small dependency-free top-down manual-alignment display."""
+
+    EXPOSURE_MASK = 1 << 15
+    STRUCTURE_NOTIFY_MASK = 1 << 17
+    CLIENT_MESSAGE = 33
+    DESTROY_NOTIFY = 17
+    XColor = _X11Color
+    XClientMessageEvent = _X11ClientMessageEvent
+
+    def __init__(self, enabled=True, width=760, height=560):
+        self.enabled = bool(enabled)
+        self.width = max(520, int(width))
+        self.height = max(400, int(height))
+        self.display = None
+        self.window = 0
+        self.gc = None
+        self.x11 = None
+        self.wm_delete_window = 0
+        self.last_draw_time = 0.0
+        self.colors = {}
+
+    def _configure_x11(self, x11):
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.restype = ctypes.c_int
+        x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+        x11.XDefaultScreen.restype = ctypes.c_int
+        x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XRootWindow.restype = ctypes.c_ulong
+        x11.XBlackPixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XBlackPixel.restype = ctypes.c_ulong
+        x11.XWhitePixel.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XWhitePixel.restype = ctypes.c_ulong
+        x11.XDefaultColormap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        x11.XDefaultColormap.restype = ctypes.c_ulong
+        x11.XCreateSimpleWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        x11.XCreateSimpleWindow.restype = ctypes.c_ulong
+        x11.XStoreName.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_char_p,
+        ]
+        x11.XSelectInput.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_long,
+        ]
+        x11.XMapRaised.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x11.XCreateGC.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+        x11.XCreateGC.restype = ctypes.c_void_p
+        x11.XFreeGC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        x11.XSetForeground.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        x11.XSetLineAttributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        x11.XDrawLine.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        x11.XDrawArc.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        x11.XFillArc.argtypes = list(x11.XDrawArc.argtypes)
+        x11.XDrawString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        x11.XClearWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        x11.XPending.argtypes = [ctypes.c_void_p]
+        x11.XPending.restype = ctypes.c_int
+        x11.XNextEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        x11.XInternAtom.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        ]
+        x11.XInternAtom.restype = ctypes.c_ulong
+        x11.XSetWMProtocols.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_int,
+        ]
+        x11.XAllocNamedColor.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_char_p,
+            ctypes.POINTER(self.XColor),
+            ctypes.POINTER(self.XColor),
+        ]
+        x11.XAllocNamedColor.restype = ctypes.c_int
+        x11.XDestroyWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+
+    def _allocate_color(self, name, fallback):
+        screen_color = self.XColor()
+        exact_color = self.XColor()
+        if self.x11.XAllocNamedColor(
+            self.display,
+            self.colormap,
+            name.encode("ascii"),
+            ctypes.byref(screen_color),
+            ctypes.byref(exact_color),
+        ):
+            return int(screen_color.pixel)
+        return int(fallback)
+
+    def open(self):
+        if not self.enabled:
+            return False
+        display_name = str(os.environ.get("DISPLAY") or "").strip()
+        if not display_name:
+            print(
+                "[run3][alignment-window][WARN] DISPLAY is not set; "
+                "visual aid disabled",
+                flush=True,
+            )
+            self.enabled = False
+            return False
+
+        library_name = ctypes.util.find_library("X11")
+        if not library_name:
+            print(
+                "[run3][alignment-window][WARN] libX11 not found; "
+                "visual aid disabled",
+                flush=True,
+            )
+            self.enabled = False
+            return False
+        try:
+            self.x11 = ctypes.CDLL(library_name)
+            self._configure_x11(self.x11)
+            self.display = self.x11.XOpenDisplay(
+                display_name.encode("utf-8")
+            )
+            if not self.display:
+                raise RuntimeError(
+                    f"cannot open X11 display {display_name!r}"
+                )
+            screen = self.x11.XDefaultScreen(self.display)
+            root = self.x11.XRootWindow(self.display, screen)
+            black = self.x11.XBlackPixel(self.display, screen)
+            white = self.x11.XWhitePixel(self.display, screen)
+            self.colormap = self.x11.XDefaultColormap(
+                self.display, screen
+            )
+            self.window = self.x11.XCreateSimpleWindow(
+                self.display,
+                root,
+                80,
+                80,
+                self.width,
+                self.height,
+                1,
+                black,
+                white,
+            )
+            if not self.window:
+                raise RuntimeError("XCreateSimpleWindow failed")
+            self.x11.XStoreName(
+                self.display,
+                self.window,
+                b"Run3 Manual Alignment",
+            )
+            self.x11.XSelectInput(
+                self.display,
+                self.window,
+                self.EXPOSURE_MASK | self.STRUCTURE_NOTIFY_MASK,
+            )
+            self.wm_delete_window = self.x11.XInternAtom(
+                self.display, b"WM_DELETE_WINDOW", 0
+            )
+            wm_protocols = (ctypes.c_ulong * 1)(
+                self.wm_delete_window
+            )
+            self.x11.XSetWMProtocols(
+                self.display, self.window, wm_protocols, 1
+            )
+            self.gc = self.x11.XCreateGC(
+                self.display, self.window, 0, None
+            )
+            if not self.gc:
+                raise RuntimeError("XCreateGC failed")
+            self.colors = {
+                "text": self._allocate_color("#111827", black),
+                "muted": self._allocate_color("#6B7280", black),
+                "line": self._allocate_color("#2563EB", black),
+                "ego": self._allocate_color("#16A34A", black),
+                "heading": self._allocate_color("#DC2626", black),
+                "goal": self._allocate_color("#7C3AED", black),
+            }
+            self.x11.XMapRaised(self.display, self.window)
+            self.x11.XFlush(self.display)
+            print(
+                "[run3][alignment-window] opened "
+                f"display={display_name} size={self.width}x{self.height}",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(
+                "[run3][alignment-window][WARN] open failed; "
+                f"visual aid disabled: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            self.close()
+            self.enabled = False
+            return False
+
+    def _set_color(self, name):
+        self.x11.XSetForeground(
+            self.display, self.gc, self.colors[name]
+        )
+
+    def _line(self, x1, y1, x2, y2, color, width=1):
+        self._set_color(color)
+        self.x11.XSetLineAttributes(
+            self.display, self.gc, width, 0, 1, 1
+        )
+        self.x11.XDrawLine(
+            self.display,
+            self.window,
+            self.gc,
+            int(round(x1)),
+            int(round(y1)),
+            int(round(x2)),
+            int(round(y2)),
+        )
+
+    def _text(self, x, y, text, color="text"):
+        payload = str(text).encode("ascii", errors="replace")
+        self._set_color(color)
+        self.x11.XDrawString(
+            self.display,
+            self.window,
+            self.gc,
+            int(x),
+            int(y),
+            payload,
+            len(payload),
+        )
+
+    def _circle(self, x, y, radius, color, filled=False):
+        self._set_color(color)
+        draw = self.x11.XFillArc if filled else self.x11.XDrawArc
+        draw(
+            self.display,
+            self.window,
+            self.gc,
+            int(round(x - radius)),
+            int(round(y - radius)),
+            int(round(2 * radius)),
+            int(round(2 * radius)),
+            0,
+            360 * 64,
+        )
+
+    def _process_events(self):
+        event_buffer = ctypes.create_string_buffer(192)
+        while self.x11.XPending(self.display) > 0:
+            self.x11.XNextEvent(
+                self.display, ctypes.byref(event_buffer)
+            )
+            event_type = ctypes.c_int.from_buffer(
+                event_buffer
+            ).value
+            if event_type == self.CLIENT_MESSAGE:
+                client_event = ctypes.cast(
+                    ctypes.byref(event_buffer),
+                    ctypes.POINTER(self.XClientMessageEvent),
+                ).contents
+                if (
+                    int(client_event.data.l[0])
+                    == int(self.wm_delete_window)
+                ):
+                    print(
+                        "[run3][alignment-window] closed by user",
+                        flush=True,
+                    )
+                    self.enabled = False
+                    return False
+            elif event_type == self.DESTROY_NOTIFY:
+                self.window = 0
+                self.enabled = False
+                return False
+        return True
+
+    def _world_to_screen(self, points):
+        plot_left = 45.0
+        plot_right = float(self.width - 45)
+        plot_top = 125.0
+        plot_bottom = float(self.height - 45)
+
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        center_x = 0.5 * (min(xs) + max(xs))
+        center_y = 0.5 * (min(ys) + max(ys))
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        overall_span = max(span_x, span_y, 5.0)
+        span_x = max(span_x * 1.25, overall_span * 0.30)
+        span_y = max(span_y * 1.25, overall_span * 0.30)
+        scale = min(
+            (plot_right - plot_left) / span_x,
+            (plot_bottom - plot_top) / span_y,
+        )
+        screen_center_x = 0.5 * (plot_left + plot_right)
+        screen_center_y = 0.5 * (plot_top + plot_bottom)
+
+        def transform(point):
+            return (
+                screen_center_x + (point[0] - center_x) * scale,
+                screen_center_y - (point[1] - center_y) * scale,
+            )
+
+        return [transform(point) for point in points]
+
+    def _draw_waiting(self):
+        self.x11.XClearWindow(self.display, self.window)
+        self._text(25, 35, "Run3 Manual Alignment")
+        self._text(
+            25,
+            65,
+            "Waiting for PREPARE and the first current INS sample...",
+            "muted",
+        )
+        self._text(
+            25,
+            95,
+            "Blue: start-goal line   Red: ego heading",
+            "muted",
+        )
+        self.x11.XFlush(self.display)
+
+    def _draw(self, controller, ego, started):
+        self.x11.XClearWindow(self.display, self.window)
+        if (
+            controller.start_xy is None
+            or controller.goal_xy is None
+        ):
+            self._draw_waiting()
+            return
+
+        start = tuple(controller.start_xy)
+        goal = tuple(controller.goal_xy)
+        ego_available = ego is not None
+        ego_point = (
+            (float(ego["x"]), float(ego["y"]))
+            if ego_available
+            else start
+        )
+        start_screen, goal_screen, ego_screen = (
+            self._world_to_screen([start, goal, ego_point])
+        )
+
+        target_heading = math.atan2(
+            goal[1] - start[1], goal[0] - start[0]
+        )
+
+        self._text(22, 28, "Run3 Manual Alignment")
+        if ego_available:
+            ego_heading = float(ego["heading"])
+            heading_error = wrap_angle(
+                target_heading - ego_heading
+            )
+            self._text(
+                22,
+                52,
+                f"state={controller.state} "
+                f"started={int(bool(started))}  "
+                f"speed={float(ego['speed']):.2f}m/s  "
+                f"target={controller.manual_speed:.2f}m/s  "
+                f"steer={controller.manual_steering_deg:.1f}deg",
+            )
+            error_color = (
+                "ego"
+                if abs(math.degrees(heading_error)) <= 3.0
+                else "heading"
+            )
+            self._text(
+                22,
+                76,
+                f"ego heading={math.degrees(ego_heading):.2f}deg  "
+                f"goal line={math.degrees(target_heading):.2f}deg  "
+                f"error={math.degrees(heading_error):+.2f}deg",
+                error_color,
+            )
+        else:
+            self._text(
+                22,
+                52,
+                f"state={controller.state} "
+                f"started={int(bool(started))}  waiting for INS...",
+                "muted",
+            )
+            self._text(
+                22,
+                76,
+                f"goal line={math.degrees(target_heading):.2f}deg  "
+                "ego heading=unavailable",
+                "line",
+            )
+        self._text(
+            22,
+            100,
+            "Hold W/UP + LEFT/RIGHT to align. "
+            "Release W to cruise. SPACE to sprint.",
+            "muted",
+        )
+
+        self._line(
+            start_screen[0],
+            start_screen[1],
+            goal_screen[0],
+            goal_screen[1],
+            "line",
+            4,
+        )
+        self._circle(
+            start_screen[0], start_screen[1], 7, "line", True
+        )
+        self._circle(
+            goal_screen[0], goal_screen[1], 10, "goal", False
+        )
+        self._circle(
+            goal_screen[0], goal_screen[1], 4, "goal", True
+        )
+        self._text(
+            start_screen[0] + 10,
+            start_screen[1] - 10,
+            "START",
+            "line",
+        )
+        self._text(
+            goal_screen[0] + 10,
+            goal_screen[1] - 10,
+            "GOAL",
+            "goal",
+        )
+
+        if ego_available:
+            self._circle(
+                ego_screen[0], ego_screen[1], 9, "ego", True
+            )
+            arrow_length = 72.0
+            arrow_x = ego_screen[0] + arrow_length * math.cos(
+                ego_heading
+            )
+            arrow_y = ego_screen[1] - arrow_length * math.sin(
+                ego_heading
+            )
+            self._line(
+                ego_screen[0],
+                ego_screen[1],
+                arrow_x,
+                arrow_y,
+                "heading",
+                4,
+            )
+            for wing_angle in (
+                ego_heading + math.radians(150),
+                ego_heading - math.radians(150),
+            ):
+                self._line(
+                    arrow_x,
+                    arrow_y,
+                    arrow_x + 18.0 * math.cos(wing_angle),
+                    arrow_y - 18.0 * math.sin(wing_angle),
+                    "heading",
+                    3,
+                )
+            self._text(
+                ego_screen[0] + 12,
+                ego_screen[1] + 20,
+                "EGO",
+                "ego",
+            )
+        self.x11.XFlush(self.display)
+
+    def update(self, controller, ego, started):
+        if not self.enabled or self.display is None:
+            return
+        if not self._process_events():
+            self.close()
+            return
+        now = time.monotonic()
+        if now - self.last_draw_time < 0.05:
+            return
+        self.last_draw_time = now
+        self._draw(controller, ego, started)
+
+    def close(self):
+        if self.display is None:
+            return
+        if self.gc is not None:
+            self.x11.XFreeGC(self.display, self.gc)
+            self.gc = None
+        if self.window:
+            self.x11.XDestroyWindow(self.display, self.window)
+            self.window = 0
+        self.x11.XFlush(self.display)
+        self.x11.XCloseDisplay(self.display)
+        self.display = None
+        self.x11 = None
+
+
 class StraightSprintController:
     def __init__(self, args):
         self.manual_start = not bool(args.auto_align)
@@ -1330,6 +1924,14 @@ class Run3:
 
         self.controller = StraightSprintController(args)
         self.keyboard = LinuxKeyboardStateReader()
+        self.alignment_window = X11AlignmentWindow(
+            enabled=(
+                self.controller.manual_start
+                and not bool(args.no_alignment_window)
+            ),
+            width=args.alignment_window_width,
+            height=args.alignment_window_height,
+        )
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
@@ -1885,6 +2487,7 @@ class Run3:
             keyboard_device = self.keyboard.open(
                 self.args.keyboard_device
             )
+            self.alignment_window.open()
             print(
                 "[run3][manual] controls ready: "
                 f"device={keyboard_device} "
@@ -1943,8 +2546,12 @@ class Run3:
                 self.poll_feedback()
                 self.poll_keyboard()
                 self.send_active_control()
+                self.alignment_window.update(
+                    self.controller, self.ego, self.started
+                )
                 time.sleep(min(0.002, 0.25 * self.control_period))
         finally:
+            self.alignment_window.close()
             self.keyboard.close()
 
 
@@ -1978,6 +2585,23 @@ def parse_args():
             "X11 input is tried first, then evdev is auto-detected "
             "(example: /dev/input/event3)"
         ),
+    )
+    parser.add_argument(
+        "--no-alignment-window",
+        action="store_true",
+        help="disable the X11 manual-alignment visual aid",
+    )
+    parser.add_argument(
+        "--alignment-window-width",
+        type=int,
+        default=760,
+        help="manual-alignment window width (default: 760)",
+    )
+    parser.add_argument(
+        "--alignment-window-height",
+        type=int,
+        default=560,
+        help="manual-alignment window height (default: 560)",
     )
     parser.add_argument(
         "--manual-max-speed",
