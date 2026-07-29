@@ -576,8 +576,12 @@ class DynamicBicycleLQR:
         heading_error_rate,
         speed,
         curvature,
+        force_kinematic=False,
     ):
-        if abs(speed) >= self.dynamic_speed_threshold:
+        if (
+            abs(speed) >= self.dynamic_speed_threshold
+            and not force_kinematic
+        ):
             state = np.array(
                 [
                     [lateral_error],
@@ -1053,6 +1057,7 @@ class LearningCsvLogger:
         "heading_error_rate",
         "curvature",
         "lqr_model",
+        "recovery_mode",
         "lqr_model_speed",
         "lqr_k",
         "lqr_feedforward_deg",
@@ -1099,9 +1104,13 @@ class GlobalPathLqrPidController:
             heading_error=args.q_heading_error,
             heading_error_rate=args.q_heading_error_rate,
             steering=args.r_steering,
-            kinematic_lateral_error=args.q_lateral_error,
-            kinematic_heading_error=args.q_heading_error,
-            kinematic_steering=args.r_steering,
+            kinematic_lateral_error=(
+                args.q_kinematic_lateral_error
+            ),
+            kinematic_heading_error=(
+                args.q_kinematic_heading_error
+            ),
+            kinematic_steering=args.r_kinematic_steering,
         )
         self.lqr = DynamicBicycleLQR(
             VEHICLE,
@@ -1147,6 +1156,13 @@ class GlobalPathLqrPidController:
         self.last_road_wheel = 0.0
         self.published_speed = None
 
+    def synchronize_speed(self, actual_speed):
+        """Synchronize command states to the first real INS measurement."""
+        actual_speed = max(0.0, finite_float(actual_speed))
+        self.pid.reset(actual_speed)
+        self.published_speed = actual_speed
+        self.last_time = None
+
     def control(self, ego, now=None):
         if self.reference is None:
             raise RuntimeError("controller has no global route")
@@ -1173,6 +1189,12 @@ class GlobalPathLqrPidController:
             ego["yaw_rate"]
             - model_speed * projection["curvature"]
         )
+        recovery_mode = (
+            abs(heading_error)
+            >= math.radians(self.args.large_heading_error_deg)
+            or abs(projection["lateral_error"])
+            >= self.args.large_lateral_error
+        )
         road_wheel_raw, lqr = self.lqr.control(
             projection["lateral_error"],
             lateral_error_rate,
@@ -1180,9 +1202,12 @@ class GlobalPathLqrPidController:
             heading_error_rate,
             model_speed,
             projection["curvature"],
+            force_kinematic=recovery_mode,
         )
         max_road_wheel = math.radians(
-            self.args.max_road_wheel_deg
+            self.args.max_recovery_road_wheel_deg
+            if recovery_mode
+            else self.args.max_road_wheel_deg
         )
         road_wheel = clip(
             road_wheel_raw, -max_road_wheel, max_road_wheel
@@ -1203,12 +1228,7 @@ class GlobalPathLqrPidController:
         )
 
         target_speed = projection["target_speed"]
-        if (
-            abs(heading_error)
-            >= math.radians(self.args.large_heading_error_deg)
-            or abs(projection["lateral_error"])
-            >= self.args.large_lateral_error
-        ):
+        if recovery_mode:
             target_speed = min(
                 target_speed, self.args.recovery_speed
             )
@@ -1255,6 +1275,7 @@ class GlobalPathLqrPidController:
             "projection": projection,
             "pid": pid,
             "lqr": lqr,
+            "recovery_mode": recovery_mode,
             "dt": dt,
             "lateral_error_rate": lateral_error_rate,
             "heading_error": heading_error,
@@ -1385,6 +1406,8 @@ class GlobalLqrPidRuntime:
         self.prepared = False
         self.started = False
         self.last_ins_sequence = None
+        self.last_controlled_ins_sequence = None
+        self.last_control_output = None
         self.ego = None
         self.last_heading = None
         self.last_heading_time = None
@@ -1491,6 +1514,8 @@ class GlobalLqrPidRuntime:
         self.started = False
         self.role_id = self.actor_id
         self.last_ins_sequence = None
+        self.last_controlled_ins_sequence = None
+        self.last_control_output = None
         self.ego = None
         self.last_heading = None
         self.last_heading_time = None
@@ -1745,7 +1770,23 @@ class GlobalLqrPidRuntime:
         if self.ego is None or self.controller.reference is None:
             self.send_control(0.0, 0.0, 0.0)
             return
+        sequence = self.ego["sequence"]
+        if sequence == self.last_controlled_ins_sequence:
+            if self.last_control_output is not None:
+                self.send_control(
+                    self.last_control_output["acceleration"],
+                    self.last_control_output["speed"],
+                    self.last_control_output["steering_wheel_deg"],
+                )
+            return
+        if self.last_controlled_ins_sequence is None:
+            # prepare.init_state.v is not always the simulator's actual
+            # spawn speed.  Starting the speed slew limiter from the first
+            # INS avoids publishing an artificial speed jump.
+            self.controller.synchronize_speed(self.ego["speed"])
+        self.last_controlled_ins_sequence = sequence
         output = self.controller.control(self.ego, now)
+        self.last_control_output = output
         self.send_control(
             output["acceleration"],
             output["speed"],
@@ -1779,6 +1820,7 @@ class GlobalLqrPidRuntime:
             "heading_error_rate": output["heading_error_rate"],
             "curvature": projection["curvature"],
             "lqr_model": lqr["model"],
+            "recovery_mode": int(output["recovery_mode"]),
             "lqr_model_speed": lqr["model_speed"],
             "lqr_k": json.dumps(
                 lqr["k"].reshape(-1).tolist()
@@ -1936,6 +1978,31 @@ def run_self_test():
     if abs(state[0, 0]) > 1e-5:
         raise AssertionError(
             "constant-curvature lateral error did not converge"
+        )
+
+    recovery_controller = DynamicBicycleLQR(
+        vehicle,
+        LqrWeights(
+            kinematic_lateral_error=0.8,
+            kinematic_heading_error=3.0,
+            kinematic_steering=12.0,
+        ),
+        dt=0.02,
+    )
+    recovery_angle, recovery_solution = recovery_controller.control(
+        lateral_error=0.537,
+        lateral_error_rate=0.0,
+        heading_error=math.radians(0.78),
+        heading_error_rate=0.0,
+        speed=5.0,
+        curvature=0.0,
+        force_kinematic=True,
+    )
+    if recovery_solution["model"] != "kinematic":
+        raise AssertionError("recovery did not force kinematic LQR")
+    if not (-math.radians(15.0) < recovery_angle < 0.0):
+        raise AssertionError(
+            "recovery LQR response is not bounded/right-turning"
         )
 
     pid = LongitudinalPID(
@@ -2229,6 +2296,24 @@ def parse_args():
     )
     parser.add_argument("--r-steering", type=float, default=2.0)
     parser.add_argument(
+        "--q-kinematic-lateral-error",
+        type=float,
+        default=0.8,
+        help="low-speed/recovery kinematic LQR lateral-error weight",
+    )
+    parser.add_argument(
+        "--q-kinematic-heading-error",
+        type=float,
+        default=3.0,
+        help="low-speed/recovery kinematic LQR heading-error weight",
+    )
+    parser.add_argument(
+        "--r-kinematic-steering",
+        type=float,
+        default=12.0,
+        help="low-speed/recovery kinematic LQR steering penalty",
+    )
+    parser.add_argument(
         "--dynamic-lqr-min-speed", type=float, default=3.0
     )
     parser.add_argument(
@@ -2245,10 +2330,22 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--steering-sign", type=float, default=1.0
+        "--steering-sign",
+        type=float,
+        default=-1.0,
+        help=(
+            "DriverSim steering mapping; onsite logs show -1 is required "
+            "(use +1 only if a positive command turns the vehicle left)"
+        ),
     )
     parser.add_argument(
         "--max-road-wheel-deg", type=float, default=35.0
+    )
+    parser.add_argument(
+        "--max-recovery-road-wheel-deg",
+        type=float,
+        default=20.0,
+        help="road-wheel limit while outside the dynamic-LQR linear region",
     )
     parser.add_argument(
         "--max-road-wheel-rate-deg",
@@ -2321,8 +2418,12 @@ def validate_args(args):
         "path_sample_step": args.path_sample_step,
         "steering_ratio": args.steering_ratio,
         "max_road_wheel_deg": args.max_road_wheel_deg,
+        "max_recovery_road_wheel_deg": (
+            args.max_recovery_road_wheel_deg
+        ),
         "max_road_wheel_rate_deg": args.max_road_wheel_rate_deg,
         "r_steering": args.r_steering,
+        "r_kinematic_steering": args.r_kinematic_steering,
     }
     invalid = [
         name for name, value in positive.items()
@@ -2333,6 +2434,8 @@ def validate_args(args):
         args.q_lateral_error_rate,
         args.q_heading_error,
         args.q_heading_error_rate,
+        args.q_kinematic_lateral_error,
+        args.q_kinematic_heading_error,
     )
     if invalid:
         raise ValueError(
