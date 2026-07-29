@@ -16,11 +16,13 @@ Removed:
 Control policy:
   - speed-controlled alignment towards the goal (2 s is warning only)
   - zero steering and wait for heading/yaw/steering feedback to settle
+  - re-anchor the goal line and align again if the new bearing has drifted
   - apply one INS-frame acceleration pulse
   - hold a constant speed target with acceleration/steering locked to zero
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -297,9 +299,6 @@ class StraightSprintController:
     def __init__(self, args):
         self.align_speed = max(0.0, float(args.align_speed))
         self.align_acceleration = float(args.align_acceleration)
-        self.align_pulse_acceleration = float(
-            args.align_pulse_acceleration
-        )
         self.align_speed_kp = max(
             0.0, float(args.align_speed_kp)
         )
@@ -360,7 +359,6 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
-        self.align_pulse_sent = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -378,7 +376,6 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
-        self.align_pulse_sent = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -645,21 +642,40 @@ class StraightSprintController:
                     heading_error_deg = math.degrees(
                         heading_error
                     )
-                    self.state = "SPRINT"
-                    self.sprint_pulse_sequence = ins_sequence
-                    self.sprint_pulse_complete = False
-                    print(
-                        "[run3] SETTLE -> SPRINT "
-                        f"heading_error={heading_error_deg:.3f}deg "
-                        f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
-                        f"steer_feedback="
-                        f"{steering_feedback_deg:.3f}deg "
-                        f"stable={self.settle_confirm_count}/"
-                        f"{self.settle_confirm_frames} "
-                        f"anchor=({ego_x:.3f},{ego_y:.3f}) "
-                        f"remaining_line={self.line_length:.3f}m",
-                        flush=True,
-                    )
+                    if (
+                        abs(heading_error_deg)
+                        > self.align_tolerance_deg
+                    ):
+                        self.state = "ALIGN"
+                        self.confirm_count = 0
+                        self.align_started_time = now
+                        self.align_timeout_warned = False
+                        self.settle_started_time = None
+                        self.settle_confirm_count = 0
+                        print(
+                            "[run3] SETTLE -> ALIGN after re-anchor "
+                            f"heading_error={heading_error_deg:.3f}deg "
+                            f"(limit={self.align_tolerance_deg:.3f}deg) "
+                            f"anchor=({ego_x:.3f},{ego_y:.3f}) "
+                            f"remaining_line={self.line_length:.3f}m",
+                            flush=True,
+                        )
+                    else:
+                        self.state = "SPRINT"
+                        self.sprint_pulse_sequence = ins_sequence
+                        self.sprint_pulse_complete = False
+                        print(
+                            "[run3] SETTLE -> SPRINT "
+                            f"heading_error={heading_error_deg:.3f}deg "
+                            f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
+                            f"steer_feedback="
+                            f"{steering_feedback_deg:.3f}deg "
+                            f"stable={self.settle_confirm_count}/"
+                            f"{self.settle_confirm_frames} "
+                            f"anchor=({ego_x:.3f},{ego_y:.3f}) "
+                            f"remaining_line={self.line_length:.3f}m",
+                            flush=True,
+                        )
 
         if self.state == "SPRINT":
             if (
@@ -694,23 +710,11 @@ class StraightSprintController:
             target_speed = self.settle_speed
             steering = 0.0
         else:
-            # Match the proven final-control publisher contract: establish
-            # the low alignment speed with exactly one acceleration pulse,
-            # then keep publishing the same speed with zero acceleration.
-            # Repeating a large command at 100 Hz made DriverSim hold the
-            # steering feedback at 1 degree instead of reaching 42 degrees.
-            if not self.align_pulse_sent:
-                acceleration = self.align_pulse_acceleration
-                self.align_pulse_sent = True
-                print(
-                    "[run3][ALIGN] one-shot speed establishment "
-                    f"acc={acceleration:.3f}m/s2 "
-                    f"speed={self.align_speed:.3f}m/s "
-                    f"sequence={ins_sequence}",
-                    flush=True,
-                )
-            else:
-                acceleration = 0.0
+            # Keep closing the speed error on every control frame. A lost
+            # first frame can no longer leave the vehicle stopped forever.
+            acceleration = self._speed_acceleration(
+                self.align_speed, ego_speed
+            )
             target_speed = self.align_speed
             steering = self._alignment_steering(
                 heading_error_deg, ego_yaw_rate_deg
@@ -776,17 +780,6 @@ class Run3:
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
-        self.steering_rate = max(
-            0.0, float(args.steering_rate_deg)
-        )
-        self.directive_steering_ratio = max(
-            1e-6, float(args.directive_steering_ratio)
-        )
-        self.steering_compat_fields = (
-            not bool(args.no_steering_compat_fields)
-        )
-        self.steering_aux_logged = False
-        self.steering_compat_logged = False
         self.first_control_before_prepare_sent = False
 
         self.prepare_channel = None
@@ -1064,10 +1057,22 @@ class Run3:
             self.started = True
             self.test_started_monotonic = time.monotonic()
             self.last_ins_monotonic = None
+            startup_speed = (
+                float(self.ego["speed"])
+                if self.ego is not None
+                else 0.0
+            )
+            startup_control_sent = self.send_control(
+                acceleration=0.0,
+                speed=startup_speed,
+                steering=0.0,
+            )
             print(
                 "[run3][notify] START "
                 f"session={self.session_id} role={self.role_id} "
-                f"timeout={self.args.task_timeout:.1f}s",
+                f"timeout={self.args.task_timeout:.1f}s "
+                f"neutral_control={int(startup_control_sent)} "
+                f"startup_speed={startup_speed:.3f}m/s",
                 flush=True,
             )
             return
@@ -1222,91 +1227,9 @@ class Run3:
         command = VehicleControl()
         command.acceleration = float(acceleration)
         command.speed = float(speed)
-        steering_control = command.steering_control
-        steering_control.target_steering_wheel_angle = float(steering)
-        directive_angle = (
-            float(steering) / self.directive_steering_ratio
+        command.steering_control.target_steering_wheel_angle = float(
+            steering
         )
-        compat_fields = []
-        if self.steering_compat_fields:
-            if hasattr(
-                steering_control, "actual_steering_wheel_angle"
-            ):
-                steering_control.actual_steering_wheel_angle = float(
-                    steering
-                )
-                compat_fields.append(
-                    f"actual_steering_wheel_angle={float(steering):.3f}"
-                )
-            if hasattr(
-                steering_control, "target_directive_wheel_angle"
-            ):
-                steering_control.target_directive_wheel_angle = (
-                    directive_angle
-                )
-                compat_fields.append(
-                    "target_directive_wheel_angle="
-                    f"{directive_angle:.3f}"
-                )
-        rate_fields = []
-        enable_fields = []
-        for field in steering_control.DESCRIPTOR.fields:
-            field_name = field.name.lower()
-            if field.name == "target_steering_wheel_angle":
-                continue
-            if (
-                ("rate" in field_name or "speed" in field_name)
-                and field.label != field.LABEL_REPEATED
-                and field.type
-                in (
-                    field.TYPE_DOUBLE,
-                    field.TYPE_FLOAT,
-                    field.TYPE_INT32,
-                    field.TYPE_INT64,
-                    field.TYPE_UINT32,
-                    field.TYPE_UINT64,
-                    field.TYPE_SINT32,
-                    field.TYPE_SINT64,
-                    field.TYPE_FIXED32,
-                    field.TYPE_FIXED64,
-                    field.TYPE_SFIXED32,
-                    field.TYPE_SFIXED64,
-                )
-            ):
-                value = self.steering_rate
-                if field.type not in (field.TYPE_DOUBLE, field.TYPE_FLOAT):
-                    value = int(round(value))
-                setattr(steering_control, field.name, value)
-                rate_fields.append(field.name)
-            elif (
-                ("enable" in field_name or "valid" in field_name)
-                and field.label != field.LABEL_REPEATED
-                and field.type == field.TYPE_BOOL
-            ):
-                setattr(steering_control, field.name, True)
-                enable_fields.append(field.name)
-        if not self.steering_aux_logged:
-            self.steering_aux_logged = True
-            print(
-                "[run3][control] steering auxiliary fields "
-                f"rate={rate_fields or 'none'} "
-                f"enable={enable_fields or 'none'} "
-                f"rate_value={self.steering_rate:.1f}",
-                flush=True,
-            )
-        if (
-            not self.steering_compat_logged
-            and abs(float(steering)) > 1e-6
-        ):
-            self.steering_compat_logged = True
-            print(
-                "[run3][control] steering compatibility fields "
-                f"enabled={int(self.steering_compat_fields)} "
-                f"steering_wheel={float(steering):.3f}deg "
-                f"ratio={self.directive_steering_ratio:.3f} "
-                f"fields={compat_fields or 'none'}",
-                flush=True,
-            )
         payload = command.SerializeToString()
         ret = self.control_channel.put(
             VEHICLE_CONTROL, len(payload), payload
@@ -1413,8 +1336,6 @@ class Run3:
             "[run3] minimal straight sprint started "
             f"align_speed={self.controller.align_speed:.2f}m/s "
             f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
-            f"align_pulse_acc="
-            f"{self.controller.align_pulse_acceleration:.2f}m/s2 "
             f"control_hz={1.0 / self.control_period:.1f} "
             f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
@@ -1428,9 +1349,7 @@ class Run3:
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
-            f"steering_rate={self.steering_rate:.1f}deg/s "
-            f"directive_ratio={self.directive_steering_ratio:.2f} "
-            f"compat_fields={int(self.steering_compat_fields)} "
+            "steering_fields=TARGET_ONLY "
             f"settle={self.controller.settle_duration:.1f}s/"
             f"{self.controller.settle_confirm_frames}frames "
             f"yaw_limit={self.controller.settle_yaw_rate_deg:.2f}deg/s "
@@ -1487,8 +1406,8 @@ def parse_args():
         type=float,
         default=72.0,
         help=(
-            "one-control-frame acceleration used to establish alignment "
-            "speed, matching the proven final publisher (default: 72)"
+            "deprecated compatibility option; ignored because ALIGN now "
+            "uses closed-loop acceleration"
         ),
     )
     parser.add_argument(
@@ -1596,8 +1515,8 @@ def parse_args():
         type=float,
         default=720.0,
         help=(
-            "value assigned to numeric steering rate/speed fields when "
-            "present in the SDK message (default: 720 deg/s)"
+            "deprecated compatibility option; ignored because only the "
+            "target steering-wheel angle is transmitted"
         ),
     )
     parser.add_argument(
@@ -1605,16 +1524,16 @@ def parse_args():
         type=float,
         default=6.3,
         help=(
-            "steering-wheel/front-directive-wheel ratio used for the "
-            "compatibility field (default: 6.3, 42/6.3=6.667 deg)"
+            "deprecated compatibility option; ignored because the directive "
+            "wheel field is not transmitted"
         ),
     )
     parser.add_argument(
         "--no-steering-compat-fields",
         action="store_true",
         help=(
-            "only populate target_steering_wheel_angle; do not populate "
-            "actual/directive wheel compatibility fields"
+            "deprecated no-op; only target_steering_wheel_angle is always "
+            "populated"
         ),
     )
     parser.add_argument(
@@ -2401,6 +2320,15 @@ def supervise_runtime(args):
             time.sleep(restart_delay)
 
 
+def _log_source_identity():
+    source_path = Path(__file__).resolve()
+    source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    print(
+        f"[run3][source] path={source_path} sha256={source_hash}",
+        flush=True,
+    )
+
+
 def main():
     run_log_archive = None
     try:
@@ -2408,6 +2336,8 @@ def main():
         if not args.runtime_child:
             if not args.no_run_log:
                 run_log_archive = _install_run_logging(args)
+        _log_source_identity()
+        if not args.runtime_child:
             supervisor_lock = acquire_supervisor_lock()
             if supervisor_lock is False:
                 raise SystemExit(2)
