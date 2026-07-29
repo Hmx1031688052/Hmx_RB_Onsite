@@ -776,6 +776,11 @@ class Run3:
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
+        self.steering_rate = max(
+            0.0, float(args.steering_rate_deg)
+        )
+        self.steering_aux_logged = False
+        self.first_control_before_prepare_sent = False
 
         self.prepare_channel = None
         self.notify_channel = None
@@ -792,6 +797,14 @@ class Run3:
             target_field = steering_field.message_type.fields_by_name.get(
                 "target_steering_wheel_angle"
             )
+        steering_fields = (
+            "missing"
+            if steering_field is None
+            else ",".join(
+                f"{field.name}#{field.number}:type{field.type}"
+                for field in steering_field.message_type.fields
+            )
+        )
         print(
             "[run3][sdk] "
             f"root={_ONSITE_PROTO_ROOT} "
@@ -801,7 +814,8 @@ class Run3:
             f"steering_field_no="
             f"{getattr(steering_field, 'number', 'missing')} "
             f"target_angle_field_no="
-            f"{getattr(target_field, 'number', 'missing')}",
+            f"{getattr(target_field, 'number', 'missing')} "
+            f"steering_fields={steering_fields}",
             flush=True,
         )
         param = libMulticastNetwork.CreateChannelsParam()
@@ -864,6 +878,7 @@ class Run3:
         self.filtered_yaw_rate = 0.0
         self.latest_feedback = None
         self.start_gate_xy = None
+        self.first_control_before_prepare_sent = False
         self.controller.reset()
         if not keep_session:
             self.session_id = ""
@@ -973,6 +988,26 @@ class Run3:
             f"map={self.map_name}",
             flush=True,
         )
+        if self.prepared:
+            # The official run.py publishes one neutral VehicleControl frame
+            # before acknowledging Prepare. This establishes control
+            # ownership/mode in DriverSim before the scenario starts.
+            self.first_control_before_prepare_sent = self.send_control(
+                0.0, 0.0, 0.0
+            )
+            if not self.first_control_before_prepare_sent:
+                print(
+                    "[run3][prepare][ERROR] neutral control before "
+                    "PrepareResult failed; reject prepare",
+                    flush=True,
+                )
+                self.prepared = False
+            else:
+                print(
+                    "[run3][prepare] first neutral control sent before "
+                    "PrepareResult acc=0 speed=0 steer=0",
+                    flush=True,
+                )
         self.send_prepare_result(self.prepared)
 
     def poll_prepare(self):
@@ -1180,9 +1215,54 @@ class Run3:
         command = VehicleControl()
         command.acceleration = float(acceleration)
         command.speed = float(speed)
-        command.steering_control.target_steering_wheel_angle = float(
-            steering
-        )
+        steering_control = command.steering_control
+        steering_control.target_steering_wheel_angle = float(steering)
+        rate_fields = []
+        enable_fields = []
+        for field in steering_control.DESCRIPTOR.fields:
+            field_name = field.name.lower()
+            if field.name == "target_steering_wheel_angle":
+                continue
+            if (
+                ("rate" in field_name or "speed" in field_name)
+                and field.label != field.LABEL_REPEATED
+                and field.type
+                in (
+                    field.TYPE_DOUBLE,
+                    field.TYPE_FLOAT,
+                    field.TYPE_INT32,
+                    field.TYPE_INT64,
+                    field.TYPE_UINT32,
+                    field.TYPE_UINT64,
+                    field.TYPE_SINT32,
+                    field.TYPE_SINT64,
+                    field.TYPE_FIXED32,
+                    field.TYPE_FIXED64,
+                    field.TYPE_SFIXED32,
+                    field.TYPE_SFIXED64,
+                )
+            ):
+                value = self.steering_rate
+                if field.type not in (field.TYPE_DOUBLE, field.TYPE_FLOAT):
+                    value = int(round(value))
+                setattr(steering_control, field.name, value)
+                rate_fields.append(field.name)
+            elif (
+                ("enable" in field_name or "valid" in field_name)
+                and field.label != field.LABEL_REPEATED
+                and field.type == field.TYPE_BOOL
+            ):
+                setattr(steering_control, field.name, True)
+                enable_fields.append(field.name)
+        if not self.steering_aux_logged:
+            self.steering_aux_logged = True
+            print(
+                "[run3][control] steering auxiliary fields "
+                f"rate={rate_fields or 'none'} "
+                f"enable={enable_fields or 'none'} "
+                f"rate_value={self.steering_rate:.1f}",
+                flush=True,
+            )
         payload = command.SerializeToString()
         ret = self.control_channel.put(
             VEHICLE_CONTROL, len(payload), payload
@@ -1304,6 +1384,7 @@ class Run3:
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
+            f"steering_rate={self.steering_rate:.1f}deg/s "
             f"settle={self.controller.settle_duration:.1f}s/"
             f"{self.controller.settle_confirm_frames}frames "
             f"yaw_limit={self.controller.settle_yaw_rate_deg:.2f}deg/s "
@@ -1463,6 +1544,15 @@ def parse_args():
         type=float,
         default=42.0,
         help="alignment steering-wheel limit (default: 42 deg)",
+    )
+    parser.add_argument(
+        "--steering-rate-deg",
+        type=float,
+        default=720.0,
+        help=(
+            "value assigned to numeric steering rate/speed fields when "
+            "present in the SDK message (default: 720 deg/s)"
+        ),
     )
     parser.add_argument(
         "--sprint-acceleration", type=float, default=10000.0
