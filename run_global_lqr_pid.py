@@ -1268,45 +1268,34 @@ SDK = {}
 def load_multicast_sdk():
     if SDK:
         return SDK
-    network = importlib.import_module("libMulticastNetwork")
-    chassis_enums = importlib.import_module(
-        "chassis.proto.chassis_enums_pb2"
-    )
-    chassis_messages = importlib.import_module(
-        "chassis.proto.chassis_messages_pb2"
-    )
-    main_enums = importlib.import_module(
-        "main.proto.enums_pb2"
-    )
-    main_messages = importlib.import_module(
-        "main.proto.messages_pb2"
-    )
-    get_ip_module = importlib.import_module("get_ip")
-    names = (
-        "MT_ACTOR_PREPARE",
-        "MT_ACTOR_PREPARE_RESULT",
-        "MT_NOTIFY",
-        "NT_ABORT_TEST",
-        "NT_COLLIDE_ROLE",
-        "NT_DESTROY_ROLE",
-        "NT_FINISH_TEST",
-        "NT_START_TEST",
-    )
+    # run_hmxzw already contains the proven onsite protobuf-root discovery:
+    # it searches beside this project, the current working directory, and
+    # the native libMulticastNetwork module. Reuse those exact imported
+    # classes/constants so this entrypoint cannot drift to another SDK copy.
+    communication = importlib.import_module("run_hmxzw")
     SDK.update(
         {
-            "network": network,
-            "VEHICLE_CONTROL": chassis_enums.VEHICLE_CONTROL,
-            "VEHICLE_FEEDBACK": chassis_enums.VEHICLE_FEEDBACK,
-            "VehicleControl": chassis_messages.VehicleControl,
-            "VehicleFeedback": chassis_messages.VehicleFeedback,
-            "ActorPrepare": main_messages.ActorPrepare,
-            "ActorPrepareResult": main_messages.ActorPrepareResult,
-            "Notify": main_messages.Notify,
-            "get_ip_address": get_ip_module.get_ip_address,
+            "network": communication.libMulticastNetwork,
+            "VEHICLE_CONTROL": communication.VEHICLE_CONTROL,
+            "VEHICLE_FEEDBACK": communication.VEHICLE_FEEDBACK,
+            "VehicleControl": communication.VehicleControl,
+            "VehicleFeedback": communication.VehicleFeedback,
+            "ActorPrepare": communication.ActorPrepare,
+            "ActorPrepareResult": communication.ActorPrepareResult,
+            "Notify": communication.Notify,
+            "get_ip_address": communication.get_ip_address,
+            "MT_ACTOR_PREPARE": communication.MT_ACTOR_PREPARE,
+            "MT_ACTOR_PREPARE_RESULT": (
+                communication.MT_ACTOR_PREPARE_RESULT
+            ),
+            "MT_NOTIFY": communication.MT_NOTIFY,
+            "NT_ABORT_TEST": communication.NT_ABORT_TEST,
+            "NT_COLLIDE_ROLE": communication.NT_COLLIDE_ROLE,
+            "NT_DESTROY_ROLE": communication.NT_DESTROY_ROLE,
+            "NT_FINISH_TEST": communication.NT_FINISH_TEST,
+            "NT_START_TEST": communication.NT_START_TEST,
         }
     )
-    for name in names:
-        SDK[name] = getattr(main_enums, name)
     return SDK
 
 
