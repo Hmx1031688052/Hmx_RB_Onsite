@@ -28,6 +28,7 @@ import math
 import os
 import re
 import select
+import struct
 import sys
 import threading
 import time
@@ -225,52 +226,234 @@ def is_newer_session(candidate, current):
     )
 
 
-class TerminalKeyReader:
+class LinuxEvdevKeyReader:
+    """Track key press/release state from a Linux evdev keyboard."""
+
+    EV_KEY = 0x01
+    KEY_W = 17
+    KEY_S = 31
+    KEY_A = 30
+    KEY_D = 32
+    KEY_SPACE = 57
+    KEY_UP = 103
+    KEY_LEFT = 105
+    KEY_RIGHT = 106
+    KEY_DOWN = 108
+    _EVENT = struct.Struct("@llHHi")
+
     def __init__(self):
         self.fd = None
-        self.saved_attributes = None
+        self.device_path = None
+        self.pressed = set()
+        self.launch_requested = False
+        self.buffer = b""
+        self.stdin_fd = None
+        self.saved_terminal_attributes = None
 
-    def open(self):
-        if (
-            termios is None
-            or tty is None
-            or not sys.stdin.isatty()
+    @staticmethod
+    def _proc_keyboard_devices():
+        proc_path = Path("/proc/bus/input/devices")
+        try:
+            text = proc_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return []
+
+        devices = []
+        for block in text.split("\n\n"):
+            handler_line = next(
+                (
+                    line
+                    for line in block.splitlines()
+                    if line.startswith("H: Handlers=")
+                ),
+                "",
+            )
+            handlers = handler_line.partition("=")[2].split()
+            if "kbd" not in handlers:
+                continue
+            for handler in handlers:
+                if re.fullmatch(r"event\d+", handler):
+                    devices.append(Path("/dev/input") / handler)
+        return devices
+
+    @classmethod
+    def _candidate_devices(cls, configured_device):
+        if configured_device:
+            return [Path(configured_device).expanduser()]
+
+        candidates = []
+        for pattern in (
+            "/dev/input/by-id/*-event-kbd",
+            "/dev/input/by-path/*-event-kbd",
         ):
-            return False
-        self.fd = sys.stdin.fileno()
-        self.saved_attributes = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
-        return True
+            candidates.extend(sorted(Path("/").glob(pattern[1:])))
+        candidates.extend(cls._proc_keyboard_devices())
+
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            key = str(candidate)
+            try:
+                key = str(candidate.resolve())
+            except OSError:
+                pass
+            if key not in seen:
+                seen.add(key)
+                unique.append(candidate)
+        return unique
+
+    def open(self, configured_device=""):
+        if sys.platform != "linux":
+            raise RuntimeError(
+                "manual simultaneous-key control requires Linux evdev"
+            )
+
+        candidates = self._candidate_devices(configured_device)
+        if not candidates:
+            raise RuntimeError(
+                "no Linux keyboard event device found; pass "
+                "--keyboard-device /dev/input/eventN"
+            )
+
+        errors = []
+        for candidate in candidates:
+            try:
+                fd = os.open(
+                    str(candidate),
+                    os.O_RDONLY | os.O_NONBLOCK,
+                )
+            except OSError as exc:
+                errors.append(f"{candidate}: {exc}")
+                continue
+            self.fd = fd
+            self.device_path = str(candidate)
+            break
+
+        if self.fd is None:
+            detail = "; ".join(errors)
+            raise RuntimeError(
+                "cannot open a Linux keyboard event device. Add this "
+                "user to the input group (then sign out/in), run with "
+                "suitable device permission, or pass "
+                "--keyboard-device /dev/input/eventN. "
+                f"Attempts: {detail}"
+            )
+
+        # evdev supplies the actual key state. cbreak is used only to keep
+        # W/A/S/D and escape sequences out of the shell's pending input.
+        if (
+            termios is not None
+            and tty is not None
+            and sys.stdin.isatty()
+        ):
+            try:
+                self.stdin_fd = sys.stdin.fileno()
+                self.saved_terminal_attributes = termios.tcgetattr(
+                    self.stdin_fd
+                )
+                tty.setcbreak(self.stdin_fd)
+            except (OSError, termios.error):
+                self.stdin_fd = None
+                self.saved_terminal_attributes = None
+
+        self.clear_state()
+        return self.device_path
+
+    def clear_state(self):
+        self.pressed.clear()
+        self.launch_requested = False
+        self.buffer = b""
+
+    def is_pressed(self, *key_codes):
+        return any(code in self.pressed for code in key_codes)
+
+    def _process_bytes(self, chunk):
+        self.buffer += chunk
+        complete_size = (
+            len(self.buffer) // self._EVENT.size
+        ) * self._EVENT.size
+        complete = self.buffer[:complete_size]
+        self.buffer = self.buffer[complete_size:]
+        for offset in range(0, len(complete), self._EVENT.size):
+            _, _, event_type, key_code, value = (
+                self._EVENT.unpack_from(complete, offset)
+            )
+            if event_type != self.EV_KEY:
+                continue
+            if value in (1, 2):
+                self.pressed.add(key_code)
+            elif value == 0:
+                self.pressed.discard(key_code)
+            if key_code == self.KEY_SPACE and value == 1:
+                self.launch_requested = True
 
     def poll(self):
         if self.fd is None:
-            return ""
-        readable, _, _ = select.select([self.fd], [], [], 0.0)
-        if not readable:
-            return ""
-        return os.read(self.fd, 64).decode("utf-8", errors="ignore")
+            return
+
+        # Drain duplicated terminal input without using it for control.
+        if self.stdin_fd is not None:
+            try:
+                readable, _, _ = select.select(
+                    [self.stdin_fd], [], [], 0.0
+                )
+                if readable:
+                    os.read(self.stdin_fd, 256)
+            except OSError:
+                pass
+
+        while True:
+            readable, _, _ = select.select([self.fd], [], [], 0.0)
+            if not readable:
+                break
+            try:
+                chunk = os.read(self.fd, self._EVENT.size * 64)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            self._process_bytes(chunk)
+
+    def consume_launch_request(self):
+        requested = self.launch_requested
+        self.launch_requested = False
+        return requested
 
     def close(self):
-        if self.fd is None or self.saved_attributes is None:
-            return
-        termios.tcsetattr(
-            self.fd, termios.TCSADRAIN, self.saved_attributes
-        )
+        if (
+            self.stdin_fd is not None
+            and self.saved_terminal_attributes is not None
+        ):
+            try:
+                termios.tcsetattr(
+                    self.stdin_fd,
+                    termios.TCSADRAIN,
+                    self.saved_terminal_attributes,
+                )
+            except (OSError, termios.error):
+                pass
+        self.stdin_fd = None
+        self.saved_terminal_attributes = None
+        if self.fd is not None:
+            os.close(self.fd)
         self.fd = None
-        self.saved_attributes = None
+        self.device_path = None
+        self.clear_state()
 
 
 class StraightSprintController:
     def __init__(self, args):
         self.manual_start = not bool(args.auto_align)
-        self.manual_speed_step = max(
-            0.1, float(args.manual_speed_step)
-        )
         self.manual_max_speed = max(
-            self.manual_speed_step, float(args.manual_max_speed)
+            0.0, float(args.manual_max_speed)
         )
-        self.manual_steer_step_deg = max(
-            0.1, abs(float(args.manual_steer_step_deg))
+        self.manual_brake_deceleration = max(
+            0.0, float(args.manual_brake_deceleration)
+        )
+        manual_steer_command_deg = abs(
+            float(args.manual_steer_command_deg)
         )
         self.align_speed = max(0.0, float(args.align_speed))
         self.align_acceleration = float(args.align_acceleration)
@@ -323,6 +506,9 @@ class StraightSprintController:
         )
         self.steer_sign = float(args.steer_sign)
         self.steer_limit_deg = abs(float(args.steer_limit_deg))
+        self.manual_steer_command_deg = min(
+            self.steer_limit_deg, manual_steer_command_deg
+        )
         self.steer_min_deg = min(
             self.steer_limit_deg,
             abs(float(args.steer_min_deg)),
@@ -359,6 +545,9 @@ class StraightSprintController:
         self.manual_speed = 0.0
         self.manual_steering_deg = 0.0
         self.manual_launch_requested = False
+        self.manual_last_input_time = None
+        self.manual_last_held_state = None
+        self.manual_last_input_log_time = 0.0
         self.last_log_time = 0.0
 
     def reset(self):
@@ -380,6 +569,9 @@ class StraightSprintController:
         self.manual_speed = 0.0
         self.manual_steering_deg = 0.0
         self.manual_launch_requested = False
+        self.manual_last_input_time = None
+        self.manual_last_held_state = None
+        self.manual_last_input_log_time = 0.0
         self.last_log_time = 0.0
 
     def configure(self, init_state, target_state):
@@ -429,52 +621,102 @@ class StraightSprintController:
         )
         return True
 
-    def handle_manual_key(self, key):
+    def update_manual_inputs(
+        self,
+        forward,
+        brake,
+        left,
+        right,
+        launch_requested=False,
+        ego_speed=None,
+    ):
         if self.state != "MANUAL":
             return False
 
-        normalized = str(key).lower()
-        if normalized == "w":
-            self.manual_speed = min(
-                self.manual_max_speed,
-                self.manual_speed + self.manual_speed_step,
+        now = time.monotonic()
+        if self.manual_last_input_time is None:
+            input_dt = 0.0
+        else:
+            input_dt = min(
+                0.1,
+                max(0.0, now - self.manual_last_input_time),
             )
-        elif normalized == "s":
-            self.manual_speed = max(
-                0.0,
-                self.manual_speed - self.manual_speed_step,
-            )
-        elif normalized == "a":
-            self.manual_steering_deg = min(
-                self.steer_limit_deg,
-                self.manual_steering_deg
-                + self.manual_steer_step_deg,
-            )
-        elif normalized == "d":
-            self.manual_steering_deg = max(
-                -self.steer_limit_deg,
-                self.manual_steering_deg
-                - self.manual_steer_step_deg,
-            )
-        elif key == " ":
+        self.manual_last_input_time = now
+
+        if launch_requested:
+            self.manual_speed = 0.0
+            self.manual_steering_deg = 0.0
             self.manual_launch_requested = True
             print(
                 "[run3][manual] SPACE launch requested; "
-                "centre steering before sprint",
+                "stop manual drive, centre steering, then sprint",
                 flush=True,
             )
             return True
-        else:
-            return False
 
-        print(
-            "[run3][manual] "
-            f"key={normalized.upper()} "
-            f"speed={self.manual_speed:.2f}m/s "
-            f"steer={self.manual_steering_deg:.1f}deg",
-            flush=True,
+        # W selects the manual cruise target. Releasing W intentionally
+        # leaves that target unchanged, avoiding a target-speed step to
+        # zero. S has priority and ramps the target down gently.
+        if brake:
+            brake_reference = self.manual_speed
+            try:
+                candidate_speed = float(ego_speed)
+                if math.isfinite(candidate_speed):
+                    brake_reference = min(
+                        brake_reference,
+                        max(0.0, candidate_speed),
+                    )
+            except (TypeError, ValueError):
+                pass
+            new_speed = max(
+                0.0,
+                brake_reference
+                - self.manual_brake_deceleration * input_dt,
+            )
+        elif forward:
+            new_speed = self.manual_max_speed
+        else:
+            new_speed = self.manual_speed
+
+        if bool(left) == bool(right):
+            new_steering = 0.0
+        elif left:
+            new_steering = self.manual_steer_command_deg
+        else:
+            new_steering = -self.manual_steer_command_deg
+
+        changed = (
+            new_speed != self.manual_speed
+            or new_steering != self.manual_steering_deg
         )
-        return True
+        held_state = (
+            bool(forward),
+            bool(brake),
+            bool(left),
+            bool(right),
+        )
+        held_state_changed = held_state != self.manual_last_held_state
+        self.manual_last_held_state = held_state
+        self.manual_speed = new_speed
+        self.manual_steering_deg = new_steering
+        log_due = (
+            held_state_changed
+            or now - self.manual_last_input_log_time >= 0.25
+            or (brake and self.manual_speed <= 0.0)
+        )
+        if (changed or held_state_changed) and log_due:
+            self.manual_last_input_log_time = now
+            print(
+                "[run3][manual] held "
+                f"forward={int(bool(forward))} "
+                f"brake={int(bool(brake))} "
+                f"left={int(bool(left))} "
+                f"right={int(bool(right))} "
+                f"speed={self.manual_speed:.2f}m/s "
+                f"steer={self.manual_steering_deg:.1f}deg",
+                flush=True,
+            )
+        return changed or held_state_changed
 
     def _set_tracking_line(self, start_x, start_y):
         goal_x, goal_y = self.goal_xy
@@ -950,7 +1192,7 @@ class Run3:
         )
 
         self.controller = StraightSprintController(args)
-        self.keyboard = TerminalKeyReader()
+        self.keyboard = LinuxEvdevKeyReader()
         self.latest_feedback = None
         self.control_period = 1.0 / max(1.0, float(args.control_hz))
         self.last_control_time = 0.0
@@ -1244,6 +1486,7 @@ class Run3:
                     flush=True,
                 )
                 return
+            self.keyboard.clear_state()
             self.started = True
             startup_speed = (
                 float(self.ego["speed"])
@@ -1464,26 +1707,54 @@ class Run3:
         self.send_control(acceleration, speed, steering)
 
     def poll_keyboard(self):
-        keys = self.keyboard.poll()
-        if not keys or not self.started:
+        if not self.controller.manual_start:
             return
-        for key in keys:
-            self.controller.handle_manual_key(key)
+        self.keyboard.poll()
+        launch_requested = self.keyboard.consume_launch_request()
+        if not self.started:
+            return
+        self.controller.update_manual_inputs(
+            forward=self.keyboard.is_pressed(
+                self.keyboard.KEY_W,
+                self.keyboard.KEY_UP,
+            ),
+            brake=self.keyboard.is_pressed(
+                self.keyboard.KEY_S,
+                self.keyboard.KEY_DOWN,
+            ),
+            left=self.keyboard.is_pressed(
+                self.keyboard.KEY_A,
+                self.keyboard.KEY_LEFT,
+            ),
+            right=self.keyboard.is_pressed(
+                self.keyboard.KEY_D,
+                self.keyboard.KEY_RIGHT,
+            ),
+            launch_requested=launch_requested,
+            ego_speed=(
+                self.ego["speed"]
+                if self.ego is not None
+                else None
+            ),
+        )
 
     def run(self):
         self.create_channels()
         if self.controller.manual_start:
-            if not self.keyboard.open():
-                raise RuntimeError(
-                    "manual start requires an interactive terminal (TTY)"
-                )
+            keyboard_device = self.keyboard.open(
+                self.args.keyboard_device
+            )
             print(
                 "[run3][manual] controls ready: "
-                "W/S speed +/- "
-                f"{self.controller.manual_speed_step:.1f}m/s, "
-                "A/D steering +/- "
-                f"{self.controller.manual_steer_step_deg:.1f}deg, "
-                "SPACE centre wheel and sprint",
+                f"device={keyboard_device} "
+                f"hold W/UP={self.controller.manual_max_speed:.1f}m/s, "
+                "release W/UP=hold target, "
+                "hold S/DOWN=slow target reduction at "
+                f"{self.controller.manual_brake_deceleration:.1f}m/s2, "
+                "hold A/LEFT or D/RIGHT="
+                f"{self.controller.manual_steer_command_deg:.1f}deg, "
+                "simultaneous keys enabled, "
+                "SPACE stop/centre then sprint",
                 flush=True,
             )
         print(
@@ -1559,10 +1830,12 @@ def parse_args():
         help="use automatic heading alignment instead of manual WASD",
     )
     parser.add_argument(
-        "--manual-speed-step",
-        type=float,
-        default=0.5,
-        help="W/S target-speed increment (default: 0.5 m/s)",
+        "--keyboard-device",
+        default="",
+        help=(
+            "Linux evdev keyboard path; auto-detected by default "
+            "(example: /dev/input/event3)"
+        ),
     )
     parser.add_argument(
         "--manual-max-speed",
@@ -1571,10 +1844,30 @@ def parse_args():
         help="maximum manual alignment speed (default: 3.0 m/s)",
     )
     parser.add_argument(
-        "--manual-steer-step-deg",
+        "--manual-brake-deceleration",
         type=float,
-        default=3.0,
-        help="A/D steering-wheel increment (default: 3.0 deg)",
+        default=1.0,
+        help=(
+            "target-speed reduction rate while S/DOWN is held "
+            "(default: 1.0 m/s^2)"
+        ),
+    )
+    parser.add_argument(
+        "--manual-steer-command-deg",
+        "--manual-steer-step-deg",
+        dest="manual_steer_command_deg",
+        type=float,
+        default=24.0,
+        help=(
+            "steering-wheel angle while A/LEFT or D/RIGHT is held "
+            "(default: 24 deg)"
+        ),
+    )
+    parser.add_argument(
+        "--manual-speed-step",
+        type=float,
+        default=0.5,
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
