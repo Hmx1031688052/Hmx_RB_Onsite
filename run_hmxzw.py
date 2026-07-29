@@ -297,6 +297,9 @@ class StraightSprintController:
     def __init__(self, args):
         self.align_speed = max(0.0, float(args.align_speed))
         self.align_acceleration = float(args.align_acceleration)
+        self.align_pulse_acceleration = float(
+            args.align_pulse_acceleration
+        )
         self.align_speed_kp = max(
             0.0, float(args.align_speed_kp)
         )
@@ -334,6 +337,9 @@ class StraightSprintController:
             float(args.align_reentry_error_deg),
         )
         self.steer_kp = float(args.steer_kp)
+        self.align_yaw_damping = max(
+            0.0, float(args.align_yaw_damping)
+        )
         self.steer_sign = float(args.steer_sign)
         self.steer_limit_deg = abs(float(args.steer_limit_deg))
         self.steer_min_deg = min(
@@ -354,6 +360,7 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
+        self.align_pulse_sent = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -371,6 +378,7 @@ class StraightSprintController:
         self.last_confirm_sequence = None
         self.align_started_time = None
         self.align_timeout_warned = False
+        self.align_pulse_sent = False
         self.settle_started_time = None
         self.settle_confirm_count = 0
         self.sprint_pulse_sequence = None
@@ -451,12 +459,22 @@ class StraightSprintController:
             min(self.align_acceleration, command),
         )
 
-    def _alignment_steering(self, heading_error_deg):
+    def _alignment_steering(
+        self, heading_error_deg, ego_yaw_rate_deg
+    ):
         if abs(heading_error_deg) <= self.align_tolerance_deg:
             return 0.0
-        raw_steering = (
-            self.steer_sign * self.steer_kp * heading_error_deg
+        predicted_error_deg = (
+            heading_error_deg
+            - self.align_yaw_damping * ego_yaw_rate_deg
         )
+        raw_steering = (
+            self.steer_sign
+            * self.steer_kp
+            * predicted_error_deg
+        )
+        if abs(raw_steering) < 1e-9:
+            return 0.0
         steering_magnitude = max(
             self.steer_min_deg, abs(raw_steering)
         )
@@ -676,12 +694,26 @@ class StraightSprintController:
             target_speed = self.settle_speed
             steering = 0.0
         else:
-            acceleration = self._speed_acceleration(
-                self.align_speed, ego_speed
-            )
+            # Match the proven final-control publisher contract: establish
+            # the low alignment speed with exactly one acceleration pulse,
+            # then keep publishing the same speed with zero acceleration.
+            # Repeating a large command at 100 Hz made DriverSim hold the
+            # steering feedback at 1 degree instead of reaching 42 degrees.
+            if not self.align_pulse_sent:
+                acceleration = self.align_pulse_acceleration
+                self.align_pulse_sent = True
+                print(
+                    "[run3][ALIGN] one-shot speed establishment "
+                    f"acc={acceleration:.3f}m/s2 "
+                    f"speed={self.align_speed:.3f}m/s "
+                    f"sequence={ins_sequence}",
+                    flush=True,
+                )
+            else:
+                acceleration = 0.0
             target_speed = self.align_speed
             steering = self._alignment_steering(
-                heading_error_deg
+                heading_error_deg, ego_yaw_rate_deg
             )
 
         if now - self.last_log_time >= 0.25:
@@ -1257,6 +1289,9 @@ class Run3:
             "[run3] minimal straight sprint started "
             f"align_speed={self.controller.align_speed:.2f}m/s "
             f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
+            f"align_pulse_acc="
+            f"{self.controller.align_pulse_acceleration:.2f}m/s2 "
+            f"control_hz={1.0 / self.control_period:.1f} "
             f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
             f"confirm_frames={self.controller.align_confirm_frames} "
@@ -1264,6 +1299,8 @@ class Run3:
             f"[{self.controller.align_min_duration:.1f},"
             f"{self.controller.align_max_duration:.1f}]s "
             f"steer_kp={self.controller.steer_kp:.2f} "
+            f"yaw_damping="
+            f"{self.controller.align_yaw_damping:.2f}s "
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
@@ -1309,14 +1346,23 @@ def parse_args():
     parser.add_argument(
         "--align-speed",
         type=float,
-        default=6.0,
-        help="fast heading-alignment target (default: 6.0 m/s)",
+        default=3.0,
+        help="heading-alignment target (default: 3.0 m/s)",
     )
     parser.add_argument(
         "--align-acceleration",
         type=float,
         default=10.0,
         help="maximum heading-alignment acceleration (default: 10 m/s^2)",
+    )
+    parser.add_argument(
+        "--align-pulse-acceleration",
+        type=float,
+        default=72.0,
+        help=(
+            "one-control-frame acceleration used to establish alignment "
+            "speed, matching the proven final publisher (default: 72)"
+        ),
     )
     parser.add_argument(
         "--align-speed-kp",
@@ -1396,6 +1442,15 @@ def parse_args():
         default=3.0,
         help="steering-wheel degrees per heading-error degree (default: 3.0)",
     )
+    parser.add_argument(
+        "--align-yaw-damping",
+        type=float,
+        default=0.4,
+        help=(
+            "predictive yaw-rate damping horizon used to avoid alignment "
+            "overshoot (default: 0.4 s)"
+        ),
+    )
     parser.add_argument("--steer-sign", type=float, default=1.0)
     parser.add_argument(
         "--steer-min-deg",
@@ -1418,7 +1473,15 @@ def parse_args():
     parser.add_argument(
         "--line-sample-step", type=float, default=1.0
     )
-    parser.add_argument("--control-hz", type=float, default=100.0)
+    parser.add_argument(
+        "--control-hz",
+        type=float,
+        default=20.0,
+        help=(
+            "VehicleControl publication rate; keep at simulator/INS rate "
+            "to avoid resetting steering actuation (default: 20 Hz)"
+        ),
+    )
     parser.add_argument(
         "--ins-start-gate-tolerance",
         type=float,
