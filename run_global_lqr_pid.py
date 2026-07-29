@@ -134,6 +134,7 @@ import os
 import subprocess
 import sys
 import time
+import types
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -1323,6 +1324,33 @@ def setup_global_route_planner(cache_dir):
     from opendrive_spiral_compat import install_spiral_support
 
     install_spiral_support()
+    # The legacy OpenDRIVE parser imports pyplot at module import time even
+    # though route calculation never plots. On the onsite Conda image that
+    # unnecessary import reaches Pillow/libLerc and selects the system
+    # libstdc++, which lacks GLIBCXX_3.4.29. Provide an explicit headless
+    # placeholder so planning remains independent of the visualization ABI.
+    if "matplotlib.pyplot" not in sys.modules:
+        matplotlib_stub = types.ModuleType("matplotlib")
+        matplotlib_stub.__path__ = []
+        pyplot_stub = types.ModuleType("matplotlib.pyplot")
+
+        def plotting_disabled(*_args, **_kwargs):
+            raise RuntimeError(
+                "matplotlib plotting is disabled in the headless "
+                "LQR/PID runtime"
+            )
+
+        pyplot_stub.plot = plotting_disabled
+        pyplot_stub.scatter = plotting_disabled
+        pyplot_stub.savefig = plotting_disabled
+        pyplot_stub.subplots = plotting_disabled
+        pyplot_stub.figure = plotting_disabled
+        pyplot_stub.show = plotting_disabled
+        pyplot_stub.grid = plotting_disabled
+        pyplot_stub.close = plotting_disabled
+        matplotlib_stub.pyplot = pyplot_stub
+        sys.modules["matplotlib"] = matplotlib_stub
+        sys.modules["matplotlib.pyplot"] = pyplot_stub
     module = importlib.import_module(
         "gloplan.global_route_planner"
     )
