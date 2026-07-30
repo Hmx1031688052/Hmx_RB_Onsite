@@ -3022,12 +3022,81 @@ def run_self_test():
     )
 
 
+def terminate_subprocess(process, label):
+    """Best-effort fallback for older run_hmxzw modules."""
+    if process is None or process.poll() is not None:
+        return
+    print(
+        f"[lqr-pid][supervisor] terminate {label} pid={process.pid}",
+        flush=True,
+    )
+    process.terminate()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5.0)
+
+
 def supervise_runtime(args):
-    """Use run_hmxzw's read-only DriverSim monitor for this controller."""
+    """Supervise the controller across old and new run_hmxzw versions."""
     monitor = importlib.import_module("run_hmxzw")
-    supervisor_lock = monitor.acquire_supervisor_lock()
-    if supervisor_lock is False:
+
+    acquire_lock = getattr(monitor, "acquire_supervisor_lock", None)
+    if callable(acquire_lock):
+        supervisor_lock = acquire_lock()
+        if supervisor_lock is False:
+            return 2
+    else:
+        supervisor_lock = None
+        print(
+            "[lqr-pid][supervisor][compat] run_hmxzw has no "
+            "acquire_supervisor_lock; continuing without the optional "
+            "duplicate-instance lock",
+            flush=True,
+        )
+
+    terminate_process = getattr(
+        monitor, "_terminate_managed_process", terminate_subprocess
+    )
+    management_helper_names = (
+        "_find_driver_sim_pids",
+        "_start_managed_simulator",
+        "_wait_for_driver_sim",
+        "_archive_simulator_diagnostics",
+        "_kill_simulator_residuals",
+    )
+    missing_management_helpers = [
+        name
+        for name in management_helper_names
+        if not callable(getattr(monitor, name, None))
+    ]
+    if not args.no_manage_simulator and missing_management_helpers:
+        print(
+            "[lqr-pid][supervisor][FATAL] this run_hmxzw version "
+            "cannot manage DriverSim; start DriverSim manually and add "
+            "--no-manage-simulator. Missing: "
+            + ", ".join(missing_management_helpers),
+            flush=True,
+        )
         return 2
+
+    find_driver_sim_pids = getattr(
+        monitor, "_find_driver_sim_pids", None
+    )
+    start_managed_simulator = getattr(
+        monitor, "_start_managed_simulator", None
+    )
+    wait_for_driver_sim = getattr(
+        monitor, "_wait_for_driver_sim", None
+    )
+    archive_simulator_diagnostics = getattr(
+        monitor, "_archive_simulator_diagnostics", None
+    )
+    kill_simulator_residuals = getattr(
+        monitor, "_kill_simulator_residuals", None
+    )
+
     child_argv = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -3041,7 +3110,7 @@ def supervise_runtime(args):
     while True:
         try:
             if not args.no_manage_simulator:
-                driver_pids = monitor._find_driver_sim_pids(
+                driver_pids = find_driver_sim_pids(
                     args.simulator_dir
                 )
                 if driver_pids:
@@ -3053,23 +3122,23 @@ def supervise_runtime(args):
                     )
                 else:
                     simulator_launcher = (
-                        monitor._start_managed_simulator(args)
+                        start_managed_simulator(args)
                     )
-                    driver_pids = monitor._wait_for_driver_sim(
+                    driver_pids = wait_for_driver_sim(
                         args, simulator_launcher
                     )
                 if not driver_pids:
                     start_failures += 1
-                    monitor._archive_simulator_diagnostics(
+                    archive_simulator_diagnostics(
                         args,
                         "lqr_pid_startup_process_missing",
                         simulator_launcher,
                     )
-                    monitor._terminate_managed_process(
+                    terminate_process(
                         simulator_launcher,
                         "DriverSim launcher",
                     )
-                    monitor._kill_simulator_residuals(
+                    kill_simulator_residuals(
                         args.simulator_dir,
                         "lqr_pid_startup_process_missing",
                     )
@@ -3112,7 +3181,7 @@ def supervise_runtime(args):
                         break
                 if (
                     not args.no_manage_simulator
-                    and not monitor._find_driver_sim_pids(
+                    and not find_driver_sim_pids(
                         args.simulator_dir
                     )
                 ):
@@ -3126,25 +3195,25 @@ def supervise_runtime(args):
                 "[lqr-pid][supervisor] interrupted; cleanup",
                 flush=True,
             )
-            monitor._terminate_managed_process(
+            terminate_process(
                 runtime, "LQR PID runtime"
             )
-            monitor._terminate_managed_process(
+            terminate_process(
                 simulator_launcher, "DriverSim launcher"
             )
             if not args.no_manage_simulator:
-                monitor._kill_simulator_residuals(
+                kill_simulator_residuals(
                     args.simulator_dir,
                     "lqr_pid_supervisor_interrupted",
                 )
             return 130
 
         if restart_reason is None:
-            monitor._terminate_managed_process(
+            terminate_process(
                 simulator_launcher, "DriverSim launcher"
             )
             if not args.no_manage_simulator:
-                monitor._kill_simulator_residuals(
+                kill_simulator_residuals(
                     args.simulator_dir,
                     "lqr_pid_runtime_exit",
                 )
@@ -3158,17 +3227,17 @@ def supervise_runtime(args):
         if not args.no_manage_simulator:
             if "simulator_process_missing" in restart_reason:
                 time.sleep(1.0)
-            monitor._archive_simulator_diagnostics(
+            archive_simulator_diagnostics(
                 args, restart_reason, simulator_launcher
             )
-        monitor._terminate_managed_process(
+        terminate_process(
             runtime, "LQR PID runtime"
         )
-        monitor._terminate_managed_process(
+        terminate_process(
             simulator_launcher, "DriverSim launcher"
         )
         if not args.no_manage_simulator:
-            monitor._kill_simulator_residuals(
+            kill_simulator_residuals(
                 args.simulator_dir, restart_reason
             )
         runtime = None
