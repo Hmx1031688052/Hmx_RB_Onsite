@@ -130,7 +130,9 @@ import csv
 import importlib
 import json
 import math
+import multiprocessing
 import os
+import queue
 import subprocess
 import sys
 import time
@@ -1594,6 +1596,9 @@ class LearningCsvLogger:
                     "q_heading_error", "r_steering",
                     "expected_speed_mps", "use_xodr_expected_speed",
                     "rule_lane_half_width", "rule_lane_margin",
+                    "no_route_visualizer", "route_visualizer_width",
+                    "route_visualizer_height", "route_visualizer_hz",
+                    "route_visualizer_max_points",
                     "task_timeout",
                 )
             }
@@ -2138,6 +2143,486 @@ def session_order_key(value):
     return int(match.group(1)), int(match.group(2))
 
 
+def downsample_route_points(x_values, y_values, max_points=1200):
+    """Return finite XY tuples with both endpoints and bounded draw cost."""
+    x_array = np.asarray(x_values, dtype=float).reshape(-1)
+    y_array = np.asarray(y_values, dtype=float).reshape(-1)
+    if x_array.size != y_array.size:
+        raise ValueError("visualizer route x/y lengths differ")
+    finite = np.isfinite(x_array) & np.isfinite(y_array)
+    x_array = x_array[finite]
+    y_array = y_array[finite]
+    if x_array.size < 2:
+        raise ValueError("visualizer route needs at least two points")
+    point_limit = max(2, int(max_points))
+    if x_array.size > point_limit:
+        indices = np.linspace(
+            0, x_array.size - 1, point_limit, dtype=int
+        )
+        x_array = x_array[indices]
+        y_array = y_array[indices]
+    return list(zip(x_array.tolist(), y_array.tolist()))
+
+
+def draw_global_route_window(window, state):
+    """Draw one dependency-free X11 frame in the visualizer process."""
+    window.x11.XClearWindow(window.display, window.window)
+    route = state.get("route") or []
+    ego = state.get("ego")
+    if len(route) < 2:
+        window._text(22, 30, "LQR Global Route Tracking")
+        window._text(
+            22,
+            58,
+            "Waiting for ActorPrepare and the global route...",
+            "muted",
+        )
+        window._text(
+            22,
+            84,
+            "Closing this window does not stop the controller.",
+            "muted",
+        )
+        window.x11.XFlush(window.display)
+        return
+
+    trail = state.get("trail") or []
+    world_points = list(route)
+    trail_start = len(world_points)
+    world_points.extend(trail)
+    ego_index = None
+    if ego is not None:
+        ego_index = len(world_points)
+        world_points.append((float(ego["x"]), float(ego["y"])))
+    screen_points = window._world_to_screen(world_points)
+    route_screen = screen_points[:len(route)]
+    trail_screen = screen_points[
+        trail_start:trail_start + len(trail)
+    ]
+
+    for index in range(1, len(route_screen)):
+        previous = route_screen[index - 1]
+        current = route_screen[index]
+        window._line(
+            previous[0],
+            previous[1],
+            current[0],
+            current[1],
+            "line",
+            2,
+        )
+
+    route_length = max(0.0, float(state.get("route_length", 0.0)))
+    station = max(0.0, float(state.get("station", 0.0)))
+    progress = (
+        clip(station / route_length, 0.0, 1.0)
+        if route_length > 1e-6
+        else 0.0
+    )
+    passed_count = min(
+        len(route_screen),
+        max(1, int(round(progress * (len(route_screen) - 1))) + 1),
+    )
+    for index in range(1, passed_count):
+        previous = route_screen[index - 1]
+        current = route_screen[index]
+        window._line(
+            previous[0],
+            previous[1],
+            current[0],
+            current[1],
+            "ego",
+            4,
+        )
+
+    for index in range(1, len(trail_screen)):
+        previous = trail_screen[index - 1]
+        current = trail_screen[index]
+        window._line(
+            previous[0],
+            previous[1],
+            current[0],
+            current[1],
+            "muted",
+            2,
+        )
+
+    start_screen = route_screen[0]
+    goal_screen = route_screen[-1]
+    window._circle(
+        start_screen[0], start_screen[1], 6, "ego", True
+    )
+    window._circle(
+        goal_screen[0], goal_screen[1], 9, "goal", False
+    )
+    window._circle(
+        goal_screen[0], goal_screen[1], 3, "goal", True
+    )
+    window._text(
+        start_screen[0] + 8,
+        start_screen[1] - 8,
+        "START",
+        "ego",
+    )
+    window._text(
+        goal_screen[0] + 8,
+        goal_screen[1] - 8,
+        "GOAL",
+        "goal",
+    )
+
+    if ego_index is not None:
+        ego_screen = screen_points[ego_index]
+        heading = float(ego["heading"])
+        arrow_length = 28.0
+        arrow_end = (
+            ego_screen[0] + arrow_length * math.cos(heading),
+            ego_screen[1] - arrow_length * math.sin(heading),
+        )
+        window._circle(
+            ego_screen[0], ego_screen[1], 8, "heading", True
+        )
+        window._line(
+            ego_screen[0],
+            ego_screen[1],
+            arrow_end[0],
+            arrow_end[1],
+            "heading",
+            4,
+        )
+        arrow_angle = math.atan2(
+            -(arrow_end[1] - ego_screen[1]),
+            arrow_end[0] - ego_screen[0],
+        )
+        for offset in (-2.55, 2.55):
+            wing_angle = arrow_angle + offset
+            window._line(
+                arrow_end[0],
+                arrow_end[1],
+                arrow_end[0] + 11.0 * math.cos(wing_angle),
+                arrow_end[1] - 11.0 * math.sin(wing_angle),
+                "heading",
+                3,
+            )
+
+    status = "RUNNING" if state.get("started") else "READY"
+    window._text(22, 26, "LQR Global Route Tracking")
+    window._text(
+        22,
+        50,
+        f"state={status} session={state.get('session', '-')}",
+    )
+    if ego is None:
+        window._text(22, 74, "Waiting for INS...", "muted")
+    else:
+        window._text(
+            22,
+            74,
+            f"speed={float(ego['speed']):.2f}m/s  "
+            f"target={float(state.get('target_speed', 0.0)):.2f}m/s  "
+            f"heading={math.degrees(float(ego['heading'])):.1f}deg",
+        )
+    window._text(
+        22,
+        98,
+        f"progress={station:.1f}/{route_length:.1f}m "
+        f"({100.0 * progress:.1f}%)  "
+        f"lateral_error={float(state.get('lateral_error', 0.0)):+.2f}m",
+    )
+    window._text(
+        22,
+        window.height - 18,
+        "Blue: route  Green: completed  Gray: ego trace  Red: ego/front",
+        "muted",
+    )
+    window.x11.XFlush(window.display)
+
+
+def global_route_visualizer_worker(
+    message_queue, width, height, update_hz
+):
+    """Own the X11 window in an isolated process."""
+    try:
+        communication = importlib.import_module("run_hmxzw")
+        window_class = getattr(
+            communication, "X11AlignmentWindow", None
+        )
+        if window_class is None:
+            raise AttributeError(
+                "run_hmxzw.X11AlignmentWindow is unavailable"
+            )
+        window = window_class(
+            enabled=True, width=int(width), height=int(height)
+        )
+        if not window.open():
+            return
+        window.x11.XStoreName(
+            window.display,
+            window.window,
+            b"LQR Global Route Tracking",
+        )
+        window.x11.XFlush(window.display)
+        print(
+            "[lqr-pid][route-window] opened in isolated process",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            "[lqr-pid][route-window][WARN] unavailable: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return
+
+    state = {
+        "route": [],
+        "trail": [],
+        "ego": None,
+        "session": "",
+        "started": False,
+        "route_length": 0.0,
+        "station": 0.0,
+        "target_speed": 0.0,
+        "lateral_error": 0.0,
+    }
+    draw_period = 1.0 / max(1.0, float(update_hz))
+    last_draw = 0.0
+    running = True
+    try:
+        while running and window.enabled:
+            messages = []
+            try:
+                messages.append(message_queue.get(timeout=0.04))
+                while True:
+                    try:
+                        messages.append(message_queue.get_nowait())
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+
+            for message in messages:
+                if message.get("type") == "stop":
+                    running = False
+                    break
+                global_route_visualizer_apply(state, message)
+            if not running:
+                continue
+
+            if not window._process_events():
+                break
+            now = time.monotonic()
+            if now - last_draw >= draw_period:
+                last_draw = now
+                draw_global_route_window(window, state)
+    finally:
+        window.close()
+        print("[lqr-pid][route-window] closed", flush=True)
+
+
+def global_route_visualizer_apply(state, message):
+    message_type = message.get("type")
+    if message_type == "clear":
+        state.update(
+            {
+                "route": [],
+                "trail": [],
+                "ego": None,
+                "session": str(message.get("session", "")),
+                "started": False,
+                "route_length": 0.0,
+                "station": 0.0,
+                "target_speed": 0.0,
+                "lateral_error": 0.0,
+            }
+        )
+        return
+    if message_type == "route":
+        state.update(message)
+        state["trail"] = []
+        state["ego"] = None
+        return
+    if message_type != "ego":
+        return
+    ego = message.get("ego")
+    if ego is not None:
+        trail = state.setdefault("trail", [])
+        point = (float(ego["x"]), float(ego["y"]))
+        if (
+            not trail
+            or math.hypot(
+                point[0] - trail[-1][0],
+                point[1] - trail[-1][1],
+            )
+            >= 0.15
+        ):
+            trail.append(point)
+            if len(trail) > 600:
+                del trail[:len(trail) - 600]
+    state.update(message)
+
+
+class GlobalRouteLiveVisualizer:
+    """Nonblocking parent-side publisher for the route window."""
+
+    def __init__(self, args):
+        self.enabled = not bool(args.no_route_visualizer)
+        self.width = int(args.route_visualizer_width)
+        self.height = int(args.route_visualizer_height)
+        self.update_hz = max(
+            1.0, float(args.route_visualizer_hz)
+        )
+        self.max_points = max(
+            100, int(args.route_visualizer_max_points)
+        )
+        self.context = None
+        self.message_queue = None
+        self.process = None
+        self.last_update = 0.0
+        self.warned_stopped = False
+
+    def start(self):
+        if not self.enabled or self.process is not None:
+            return
+        try:
+            self.context = multiprocessing.get_context("spawn")
+            self.message_queue = self.context.Queue(maxsize=8)
+            self.process = self.context.Process(
+                target=global_route_visualizer_worker,
+                args=(
+                    self.message_queue,
+                    self.width,
+                    self.height,
+                    self.update_hz,
+                ),
+                name="lqr-global-route-window",
+                daemon=True,
+            )
+            self.process.start()
+            print(
+                "[lqr-pid][route-window] process started "
+                f"pid={self.process.pid}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.enabled = False
+            print(
+                "[lqr-pid][route-window][WARN] start failed; "
+                f"control continues without visualization: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    def _publish(self, message, important=False):
+        if (
+            not self.enabled
+            or self.process is None
+            or self.message_queue is None
+        ):
+            return False
+        if not self.process.is_alive():
+            if not self.warned_stopped:
+                self.warned_stopped = True
+                print(
+                    "[lqr-pid][route-window] process is closed; "
+                    "control continues normally",
+                    flush=True,
+                )
+            self.enabled = False
+            return False
+        try:
+            if important:
+                self.message_queue.put(message, timeout=0.20)
+            else:
+                self.message_queue.put_nowait(message)
+            return True
+        except queue.Full:
+            return False
+        except (BrokenPipeError, EOFError, OSError):
+            self.enabled = False
+            return False
+
+    def clear(self, session=""):
+        self._publish(
+            {"type": "clear", "session": str(session)},
+            important=True,
+        )
+
+    def set_route(self, route, session, route_length):
+        try:
+            points = downsample_route_points(
+                route["x"],
+                route["y"],
+                max_points=self.max_points,
+            )
+        except Exception as exc:
+            print(
+                "[lqr-pid][route-window][WARN] route rejected: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return
+        self._publish(
+            {
+                "type": "route",
+                "route": points,
+                "session": str(session),
+                "route_length": float(route_length),
+                "started": False,
+                "station": 0.0,
+                "target_speed": 0.0,
+                "lateral_error": 0.0,
+            },
+            important=True,
+        )
+
+    def update(self, ego, started, output=None):
+        if ego is None:
+            return
+        now = time.monotonic()
+        if now - self.last_update < 1.0 / self.update_hz:
+            return
+        self.last_update = now
+        projection = (
+            output.get("projection", {}) if output is not None else {}
+        )
+        self._publish(
+            {
+                "type": "ego",
+                "ego": {
+                    "x": float(ego["x"]),
+                    "y": float(ego["y"]),
+                    "heading": float(ego["heading"]),
+                    "speed": float(ego["speed"]),
+                },
+                "started": bool(started),
+                "station": float(projection.get("station", 0.0)),
+                "target_speed": float(
+                    output.get("target_speed", 0.0)
+                    if output is not None
+                    else 0.0
+                ),
+                "lateral_error": float(
+                    projection.get("lateral_error", 0.0)
+                ),
+            }
+        )
+
+    def close(self):
+        if self.process is None:
+            return
+        self._publish({"type": "stop"}, important=True)
+        self.process.join(timeout=1.5)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=1.0)
+        if self.message_queue is not None:
+            self.message_queue.close()
+            self.message_queue.cancel_join_thread()
+        self.process = None
+        self.message_queue = None
+
+
 class GlobalLqrPidRuntime:
     def __init__(self, args):
         self.args = args
@@ -2165,6 +2650,7 @@ class GlobalLqrPidRuntime:
             Path(args.route_cache_dir)
         )
         self.logger = LearningCsvLogger(args.log_dir, args)
+        self.route_visualizer = GlobalRouteLiveVisualizer(args)
         self.prepare_channel = None
         self.notify_channel = None
         self.ins_channel = None
@@ -2269,6 +2755,7 @@ class GlobalLqrPidRuntime:
         self.filtered_yaw_rate = 0.0
         self.controller.reset()
         self.session_id = session if keep_session else ""
+        self.route_visualizer.clear(self.session_id)
 
     def _build_route(self, brief_data):
         testees = brief_data.get("testees") or []
@@ -2351,6 +2838,11 @@ class GlobalLqrPidRuntime:
                 initial_speed,
                 legal_speed=legal_speed,
                 expected_speed=legal_speed,
+            )
+            self.route_visualizer.set_route(
+                route,
+                session=self.session_id,
+                route_length=self.controller.reference.length,
             )
             if self.args.task_timeout > 0.0:
                 self.episode_task_timeout = max(
@@ -2550,6 +3042,11 @@ class GlobalLqrPidRuntime:
             "yaw_rate": yaw_rate,
             "speed": math.hypot(vx_world, vy_world),
         }
+        self.route_visualizer.update(
+            self.ego,
+            self.started,
+            output=self.last_control_output,
+        )
 
     def poll_feedback(self):
         for _ in range(8):
@@ -2775,14 +3272,15 @@ class GlobalLqrPidRuntime:
             os._exit(TASK_TIMEOUT_EXIT_CODE)
 
     def run(self):
-        self.create_channels()
-        print(
-            "[lqr-pid] controller ready "
-            f"vehicle={asdict(VEHICLE)} "
-            f"csv={self.logger.path}",
-            flush=True,
-        )
+        self.route_visualizer.start()
         try:
+            self.create_channels()
+            print(
+                "[lqr-pid] controller ready "
+                f"vehicle={asdict(VEHICLE)} "
+                f"csv={self.logger.path}",
+                flush=True,
+            )
             while True:
                 self.poll_prepare()
                 self.poll_notify()
@@ -2792,6 +3290,7 @@ class GlobalLqrPidRuntime:
                 self.enforce_watchdogs()
                 time.sleep(0.002)
         finally:
+            self.route_visualizer.close()
             self.logger.close()
 
 
@@ -2812,6 +3311,43 @@ def run_self_test():
                     f"{profile_name}.{field} must stay below "
                     f"the scoring boundary {official_limit}"
                 )
+
+    visual_points = downsample_route_points(
+        np.arange(2000, dtype=float),
+        np.zeros(2000, dtype=float),
+        max_points=120,
+    )
+    if (
+        len(visual_points) != 120
+        or visual_points[0] != (0.0, 0.0)
+        or visual_points[-1] != (1999.0, 0.0)
+    ):
+        raise AssertionError("route visualizer downsampling failed")
+    visual_state = {}
+    global_route_visualizer_apply(
+        visual_state,
+        {
+            "type": "route",
+            "route": visual_points,
+            "session": "self-test",
+            "route_length": 1999.0,
+        },
+    )
+    global_route_visualizer_apply(
+        visual_state,
+        {
+            "type": "ego",
+            "ego": {
+                "x": 1.0,
+                "y": 0.0,
+                "heading": 0.0,
+                "speed": 1.0,
+            },
+            "station": 1.0,
+        },
+    )
+    if len(visual_state["trail"]) != 1:
+        raise AssertionError("route visualizer ego trail update failed")
 
     vehicle = VEHICLE
     weights = LqrWeights()
@@ -3414,7 +3950,7 @@ def parse_args():
     parser.add_argument(
         "--steering-ratio",
         type=float,
-        default=16.0,
+        default=1.65,
         help=(
             "steering-wheel / road-wheel ratio; not provided by "
             "the parameter images and must be calibrated"
@@ -3450,6 +3986,29 @@ def parse_args():
     parser.add_argument(
         "--log-dir",
         default=str(SCRIPT_DIR / "debug_logs" / "lqr_pid"),
+    )
+    parser.add_argument(
+        "--no-route-visualizer",
+        action="store_true",
+        help="disable the separate X11 global-route/ego window",
+    )
+    parser.add_argument(
+        "--route-visualizer-width", type=int, default=1000
+    )
+    parser.add_argument(
+        "--route-visualizer-height", type=int, default=760
+    )
+    parser.add_argument(
+        "--route-visualizer-hz",
+        type=float,
+        default=10.0,
+        help="visual refresh/state publication rate; control remains 50 Hz",
+    )
+    parser.add_argument(
+        "--route-visualizer-max-points",
+        type=int,
+        default=1200,
+        help="maximum downsampled route points drawn per frame",
     )
     parser.add_argument(
         "--debug-period", type=float, default=0.5
@@ -3518,6 +4077,12 @@ def validate_args(args):
             args.max_recovery_road_wheel_deg
         ),
         "max_road_wheel_rate_deg": args.max_road_wheel_rate_deg,
+        "route_visualizer_width": args.route_visualizer_width,
+        "route_visualizer_height": args.route_visualizer_height,
+        "route_visualizer_hz": args.route_visualizer_hz,
+        "route_visualizer_max_points": (
+            args.route_visualizer_max_points
+        ),
         "r_steering": args.r_steering,
         "r_kinematic_steering": args.r_kinematic_steering,
     }
