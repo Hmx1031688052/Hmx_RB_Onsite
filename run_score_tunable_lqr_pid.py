@@ -193,6 +193,9 @@ SCORE_PROFILES = {
         "speed_ki": 0.12,
         "speed_kd": 0.10,
         "max_road_wheel_rate_deg": 35.0,
+        "max_lqr_feedback_road_wheel_deg": 8.0,
+        "curvature_preview_time": 0.30,
+        "geometric_feedforward_blend": 0.0,
     },
     "balanced": {
         "max_speed": 45.0,
@@ -208,6 +211,9 @@ SCORE_PROFILES = {
         "speed_ki": 0.12,
         "speed_kd": 0.10,
         "max_road_wheel_rate_deg": 50.0,
+        "max_lqr_feedback_road_wheel_deg": 8.0,
+        "curvature_preview_time": 0.35,
+        "geometric_feedforward_blend": 0.0,
     },
     "efficiency": {
         "max_speed": 55.0,
@@ -223,6 +229,27 @@ SCORE_PROFILES = {
         "speed_ki": 0.10,
         "speed_kd": 0.06,
         "max_road_wheel_rate_deg": 60.0,
+        "max_lqr_feedback_road_wheel_deg": 7.0,
+        "curvature_preview_time": 0.40,
+        "geometric_feedforward_blend": 0.0,
+    },
+    "attack": {
+        "max_speed": 60.0,
+        "max_accel": 2.85,
+        "max_decel": 2.85,
+        "max_lateral_accel": 3.50,
+        "max_longitudinal_jerk": 5.50,
+        "max_lateral_jerk": 8.00,
+        "max_yaw_rate": 0.85,
+        "speed_limit_ratio": 1.17,
+        "recovery_speed": 8.0,
+        "speed_kp": 1.25,
+        "speed_ki": 0.10,
+        "speed_kd": 0.06,
+        "max_road_wheel_rate_deg": 90.0,
+        "max_lqr_feedback_road_wheel_deg": 2.5,
+        "curvature_preview_time": 0.45,
+        "geometric_feedforward_blend": 1.0,
     },
 }
 
@@ -1183,6 +1210,23 @@ class ReferencePath:
     def reset_progress(self):
         self.last_station = None
 
+    def preview_curvature(self, station, distance):
+        preview_station = clip(
+            float(station) + max(0.0, float(distance)),
+            0.0,
+            self.length,
+        )
+        return (
+            float(
+                np.interp(
+                    preview_station,
+                    self.station,
+                    self.curvature,
+                )
+            ),
+            preview_station,
+        )
+
     def _candidate_indices(self):
         if self.last_station is None:
             return 0, len(self.station)
@@ -1521,8 +1565,11 @@ class LearningCsvLogger:
         "speed",
         "expected_speed",
         "legal_speed",
+        "path_target_speed",
         "target_speed",
         "published_speed",
+        "feedback_speed_guard",
+        "requested_curvature_speed_cap",
         "speed_limit_ratio_actual",
         "pid_error",
         "pid_p",
@@ -1546,12 +1593,17 @@ class LearningCsvLogger:
         "heading_error",
         "heading_error_rate",
         "curvature",
+        "control_curvature",
+        "curvature_preview_station",
         "lqr_model",
         "recovery_mode",
         "lqr_model_speed",
         "lqr_k",
         "lqr_feedforward_deg",
+        "lqr_model_feedforward_deg",
+        "lqr_geometric_feedforward_deg",
         "lqr_feedback_deg",
+        "lqr_feedback_unclipped_deg",
         "road_wheel_deg",
         "road_wheel_rate_deg",
         "comfort_road_wheel_rate_limit_deg",
@@ -1599,6 +1651,11 @@ class LearningCsvLogger:
                     "steering_ratio", "steering_sign",
                     "max_road_wheel_deg",
                     "max_recovery_road_wheel_deg",
+                    "max_lqr_feedback_road_wheel_deg",
+                    "curvature_preview_time",
+                    "geometric_feedforward_blend",
+                    "feedback_speed_guard_lateral_error",
+                    "feedback_speed_guard_heading_error_deg",
                     "expected_speed_mps", "use_xodr_expected_speed",
                     "rule_lane_half_width", "rule_lane_margin",
                     "no_route_visualizer", "route_visualizer_width",
@@ -1769,17 +1826,65 @@ class GlobalPathLqrPidController:
             or abs(projection["lateral_error"])
             >= recovery_lateral_threshold
         )
+        curvature_preview_distance = (
+            model_speed * self.args.curvature_preview_time
+        )
+        control_curvature, curvature_preview_station = (
+            self.reference.preview_curvature(
+                projection["station"],
+                curvature_preview_distance,
+            )
+        )
+        if (
+            recovery_mode
+            or (
+                projection["curvature"] * control_curvature < 0.0
+                and abs(projection["curvature"]) > 0.005
+            )
+        ):
+            control_curvature = projection["curvature"]
+            curvature_preview_station = projection["station"]
         road_wheel_raw, lqr = self.lqr.control(
             projection["lateral_error"],
             lateral_error_rate,
             heading_error,
             heading_error_rate,
             model_speed,
-            projection["curvature"],
+            control_curvature,
             force_kinematic=recovery_mode,
         )
+        model_feedforward = float(lqr["feedforward"])
+        geometric_feedforward = math.atan(
+            VEHICLE.wheelbase * control_curvature
+        )
+        feedforward_blend = clip(
+            self.args.geometric_feedforward_blend, 0.0, 1.0
+        )
+        lqr["model_feedforward"] = model_feedforward
+        lqr["geometric_feedforward"] = geometric_feedforward
+        lqr["feedforward"] = (
+            (1.0 - feedforward_blend) * model_feedforward
+            + feedforward_blend * geometric_feedforward
+        )
+        lqr_feedback_unclipped = float(lqr["feedback"])
+        if not recovery_mode:
+            lqr["feedback"] = clip(
+                lqr_feedback_unclipped,
+                -math.radians(
+                    self.args.max_lqr_feedback_road_wheel_deg
+                ),
+                math.radians(
+                    self.args.max_lqr_feedback_road_wheel_deg
+                ),
+            )
+        road_wheel_raw = (
+            float(lqr["feedforward"]) + float(lqr["feedback"])
+        )
+        lqr["road_wheel_angle_raw"] = road_wheel_raw
+        lqr["feedback_unclipped"] = lqr_feedback_unclipped
 
-        target_speed = projection["target_speed"]
+        path_target_speed = projection["target_speed"]
+        target_speed = path_target_speed
         if recovery_mode:
             target_speed = min(
                 target_speed, self.args.recovery_speed
@@ -1808,15 +1913,35 @@ class GlobalPathLqrPidController:
                 VEHICLE.wheelbase,
             )
         )
+        feedback_speed_guard = (
+            recovery_mode
+            or abs(projection["lateral_error"])
+            >= self.args.feedback_speed_guard_lateral_error
+            or abs(heading_error)
+            >= math.radians(
+                self.args.feedback_speed_guard_heading_error_deg
+            )
+        )
+        requested_curvature_speed_cap = float("inf")
         if requested_curvature > 1e-8:
-            target_speed = min(
-                target_speed,
+            requested_curvature_speed_cap = min(
                 math.sqrt(
-                    self.args.max_lateral_accel
-                    / requested_curvature
+                    self.args.max_lateral_accel / requested_curvature
                 ),
                 self.args.max_yaw_rate / requested_curvature,
             )
+            # The route profile already limits reference curvature, while the
+            # actual road-wheel command below is independently clipped to the
+            # current-speed comfort envelope.  Applying this cap to every raw
+            # LQR correction made centimetre-scale errors reduce a 10 m/s
+            # straight to roughly 3 m/s.  Reserve it for material tracking
+            # errors and recovery, where slowing down genuinely restores
+            # steering authority.
+            if feedback_speed_guard:
+                target_speed = min(
+                    target_speed,
+                    requested_curvature_speed_cap,
+                )
 
         max_road_wheel = physical_max_road_wheel
         comfort_kappa_limit = comfort_curvature_limit(
@@ -2012,6 +2137,7 @@ class GlobalPathLqrPidController:
             "raw_acceleration": raw_acceleration,
             "score_metrics": score_metrics,
             "speed": self.published_speed,
+            "path_target_speed": path_target_speed,
             "steering_wheel_deg": steering_wheel_deg,
             "road_wheel": road_wheel,
             "road_wheel_rate": road_wheel_rate,
@@ -2036,6 +2162,14 @@ class GlobalPathLqrPidController:
             "heading_error": heading_error,
             "heading_error_rate": heading_error_rate,
             "target_speed": target_speed,
+            "feedback_speed_guard": feedback_speed_guard,
+            "requested_curvature_speed_cap": (
+                requested_curvature_speed_cap
+            ),
+            "control_curvature": control_curvature,
+            "curvature_preview_station": (
+                curvature_preview_station
+            ),
         }
 
 
@@ -3121,8 +3255,19 @@ class GlobalLqrPidRuntime:
                 self.controller.reference.expected_speed_mps
             ),
             "legal_speed": projection["legal_speed"],
+            "path_target_speed": output["path_target_speed"],
             "target_speed": output["target_speed"],
             "published_speed": output["speed"],
+            "feedback_speed_guard": int(
+                output["feedback_speed_guard"]
+            ),
+            "requested_curvature_speed_cap": (
+                output["requested_curvature_speed_cap"]
+                if math.isfinite(
+                    output["requested_curvature_speed_cap"]
+                )
+                else ""
+            ),
             "speed_limit_ratio_actual": output["score_metrics"][
                 "speed_limit_ratio_actual"
             ],
@@ -3162,6 +3307,10 @@ class GlobalLqrPidRuntime:
             "heading_error": output["heading_error"],
             "heading_error_rate": output["heading_error_rate"],
             "curvature": projection["curvature"],
+            "control_curvature": output["control_curvature"],
+            "curvature_preview_station": output[
+                "curvature_preview_station"
+            ],
             "lqr_model": lqr["model"],
             "recovery_mode": int(output["recovery_mode"]),
             "lqr_model_speed": lqr["model_speed"],
@@ -3171,7 +3320,16 @@ class GlobalLqrPidRuntime:
             "lqr_feedforward_deg": math.degrees(
                 lqr["feedforward"]
             ),
+            "lqr_model_feedforward_deg": math.degrees(
+                lqr["model_feedforward"]
+            ),
+            "lqr_geometric_feedforward_deg": math.degrees(
+                lqr["geometric_feedforward"]
+            ),
             "lqr_feedback_deg": math.degrees(lqr["feedback"]),
+            "lqr_feedback_unclipped_deg": math.degrees(
+                lqr["feedback_unclipped"]
+            ),
             "road_wheel_deg": math.degrees(
                 output["road_wheel"]
             ),
@@ -3218,13 +3376,18 @@ class GlobalLqrPidRuntime:
                 f"profile={self.args.score_profile} "
                 f"v={self.ego['speed']:.2f}->"
                 f"{output['target_speed']:.2f}m/s "
+                f"path_v={output['path_target_speed']:.2f} "
+                f"feedback_guard="
+                f"{int(output['feedback_speed_guard'])} "
                 f"ratio={output['score_metrics']['speed_limit_ratio_actual']:.3f} "
                 f"ey={projection['lateral_error']:.3f}m "
                 f"epsi={math.degrees(output['heading_error']):.2f}deg "
-                f"kappa={projection['curvature']:.4f} "
+                f"kappa={projection['curvature']:.4f}->"
+                f"{output['control_curvature']:.4f} "
                 f"model={lqr['model']} "
                 f"delta_ff={math.degrees(lqr['feedforward']):.2f}deg "
-                f"delta_fb={math.degrees(lqr['feedback']):.2f}deg "
+                f"delta_fb={math.degrees(lqr['feedback']):.2f}/"
+                f"{math.degrees(lqr['feedback_unclipped']):.2f}deg "
                 f"steer={output['steering_wheel_deg']:.1f}deg "
                 f"delta_rate="
                 f"{math.degrees(output['road_wheel_rate']):.2f}deg/s "
@@ -3306,7 +3469,7 @@ class GlobalLqrPidRuntime:
             self.logger.close()
 
 
-def run_self_test():
+def run_self_test(args=None):
     official_limits = {
         "max_accel": 3.0,
         "max_decel": 3.0,
@@ -3316,13 +3479,36 @@ def run_self_test():
         "max_yaw_rate": 0.5,
         "speed_limit_ratio": 1.20,
     }
-    for profile_name, profile in SCORE_PROFILES.items():
+    score_safe_profiles = ("comfort", "balanced", "efficiency")
+    for profile_name in score_safe_profiles:
+        profile = SCORE_PROFILES[profile_name]
         for field, official_limit in official_limits.items():
             if not float(profile[field]) < official_limit:
                 raise AssertionError(
                     f"{profile_name}.{field} must stay below "
                     f"the scoring boundary {official_limit}"
                 )
+    attack = SCORE_PROFILES["attack"]
+    for field in (
+        "max_accel",
+        "max_decel",
+        "max_longitudinal_jerk",
+        "speed_limit_ratio",
+    ):
+        if not float(attack[field]) < official_limits[field]:
+            raise AssertionError(
+                f"attack.{field} must stay below "
+                f"the scoring boundary {official_limits[field]}"
+            )
+    if not (
+        attack["max_lateral_accel"]
+        > official_limits["max_lateral_accel"]
+        and attack["max_lateral_jerk"]
+        > official_limits["max_lateral_jerk"]
+    ):
+        raise AssertionError(
+            "attack profile must explicitly trade lateral comfort for speed"
+        )
 
     visual_points = downsample_route_points(
         np.arange(2000, dtype=float),
@@ -3560,6 +3746,88 @@ def run_self_test():
         raise AssertionError("U-turn spline curvature failed")
     if uturn.speed[center] > math.sqrt(3.0 * radius) + 1e-3:
         raise AssertionError("U-turn lateral acceleration cap failed")
+
+    if args is not None:
+        attack_args = argparse.Namespace(**vars(args))
+        for name, value in SCORE_PROFILES["attack"].items():
+            setattr(attack_args, name, value)
+        straight_x = np.linspace(0.0, 8.0, 41)
+        straight_y = np.zeros_like(straight_x)
+        arc_angle = np.linspace(-math.pi / 2.0, 0.0, 158)
+        arc_x = 8.0 + 20.0 * np.cos(arc_angle)
+        arc_y = 20.0 + 20.0 * np.sin(arc_angle)
+        intersection_route = {
+            "x": np.concatenate((straight_x, arc_x[1:])),
+            "y": np.concatenate((straight_y, arc_y[1:])),
+        }
+        attack_controller = GlobalPathLqrPidController(attack_args)
+        attack_controller.set_route(
+            intersection_route,
+            initial_speed=8.9,
+            legal_speed=20.0,
+            expected_speed=20.0,
+        )
+        sim_x = 1.0
+        sim_y = 0.34
+        sim_heading = 0.0
+        sim_speed = 8.9
+        sim_output = None
+        max_intersection_error = 0.0
+        reached_intersection_goal = False
+        for index in range(350):
+            sim_yaw_rate = (
+                0.0
+                if sim_output is None
+                else (
+                    sim_speed
+                    * math.tan(sim_output["road_wheel"])
+                    / VEHICLE.wheelbase
+                )
+            )
+            sim_ego = {
+                "x": sim_x,
+                "y": sim_y,
+                "heading": sim_heading,
+                "vx_world": sim_speed * math.cos(sim_heading),
+                "vy_world": sim_speed * math.sin(sim_heading),
+                "yaw_rate": sim_yaw_rate,
+                "speed": sim_speed,
+            }
+            sim_output = attack_controller.control(
+                sim_ego, now=10.0 + 0.02 * index
+            )
+            sim_road_wheel = sim_output["road_wheel"]
+            sim_heading = wrap_angle(
+                sim_heading
+                + sim_speed
+                * math.tan(sim_road_wheel)
+                / VEHICLE.wheelbase
+                * 0.02
+            )
+            sim_x += sim_speed * math.cos(sim_heading) * 0.02
+            sim_y += sim_speed * math.sin(sim_heading) * 0.02
+            sim_speed = max(
+                0.0,
+                sim_speed + sim_output["acceleration"] * 0.02,
+            )
+            max_intersection_error = max(
+                max_intersection_error,
+                abs(
+                    sim_output["projection"]["lateral_error"]
+                ),
+            )
+            if sim_output["projection"]["remaining"] < 0.40:
+                reached_intersection_goal = True
+                break
+        if (
+            not reached_intersection_goal
+            or max_intersection_error > 0.80
+        ):
+            raise AssertionError(
+                "attack intersection capture failed: "
+                f"reached={reached_intersection_goal} "
+                f"max_error={max_intersection_error:.3f}m"
+            )
 
     print("[self-test] vehicle parameters:", asdict(vehicle))
     print(
@@ -3905,6 +4173,24 @@ def parse_args():
         "--large-lateral-error", type=float, default=1.5
     )
     parser.add_argument(
+        "--feedback-speed-guard-lateral-error",
+        type=float,
+        default=0.40,
+        help=(
+            "apply raw LQR-curvature speed cap only beyond this "
+            "normal-tracking lateral error"
+        ),
+    )
+    parser.add_argument(
+        "--feedback-speed-guard-heading-error-deg",
+        type=float,
+        default=8.0,
+        help=(
+            "apply raw LQR-curvature speed cap only beyond this "
+            "normal-tracking heading error"
+        ),
+    )
+    parser.add_argument(
         "--path-sample-step", type=float, default=0.20
     )
 
@@ -3957,6 +4243,30 @@ def parse_args():
     )
     parser.add_argument(
         "--lqr-speed-recompute-delta", type=float, default=0.20
+    )
+    parser.add_argument(
+        "--max-lqr-feedback-road-wheel-deg",
+        type=float,
+        default=None,
+        help=(
+            "normal-mode LQR feedback-angle cap before adding curvature "
+            "feedforward; recovery mode remains unrestricted"
+        ),
+    )
+    parser.add_argument(
+        "--curvature-preview-time",
+        type=float,
+        default=None,
+        help="seconds of speed-scaled curvature preview for LQR feedforward",
+    )
+    parser.add_argument(
+        "--geometric-feedforward-blend",
+        type=float,
+        default=None,
+        help=(
+            "blend from dynamic-LQR affine feedforward (0) to "
+            "atan(wheelbase*preview_curvature) feedforward (1)"
+        ),
     )
 
     parser.add_argument(
@@ -4083,12 +4393,22 @@ def validate_args(args):
         "speed_limit_ratio": args.speed_limit_ratio,
         "rule_lane_half_width": args.rule_lane_half_width,
         "path_sample_step": args.path_sample_step,
+        "feedback_speed_guard_lateral_error": (
+            args.feedback_speed_guard_lateral_error
+        ),
+        "feedback_speed_guard_heading_error_deg": (
+            args.feedback_speed_guard_heading_error_deg
+        ),
         "steering_ratio": args.steering_ratio,
         "max_road_wheel_deg": args.max_road_wheel_deg,
         "max_recovery_road_wheel_deg": (
             args.max_recovery_road_wheel_deg
         ),
         "max_road_wheel_rate_deg": args.max_road_wheel_rate_deg,
+        "max_lqr_feedback_road_wheel_deg": (
+            args.max_lqr_feedback_road_wheel_deg
+        ),
+        "curvature_preview_time": args.curvature_preview_time,
         "route_visualizer_width": args.route_visualizer_width,
         "route_visualizer_height": args.route_visualizer_height,
         "route_visualizer_hz": args.route_visualizer_hz,
@@ -4127,6 +4447,13 @@ def validate_args(args):
     ):
         raise ValueError("--steering-sign must be exactly +1 or -1")
     if (
+        not math.isfinite(args.geometric_feedforward_blend)
+        or not 0.0 <= args.geometric_feedforward_blend <= 1.0
+    ):
+        raise ValueError(
+            "--geometric-feedforward-blend must be between 0 and 1"
+        )
+    if (
         args.expected_speed_mps is not None
         and (
             not math.isfinite(args.expected_speed_mps)
@@ -4153,7 +4480,7 @@ def main():
     args = parse_args()
     validate_args(args)
     if args.self_test:
-        run_self_test()
+        run_self_test(args)
         return
     if not args.runtime_child:
         raise SystemExit(supervise_runtime(args))
