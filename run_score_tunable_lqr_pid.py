@@ -135,6 +135,7 @@ import math
 import multiprocessing
 import os
 import queue
+import signal
 import subprocess
 import sys
 import time
@@ -2571,9 +2572,9 @@ def draw_global_route_window(window, state):
 
 
 def global_route_visualizer_worker(
-    message_queue, width, height, update_hz
+    message_queue, width, height, update_hz, owner_pid
 ):
-    """Own the X11 window in an isolated process."""
+    """Own the X11 window and close it when its parent disappears."""
     try:
         communication = importlib.import_module("run_hmxzw")
         window_class = getattr(
@@ -2622,6 +2623,16 @@ def global_route_visualizer_worker(
     running = True
     try:
         while running and window.enabled:
+            # Normal shutdown arrives through the queue.  This parent check
+            # is the fail-safe for SIGKILL, os._exit, interpreter crashes,
+            # or supervisor termination that cannot execute parent cleanup.
+            # An orphan is re-parented, so getppid() changes immediately.
+            if os.getppid() != int(owner_pid):
+                print(
+                    "[lqr-pid][route-window] owner exited; closing",
+                    flush=True,
+                )
+                break
             messages = []
             try:
                 messages.append(message_queue.get(timeout=0.04))
@@ -2726,6 +2737,7 @@ class GlobalRouteLiveVisualizer:
                     self.width,
                     self.height,
                     self.update_hz,
+                    os.getpid(),
                 ),
                 name="lqr-global-route-window",
                 daemon=True,
@@ -2843,16 +2855,42 @@ class GlobalRouteLiveVisualizer:
     def close(self):
         if self.process is None:
             return
+        process = self.process
+        message_queue = self.message_queue
         self._publish({"type": "stop"}, important=True)
-        self.process.join(timeout=1.5)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=1.0)
-        if self.message_queue is not None:
-            self.message_queue.close()
-            self.message_queue.cancel_join_thread()
+        try:
+            process.join(timeout=1.5)
+            if process.is_alive():
+                print(
+                    "[lqr-pid][route-window] graceful close timed out; "
+                    "terminating process",
+                    flush=True,
+                )
+                process.terminate()
+                process.join(timeout=1.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                print(
+                    "[lqr-pid][route-window] terminate timed out; "
+                    "killing process",
+                    flush=True,
+                )
+                process.kill()
+                process.join(timeout=1.0)
+        finally:
+            if message_queue is not None:
+                try:
+                    message_queue.close()
+                    message_queue.cancel_join_thread()
+                except (OSError, ValueError):
+                    pass
+            if not process.is_alive():
+                try:
+                    process.close()
+                except (OSError, ValueError):
+                    pass
         self.process = None
         self.message_queue = None
+        self.enabled = False
 
 
 class GlobalLqrPidRuntime:
@@ -3524,7 +3562,7 @@ class GlobalLqrPidRuntime:
                 flush=True,
             )
             self.send_control(0.0, 0.0, 0.0)
-            os._exit(INS_STALL_EXIT_CODE)
+            raise SystemExit(INS_STALL_EXIT_CODE)
         if (
             self.episode_task_timeout > 0.0
             and elapsed >= self.episode_task_timeout
@@ -3536,7 +3574,7 @@ class GlobalLqrPidRuntime:
                 flush=True,
             )
             self.send_control(0.0, 0.0, 0.0)
-            os._exit(TASK_TIMEOUT_EXIT_CODE)
+            raise SystemExit(TASK_TIMEOUT_EXIT_CODE)
 
     def run(self):
         self.route_visualizer.start()
@@ -3549,6 +3587,16 @@ class GlobalLqrPidRuntime:
                 flush=True,
             )
             while True:
+                if (
+                    self.args.supervisor_pid > 0
+                    and os.getppid() != self.args.supervisor_pid
+                ):
+                    print(
+                        "[lqr-pid] supervisor exited; "
+                        "closing controller and visualization",
+                        flush=True,
+                    )
+                    break
                 self.poll_prepare()
                 self.poll_notify()
                 self.poll_ins()
@@ -4103,6 +4151,8 @@ def supervise_runtime(args):
         str(Path(__file__).resolve()),
         *sys.argv[1:],
         "--runtime-child",
+        "--supervisor-pid",
+        str(os.getpid()),
     ]
     restart_count = 0
     start_failures = 0
@@ -4263,6 +4313,12 @@ def parse_args():
     parser.add_argument(
         "--runtime-child",
         action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--supervisor-pid",
+        type=int,
+        default=0,
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -4760,7 +4816,37 @@ def validate_args(args):
         )
 
 
+def install_shutdown_signal_handlers():
+    """Convert termination signals into exceptions so finally blocks run."""
+    shutdown_requested = False
+
+    def handle_shutdown(signum, _frame):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        try:
+            received_name = signal.Signals(signum).name
+        except (TypeError, ValueError):
+            received_name = str(signum)
+        print(
+            f"[lqr-pid] received {received_name}; cleaning up",
+            flush=True,
+        )
+        raise KeyboardInterrupt
+
+    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        shutdown_signal = getattr(signal, signal_name, None)
+        if shutdown_signal is None:
+            continue
+        try:
+            signal.signal(shutdown_signal, handle_shutdown)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+
 def main():
+    install_shutdown_signal_handlers()
     args = parse_args()
     validate_args(args)
     if args.self_test:
