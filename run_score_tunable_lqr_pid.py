@@ -45,8 +45,10 @@ Cxf               179040       N              前轴纵向刚度（89520×2）
 Cxr               121480       N              后轴纵向刚度（60740×2）
 ================  ===========  =============  ==========================
 
-方向盘传动比没有出现在三张图片中，因此它不是“实测图片参数”。代码把
-``steering_ratio`` 单独作为必须标定的执行器参数，默认 16.0。
+LQR 输出是前轮转角，DriverSim 的控制字段名为方向盘转角，因此发送前仍需
+经过执行器映射。仓库已有 INS/横摆响应标定表明 Cam6 的有效比例约为 1.65，
+且正命令产生正横摆，所以默认 ``steering_ratio=1.65``、
+``steering_sign=+1``；它不是普通乘用车约 16:1 的机械方向盘比例。
 
 四状态侧向-横摆 LQR 实际使用 m、Iz、lf、lr、Cf、Cr；纵向阻力前馈使用
 m、f、rho、CD、A、g。图片中的侧倾参数被完整记录但没有硬塞进状态矩阵，
@@ -1594,6 +1596,9 @@ class LearningCsvLogger:
                     "max_yaw_rate", "speed_kp", "speed_ki", "speed_kd",
                     "max_road_wheel_rate_deg", "q_lateral_error",
                     "q_heading_error", "r_steering",
+                    "steering_ratio", "steering_sign",
+                    "max_road_wheel_deg",
+                    "max_recovery_road_wheel_deg",
                     "expected_speed_mps", "use_xodr_expected_speed",
                     "rule_lane_half_width", "rule_lane_margin",
                     "no_route_visualizer", "route_visualizer_width",
@@ -1658,6 +1663,13 @@ class GlobalPathLqrPidController:
         self.published_speed = None
         self.last_acceleration_command = 0.0
         self.score_tracker = ScoreProxyTracker()
+        print(
+            "[lqr-pid][steering-map] "
+            "command_deg=road_wheel_deg"
+            f"*{float(args.steering_ratio):.3f}"
+            f"*{float(args.steering_sign):+.0f}",
+            flush=True,
+        )
 
     def set_route(
         self,
@@ -3952,17 +3964,17 @@ def parse_args():
         type=float,
         default=1.65,
         help=(
-            "steering-wheel / road-wheel ratio; not provided by "
-            "the parameter images and must be calibrated"
+            "DriverSim command / LQR road-wheel angle ratio; "
+            "Cam6 INS/yaw calibration gives about 1.65"
         ),
     )
     parser.add_argument(
         "--steering-sign",
         type=float,
-        default=-1.0,
+        default=1.0,
         help=(
-            "DriverSim steering mapping; onsite logs show -1 is required "
-            "(use +1 only if a positive command turns the vehicle left)"
+            "DriverSim command sign; Cam6 positive command produces "
+            "positive yaw, so the calibrated default is +1"
         ),
     )
     parser.add_argument(
@@ -4109,6 +4121,11 @@ def validate_args(args):
         raise ValueError(
             "LQR Q weights must be nonnegative and not all zero"
         )
+    if (
+        not math.isfinite(args.steering_sign)
+        or abs(abs(args.steering_sign) - 1.0) > 1e-9
+    ):
+        raise ValueError("--steering-sign must be exactly +1 or -1")
     if (
         args.expected_speed_mps is not None
         and (
