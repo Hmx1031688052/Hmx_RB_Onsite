@@ -194,6 +194,8 @@ SCORE_PROFILES = {
         "speed_kd": 0.10,
         "max_road_wheel_rate_deg": 35.0,
         "max_lqr_feedback_road_wheel_deg": 8.0,
+        "normal_feedback_speed_product_deg_mps": 500.0,
+        "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.30,
         "geometric_feedforward_blend": 0.0,
     },
@@ -212,6 +214,8 @@ SCORE_PROFILES = {
         "speed_kd": 0.10,
         "max_road_wheel_rate_deg": 50.0,
         "max_lqr_feedback_road_wheel_deg": 8.0,
+        "normal_feedback_speed_product_deg_mps": 500.0,
+        "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.35,
         "geometric_feedforward_blend": 0.0,
     },
@@ -230,6 +234,8 @@ SCORE_PROFILES = {
         "speed_kd": 0.06,
         "max_road_wheel_rate_deg": 60.0,
         "max_lqr_feedback_road_wheel_deg": 7.0,
+        "normal_feedback_speed_product_deg_mps": 500.0,
+        "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.40,
         "geometric_feedforward_blend": 0.0,
     },
@@ -248,6 +254,8 @@ SCORE_PROFILES = {
         "speed_kd": 0.06,
         "max_road_wheel_rate_deg": 90.0,
         "max_lqr_feedback_road_wheel_deg": 2.5,
+        "normal_feedback_speed_product_deg_mps": 4.0,
+        "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.45,
         "geometric_feedforward_blend": 1.0,
     },
@@ -1597,6 +1605,8 @@ class LearningCsvLogger:
         "curvature_preview_station",
         "lqr_model",
         "recovery_mode",
+        "lateral_feedback_controller",
+        "lateral_feedback_limit_deg",
         "lqr_model_speed",
         "lqr_k",
         "lqr_feedforward_deg",
@@ -1652,6 +1662,14 @@ class LearningCsvLogger:
                     "max_road_wheel_deg",
                     "max_recovery_road_wheel_deg",
                     "max_lqr_feedback_road_wheel_deg",
+                    "normal_feedback_speed_product_deg_mps",
+                    "normal_feedback_full_curvature",
+                    "max_recovery_feedback_road_wheel_deg",
+                    "recovery_feedback_speed_product_deg_mps",
+                    "recovery_stanley_gain",
+                    "recovery_stanley_softening_speed",
+                    "recovery_exit_lateral_error",
+                    "recovery_exit_heading_error_deg",
                     "curvature_preview_time",
                     "geometric_feedforward_blend",
                     "feedback_speed_guard_lateral_error",
@@ -1717,6 +1735,7 @@ class GlobalPathLqrPidController:
         self.reference = None
         self.last_time = None
         self.last_road_wheel = 0.0
+        self.recovery_active = False
         self.published_speed = None
         self.last_acceleration_command = 0.0
         self.score_tracker = ScoreProxyTracker()
@@ -1755,6 +1774,7 @@ class GlobalPathLqrPidController:
         self.pid.reset(initial_speed)
         self.last_time = None
         self.last_road_wheel = 0.0
+        self.recovery_active = False
         self.published_speed = max(0.0, float(initial_speed))
         self.last_acceleration_command = 0.0
         self.score_tracker.reset(
@@ -1769,6 +1789,7 @@ class GlobalPathLqrPidController:
         self.pid.reset()
         self.last_time = None
         self.last_road_wheel = 0.0
+        self.recovery_active = False
         self.published_speed = None
         self.last_acceleration_command = 0.0
         self.score_tracker.reset(0.1, 0.0)
@@ -1820,12 +1841,26 @@ class GlobalPathLqrPidController:
             self.args.large_lateral_error,
             0.80 * routed_corridor,
         )
-        recovery_mode = (
+        recovery_entry = (
             abs(heading_error)
             >= math.radians(self.args.large_heading_error_deg)
             or abs(projection["lateral_error"])
             >= recovery_lateral_threshold
         )
+        if self.recovery_active:
+            recovery_exit = (
+                abs(projection["lateral_error"])
+                <= self.args.recovery_exit_lateral_error
+                and abs(heading_error)
+                <= math.radians(
+                    self.args.recovery_exit_heading_error_deg
+                )
+            )
+            if recovery_exit:
+                self.recovery_active = False
+        elif recovery_entry:
+            self.recovery_active = True
+        recovery_mode = self.recovery_active
         curvature_preview_distance = (
             model_speed * self.args.curvature_preview_time
         )
@@ -1866,17 +1901,66 @@ class GlobalPathLqrPidController:
             (1.0 - feedforward_blend) * model_feedforward
             + feedforward_blend * geometric_feedforward
         )
+        feedback_controller = "lqr"
         lqr_feedback_unclipped = float(lqr["feedback"])
-        if not recovery_mode:
-            lqr["feedback"] = clip(
-                lqr_feedback_unclipped,
-                -math.radians(
-                    self.args.max_lqr_feedback_road_wheel_deg
-                ),
-                math.radians(
-                    self.args.max_lqr_feedback_road_wheel_deg
+        straight_feedback_limit_deg = min(
+            self.args.max_lqr_feedback_road_wheel_deg,
+            (
+                self.args.normal_feedback_speed_product_deg_mps
+                / max(model_speed, 1.0)
+            ),
+        )
+        curve_authority_blend = clip(
+            abs(control_curvature)
+            / self.args.normal_feedback_full_curvature,
+            0.0,
+            1.0,
+        )
+        feedback_limit_deg = (
+            straight_feedback_limit_deg
+            + curve_authority_blend
+            * (
+                self.args.max_lqr_feedback_road_wheel_deg
+                - straight_feedback_limit_deg
+            )
+        )
+        if recovery_mode:
+            # Raw kinematic LQR is intentionally aggressive outside its
+            # linear region.  In the high-speed straight test it requested
+            # +/-60 deg, crossed the route with substantial yaw, then did
+            # the same in the opposite direction.  A Stanley-style recovery
+            # law supplies the missing geometric damping, while the
+            # speed-scaled cap preserves authority at low speed without
+            # commanding a hairpin correction at motorway speed.
+            feedback_controller = "stanley_recovery"
+            stanley_cross_track = math.atan2(
+                self.args.recovery_stanley_gain
+                * projection["lateral_error"],
+                model_speed
+                + self.args.recovery_stanley_softening_speed,
+            )
+            lqr_feedback_unclipped = -(
+                heading_error + stanley_cross_track
+            )
+            feedback_limit_deg = min(
+                self.args.max_recovery_feedback_road_wheel_deg,
+                max(
+                    self.args.max_lqr_feedback_road_wheel_deg,
+                    (
+                        self.args
+                        .recovery_feedback_speed_product_deg_mps
+                        / max(model_speed, 1.0)
+                    ),
                 ),
             )
+        feedback_limit = math.radians(feedback_limit_deg)
+        lqr["feedback"] = clip(
+            lqr_feedback_unclipped,
+            -feedback_limit,
+            feedback_limit,
+        )
+        lqr["feedback_controller"] = feedback_controller
+        lqr["feedback_limit"] = feedback_limit
         road_wheel_raw = (
             float(lqr["feedforward"]) + float(lqr["feedback"])
         )
@@ -2157,6 +2241,8 @@ class GlobalPathLqrPidController:
             "pid": pid,
             "lqr": lqr,
             "recovery_mode": recovery_mode,
+            "lateral_feedback_controller": feedback_controller,
+            "lateral_feedback_limit": feedback_limit,
             "dt": dt,
             "lateral_error_rate": lateral_error_rate,
             "heading_error": heading_error,
@@ -3313,6 +3399,12 @@ class GlobalLqrPidRuntime:
             ],
             "lqr_model": lqr["model"],
             "recovery_mode": int(output["recovery_mode"]),
+            "lateral_feedback_controller": output[
+                "lateral_feedback_controller"
+            ],
+            "lateral_feedback_limit_deg": math.degrees(
+                output["lateral_feedback_limit"]
+            ),
             "lqr_model_speed": lqr["model_speed"],
             "lqr_k": json.dumps(
                 lqr["k"].reshape(-1).tolist()
@@ -3829,6 +3921,99 @@ def run_self_test(args=None):
                 f"max_error={max_intersection_error:.3f}m"
             )
 
+        # Regression for the onsite "high-speed snake" trace: the vehicle
+        # arrived on a straight at 30 m/s with 0.65 m cross-track error.
+        # A fixed +/-2.5 deg feedback clip behaved like a relay, eventually
+        # triggering unrestricted recovery and oscillating by over 4 m.
+        high_speed_route = {
+            "x": np.linspace(0.0, 420.0, 1401).tolist(),
+            "y": np.zeros(1401).tolist(),
+            "speed_limit": np.full(
+                1401, 33.333333
+            ).tolist(),
+        }
+        high_speed_controller = GlobalPathLqrPidController(
+            attack_args
+        )
+        high_speed_controller.set_route(
+            high_speed_route,
+            initial_speed=30.012,
+            legal_speed=33.333333,
+            expected_speed=33.333333,
+        )
+        sim_x = 0.0
+        sim_y = 0.646
+        sim_heading = math.radians(1.353)
+        sim_speed = 30.012
+        sim_output = None
+        high_speed_errors = []
+        high_speed_recovery_samples = 0
+        reached_high_speed_goal = False
+        for index in range(800):
+            sim_yaw_rate = (
+                0.0
+                if sim_output is None
+                else (
+                    sim_speed
+                    * math.tan(sim_output["road_wheel"])
+                    / VEHICLE.wheelbase
+                )
+            )
+            sim_ego = {
+                "x": sim_x,
+                "y": sim_y,
+                "heading": sim_heading,
+                "vx_world": sim_speed * math.cos(sim_heading),
+                "vy_world": sim_speed * math.sin(sim_heading),
+                "yaw_rate": sim_yaw_rate,
+                "speed": sim_speed,
+            }
+            sim_output = high_speed_controller.control(
+                sim_ego, now=30.0 + 0.02 * index
+            )
+            high_speed_errors.append(
+                abs(
+                    sim_output["projection"]["lateral_error"]
+                )
+            )
+            high_speed_recovery_samples += int(
+                sim_output["recovery_mode"]
+            )
+            sim_road_wheel = sim_output["road_wheel"]
+            sim_heading = wrap_angle(
+                sim_heading
+                + sim_speed
+                * math.tan(sim_road_wheel)
+                / VEHICLE.wheelbase
+                * 0.02
+            )
+            sim_x += (
+                sim_speed * math.cos(sim_heading) * 0.02
+            )
+            sim_y += (
+                sim_speed * math.sin(sim_heading) * 0.02
+            )
+            sim_speed = max(
+                0.0,
+                sim_speed + sim_output["acceleration"] * 0.02,
+            )
+            if sim_output["projection"]["remaining"] < 0.50:
+                reached_high_speed_goal = True
+                break
+        if (
+            not reached_high_speed_goal
+            or max(high_speed_errors) > 1.05
+            or max(high_speed_errors[-50:]) > 0.02
+            or high_speed_recovery_samples != 0
+        ):
+            raise AssertionError(
+                "attack high-speed straight damping failed: "
+                f"reached={reached_high_speed_goal} "
+                f"max_error={max(high_speed_errors):.3f}m "
+                f"tail_error={max(high_speed_errors[-50:]):.3f}m "
+                f"recovery_samples={high_speed_recovery_samples}"
+            )
+
     print("[self-test] vehicle parameters:", asdict(vehicle))
     print(
         "[self-test] PASS "
@@ -4250,8 +4435,67 @@ def parse_args():
         default=None,
         help=(
             "normal-mode LQR feedback-angle cap before adding curvature "
-            "feedforward; recovery mode remains unrestricted"
+            "feedforward"
         ),
+    )
+    parser.add_argument(
+        "--max-recovery-feedback-road-wheel-deg",
+        type=float,
+        default=None,
+        help=(
+            "maximum Stanley recovery feedback angle at low speed"
+        ),
+    )
+    parser.add_argument(
+        "--normal-feedback-speed-product-deg-mps",
+        type=float,
+        default=None,
+        help=(
+            "straight-road normal feedback cap times speed; attack mode "
+            "uses a small value to prevent high-speed bang-bang steering"
+        ),
+    )
+    parser.add_argument(
+        "--normal-feedback-full-curvature",
+        type=float,
+        default=0.02,
+        help=(
+            "reference curvature at which normal LQR regains its full "
+            "feedback-angle authority"
+        ),
+    )
+    parser.add_argument(
+        "--recovery-feedback-speed-product-deg-mps",
+        type=float,
+        default=80.0,
+        help=(
+            "speed-scaled recovery feedback cap in deg*m/s; the active "
+            "cap is this value divided by speed"
+        ),
+    )
+    parser.add_argument(
+        "--recovery-stanley-gain",
+        type=float,
+        default=1.0,
+        help="cross-track gain for bounded nonlinear recovery steering",
+    )
+    parser.add_argument(
+        "--recovery-stanley-softening-speed",
+        type=float,
+        default=2.0,
+        help="m/s softening term in nonlinear recovery steering",
+    )
+    parser.add_argument(
+        "--recovery-exit-lateral-error",
+        type=float,
+        default=0.40,
+        help="recovery exits only inside this lateral-error band",
+    )
+    parser.add_argument(
+        "--recovery-exit-heading-error-deg",
+        type=float,
+        default=8.0,
+        help="recovery exits only inside this heading-error band",
     )
     parser.add_argument(
         "--curvature-preview-time",
@@ -4408,6 +4652,28 @@ def validate_args(args):
         "max_lqr_feedback_road_wheel_deg": (
             args.max_lqr_feedback_road_wheel_deg
         ),
+        "max_recovery_feedback_road_wheel_deg": (
+            args.max_recovery_feedback_road_wheel_deg
+        ),
+        "normal_feedback_speed_product_deg_mps": (
+            args.normal_feedback_speed_product_deg_mps
+        ),
+        "normal_feedback_full_curvature": (
+            args.normal_feedback_full_curvature
+        ),
+        "recovery_feedback_speed_product_deg_mps": (
+            args.recovery_feedback_speed_product_deg_mps
+        ),
+        "recovery_stanley_gain": args.recovery_stanley_gain,
+        "recovery_stanley_softening_speed": (
+            args.recovery_stanley_softening_speed
+        ),
+        "recovery_exit_lateral_error": (
+            args.recovery_exit_lateral_error
+        ),
+        "recovery_exit_heading_error_deg": (
+            args.recovery_exit_heading_error_deg
+        ),
         "curvature_preview_time": args.curvature_preview_time,
         "route_visualizer_width": args.route_visualizer_width,
         "route_visualizer_height": args.route_visualizer_height,
@@ -4473,6 +4739,24 @@ def validate_args(args):
     if not 0.0 < args.speed_limit_ratio < 1.20:
         raise ValueError(
             "--speed-limit-ratio must stay below the 1.20 score boundary"
+        )
+    recovery_lateral_entry = min(
+        args.large_lateral_error,
+        0.80
+        * (args.rule_lane_half_width - args.rule_lane_margin),
+    )
+    if args.recovery_exit_lateral_error >= recovery_lateral_entry:
+        raise ValueError(
+            "--recovery-exit-lateral-error must be smaller than the "
+            "recovery entry threshold"
+        )
+    if (
+        args.recovery_exit_heading_error_deg
+        >= args.large_heading_error_deg
+    ):
+        raise ValueError(
+            "--recovery-exit-heading-error-deg must be smaller than "
+            "--large-heading-error-deg"
         )
 
 
