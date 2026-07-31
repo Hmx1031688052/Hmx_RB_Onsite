@@ -1278,6 +1278,13 @@ class StraightSprintController:
         self.align_steer_reference_speed = max(
             0.1, float(args.align_steer_reference_speed)
         )
+        self.align_stabilization_steer_limit_deg = max(
+            0.0, float(args.align_stabilization_steer_limit_deg)
+        )
+        self.align_capture_error_deg = max(
+            self.align_tolerance_deg + 0.1,
+            float(args.align_capture_error_deg),
+        )
         self.steer_sign = float(args.steer_sign)
         self.steer_limit_deg = abs(float(args.steer_limit_deg))
         self.manual_steer_command_deg = min(
@@ -1573,12 +1580,49 @@ class StraightSprintController:
             / max(self.align_steer_reference_speed, speed),
         )
 
+    def _alignment_steer_limit(
+        self, heading_error_deg, ego_speed
+    ):
+        speed_scale = self._alignment_steer_scale(ego_speed)
+        full_limit = self.steer_limit_deg * speed_scale
+        stabilization_limit = min(
+            full_limit,
+            self.align_stabilization_steer_limit_deg * speed_scale,
+        )
+        blend = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    abs(float(heading_error_deg))
+                    - self.align_tolerance_deg
+                )
+                / (
+                    self.align_capture_error_deg
+                    - self.align_tolerance_deg
+                ),
+            ),
+        )
+        return stabilization_limit + blend * (
+            full_limit - stabilization_limit
+        )
+
     def _alignment_steering(
         self,
         heading_error_deg,
         ego_yaw_rate_deg,
         ego_speed=0.0,
     ):
+        # Do not excite an already aligned vehicle.  The previous controller
+        # reacted to a sub-degree error with a small command; chassis delay
+        # turned that correction into an expanding left/right oscillation at
+        # high entry speed.
+        if (
+            abs(heading_error_deg) <= self.align_tolerance_deg
+            and abs(ego_yaw_rate_deg) <= self.settle_yaw_rate_deg
+        ):
+            return 0.0
+
         speed_scale = self._alignment_steer_scale(ego_speed)
         predicted_error_deg = (
             heading_error_deg
@@ -1601,12 +1645,14 @@ class StraightSprintController:
             if abs(heading_error_deg) <= self.align_tolerance_deg
             else self.steer_min_deg * speed_scale
         )
-        scaled_steer_limit = self.steer_limit_deg * speed_scale
+        scheduled_steer_limit = self._alignment_steer_limit(
+            heading_error_deg, ego_speed
+        )
         steering_magnitude = max(
             scaled_steer_min, abs(raw_steering)
         )
         return math.copysign(
-            min(scaled_steer_limit, steering_magnitude),
+            min(scheduled_steer_limit, steering_magnitude),
             raw_steering,
         )
 
@@ -2005,6 +2051,9 @@ class StraightSprintController:
         else:
             stable_count = self.settle_confirm_count
             stable_required = self.settle_confirm_frames
+        alignment_steer_limit = self._alignment_steer_limit(
+            heading_error_deg, ego_speed
+        )
 
         if now - self.last_log_time >= 0.25:
             self.last_log_time = now
@@ -2024,6 +2073,8 @@ class StraightSprintController:
                 f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
                 f"align_steer_scale="
                 f"{self._alignment_steer_scale(ego_speed):.3f} "
+                f"align_steer_limit="
+                f"{alignment_steer_limit:.3f}deg "
                 f"steer_feedback={steering_feedback_deg:.3f}deg "
                 f"stable={stable_count}/{stable_required} "
                 f"pulse_active="
@@ -2690,6 +2741,10 @@ class Run3:
             f"{self.controller.align_yaw_damping:.2f}s "
             f"steer_reference_speed="
             f"{self.controller.align_steer_reference_speed:.2f}m/s "
+            f"stabilization_steer_limit="
+            f"{self.controller.align_stabilization_steer_limit_deg:.2f}deg "
+            f"capture_error="
+            f"{self.controller.align_capture_error_deg:.2f}deg "
             f"steer_range="
             f"[{self.controller.steer_min_deg:.1f},"
             f"{self.controller.steer_limit_deg:.1f}]deg "
@@ -2963,6 +3018,24 @@ def parse_args():
         help=(
             "full-gain alignment speed; steering gain and limit scale "
             "inversely above this speed (default: 7.0 m/s)"
+        ),
+    )
+    parser.add_argument(
+        "--align-stabilization-steer-limit-deg",
+        type=float,
+        default=4.0,
+        help=(
+            "low-error steering-wheel limit before speed scaling "
+            "(default: 4.0 deg)"
+        ),
+    )
+    parser.add_argument(
+        "--align-capture-error-deg",
+        type=float,
+        default=15.0,
+        help=(
+            "heading error where the full speed-scaled steering limit "
+            "becomes available (default: 15.0 deg)"
         ),
     )
     parser.add_argument("--steer-sign", type=float, default=1.0)
