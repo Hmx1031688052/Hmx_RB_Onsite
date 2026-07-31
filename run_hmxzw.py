@@ -14,10 +14,10 @@ Removed:
   - map loading and obstacle handling
 
 Control policy:
-  - coast without a speed limit while aligning towards the goal
+  - coast without a speed limit while tracking the current goal bearing
     (2 s is warning only)
   - zero steering and wait for heading/yaw/steering feedback to settle
-  - re-anchor the goal line and align again if the new bearing has drifted
+  - anchor the sprint line on the settled current-position-to-goal bearing
   - repeat one logical acceleration pulse until the chassis samples it
   - hold a constant speed target with acceleration/steering locked to zero
 """
@@ -1652,12 +1652,17 @@ class StraightSprintController:
         cross_track = relative_y * tx - relative_x * ty
         remaining_along = self.line_length - along_track
 
-        # Align to the immutable start-to-goal axis. A moving pure-pursuit
-        # bearing can run away when the vehicle starts with a large heading
-        # error: while the car travels beside the line, the goal bearing
-        # rotates faster than the chassis can turn. Once alignment ends,
-        # steering is permanently zero for this episode.
-        guidance_heading = self.line_heading
+        # While the vehicle coasts at its non-zero entry speed, a turn creates
+        # unavoidable lateral displacement.  Continuously track the current
+        # goal bearing so the stabilized heading still defines a straight
+        # line through the goal.  Using the immutable start-to-goal axis here
+        # used to create a large lateral offset, followed by endless discrete
+        # re-anchor turns.
+        guidance_heading = (
+            goal_heading
+            if self.state in ("ALIGN", "SETTLE")
+            else self.line_heading
+        )
         heading_error = wrap_angle(guidance_heading - ego_heading)
         heading_error_deg = math.degrees(heading_error)
         ego_yaw_rate_deg = math.degrees(float(ego_yaw_rate))
@@ -1873,7 +1878,17 @@ class StraightSprintController:
                     self.settle_confirm_count
                     >= self.settle_confirm_frames
                 ):
-                    self._set_tracking_line(ego_x, ego_y)
+                    # Dynamic guidance has already stabilized the direct
+                    # current-position-to-goal bearing.  Anchor that bearing
+                    # once and lock steering to zero for the sprint.
+                    aligned_heading = goal_heading
+                    goal_lateral_offset = abs(
+                        goal_dy * math.cos(aligned_heading)
+                        - goal_dx * math.sin(aligned_heading)
+                    )
+                    self._set_manual_sprint_line(
+                        ego_x, ego_y, aligned_heading
+                    )
                     tx = math.cos(self.line_heading)
                     ty = math.sin(self.line_heading)
                     along_track = 0.0
@@ -1886,56 +1901,25 @@ class StraightSprintController:
                     heading_error_deg = math.degrees(
                         heading_error
                     )
-                    predicted_lateral_miss = abs(
-                        math.sin(heading_error) * self.line_length
+                    self.state = "SPRINT"
+                    self.sprint_pulse_started_time = now
+                    self.sprint_pulse_entry_speed = float(ego_speed)
+                    self.sprint_pulse_complete = False
+                    print(
+                        "[run3] SETTLE -> SPRINT direction aligned "
+                        f"heading_error={heading_error_deg:.3f}deg "
+                        f"goal_lateral_offset="
+                        f"{goal_lateral_offset:.3f}m "
+                        f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
+                        f"steer_feedback="
+                        f"{steering_feedback_deg:.3f}deg "
+                        f"stable={self.settle_confirm_count}/"
+                        f"{self.settle_confirm_frames} "
+                        f"anchor=({ego_x:.3f},{ego_y:.3f}) "
+                        f"straight_heading="
+                        f"{math.degrees(self.line_heading):.3f}deg",
+                        flush=True,
                     )
-                    sprint_heading_ok = (
-                        abs(heading_error_deg)
-                        <= self.sprint_heading_tolerance_deg
-                    )
-                    sprint_miss_ok = (
-                        predicted_lateral_miss
-                        <= self.sprint_max_lateral_miss
-                    )
-                    if not (sprint_heading_ok and sprint_miss_ok):
-                        self.state = "ALIGN"
-                        self.confirm_count = 0
-                        self.align_started_time = now
-                        self.align_timeout_warned = False
-                        self.settle_started_time = None
-                        self.settle_confirm_count = 0
-                        print(
-                            "[run3] SETTLE -> ALIGN after re-anchor "
-                            f"heading_error={heading_error_deg:.3f}deg "
-                            f"(sprint_limit="
-                            f"{self.sprint_heading_tolerance_deg:.3f}deg) "
-                            f"predicted_miss="
-                            f"{predicted_lateral_miss:.3f}m "
-                            f"(limit="
-                            f"{self.sprint_max_lateral_miss:.3f}m) "
-                            f"anchor=({ego_x:.3f},{ego_y:.3f}) "
-                            f"remaining_line={self.line_length:.3f}m",
-                            flush=True,
-                        )
-                    else:
-                        self.state = "SPRINT"
-                        self.sprint_pulse_started_time = now
-                        self.sprint_pulse_entry_speed = float(ego_speed)
-                        self.sprint_pulse_complete = False
-                        print(
-                            "[run3] SETTLE -> SPRINT "
-                            f"heading_error={heading_error_deg:.3f}deg "
-                            f"predicted_miss="
-                            f"{predicted_lateral_miss:.3f}m "
-                            f"yaw_rate={ego_yaw_rate_deg:.3f}deg/s "
-                            f"steer_feedback="
-                            f"{steering_feedback_deg:.3f}deg "
-                            f"stable={self.settle_confirm_count}/"
-                            f"{self.settle_confirm_frames} "
-                            f"anchor=({ego_x:.3f},{ego_y:.3f}) "
-                            f"remaining_line={self.line_length:.3f}m",
-                            flush=True,
-                        )
 
         if self.state == "SPRINT":
             pulse_elapsed = (
@@ -2695,9 +2679,8 @@ class Run3:
             f"control_hz={1.0 / self.control_period:.1f} "
             f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
-            f"sprint_tolerance="
-            f"{self.controller.sprint_heading_tolerance_deg:.2f}deg/"
-            f"{self.controller.sprint_max_lateral_miss:.2f}m "
+            "align_guidance=DYNAMIC_GOAL_BEARING "
+            "sprint_entry=DIRECTION_ALIGNED "
             f"confirm_frames={self.controller.align_confirm_frames} "
             f"align_min/warn="
             f"[{self.controller.align_min_duration:.1f},"
@@ -2882,8 +2865,8 @@ def parse_args():
         type=float,
         default=8.0,
         help=(
-            "maximum re-anchored heading error allowed before sprint "
-            "(default: 8.0 deg)"
+            "deprecated compatibility option; automatic sprint now starts "
+            "after the dynamic current-position-to-goal bearing has settled"
         ),
     )
     parser.add_argument(
@@ -2891,8 +2874,8 @@ def parse_args():
         type=float,
         default=3.5,
         help=(
-            "maximum predicted lateral miss at the goal when sprint steering "
-            "is locked to zero (default: 3.5 m)"
+            "deprecated compatibility option; dynamic goal-bearing guidance "
+            "continuously removes lateral miss before sprint"
         ),
     )
     parser.add_argument(
@@ -2976,10 +2959,10 @@ def parse_args():
     parser.add_argument(
         "--align-steer-reference-speed",
         type=float,
-        default=3.0,
+        default=7.0,
         help=(
             "full-gain alignment speed; steering gain and limit scale "
-            "inversely above this speed (default: 3.0 m/s)"
+            "inversely above this speed (default: 7.0 m/s)"
         ),
     )
     parser.add_argument("--steer-sign", type=float, default=1.0)
