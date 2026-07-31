@@ -14,7 +14,8 @@ Removed:
   - map loading and obstacle handling
 
 Control policy:
-  - speed-controlled alignment towards the goal (2 s is warning only)
+  - coast without a speed limit while aligning towards the goal
+    (2 s is warning only)
   - zero steering and wait for heading/yaw/steering feedback to settle
   - re-anchor the goal line and align again if the new bearing has drifted
   - repeat one logical acceleration pulse until the chassis samples it
@@ -1285,6 +1286,13 @@ class StraightSprintController:
         )
         self.sprint_acceleration = float(args.sprint_acceleration)
         self.sprint_speed = max(0.0, float(args.sprint_speed))
+        # ``speed`` is a chassis-side upper bound while ``acceleration``
+        # supplies the longitudinal request.  Keep the bound effectively
+        # disabled throughout automatic alignment so a non-zero episode
+        # entry speed cannot trigger braking before the sprint pulse.
+        self.unrestricted_speed_target = max(
+            10000.0, self.sprint_speed
+        )
         self.sprint_pulse_min_duration = max(
             0.01, float(args.sprint_pulse_min_duration)
         )
@@ -1932,10 +1940,11 @@ class StraightSprintController:
             heading_error_deg = math.degrees(heading_error)
             steering = 0.0
         elif self.state == "SETTLE":
-            acceleration = self._speed_acceleration(
-                self.settle_speed, ego_speed
-            )
-            target_speed = self.settle_speed
+            # Continue coasting while yaw and steering settle.  Restoring a
+            # low speed target here would reintroduce a deceleration step
+            # just before the sprint pulse.
+            acceleration = 0.0
+            target_speed = self.unrestricted_speed_target
             steering = 0.0
         elif self.state == "MANUAL_CENTER":
             acceleration = self._speed_acceleration(
@@ -1954,12 +1963,11 @@ class StraightSprintController:
             target_speed = self.manual_speed
             steering = self.manual_steering_deg
         else:
-            # Keep closing the speed error on every control frame. A lost
-            # first frame can no longer leave the vehicle stopped forever.
-            acceleration = self._speed_acceleration(
-                self.align_speed, ego_speed
-            )
-            target_speed = self.align_speed
+            # ALIGN changes heading only.  Episodes can enter this state
+            # with substantial initial speed, so do not impose a lower
+            # speed bound or a longitudinal acceleration/deceleration.
+            acceleration = 0.0
+            target_speed = self.unrestricted_speed_target
             steering = self._alignment_steering(
                 heading_error_deg, ego_yaw_rate_deg
             )
@@ -2630,8 +2638,9 @@ class Run3:
             "[run3] minimal straight sprint started "
             f"start_mode="
             f"{'MANUAL_WASD' if self.controller.manual_start else 'AUTO'} "
-            f"align_speed={self.controller.align_speed:.2f}m/s "
-            f"align_acc={self.controller.align_acceleration:.2f}m/s2 "
+            "align_longitudinal=COAST_UNLIMITED "
+            f"align_speed_limit="
+            f"{self.controller.unrestricted_speed_target:.1f}m/s "
             f"control_hz={1.0 / self.control_period:.1f} "
             f"align_speed_kp={self.controller.align_speed_kp:.2f} "
             f"align_tolerance={self.controller.align_tolerance_deg:.2f}deg "
@@ -2774,13 +2783,19 @@ def parse_args():
         "--align-speed",
         type=float,
         default=3.0,
-        help="heading-alignment target (default: 3.0 m/s)",
+        help=(
+            "deprecated compatibility option; ignored because automatic "
+            "alignment now coasts without a speed limit"
+        ),
     )
     parser.add_argument(
         "--align-acceleration",
         type=float,
         default=10.0,
-        help="maximum heading-alignment acceleration (default: 10 m/s^2)",
+        help=(
+            "deprecated compatibility option; ignored during automatic "
+            "alignment"
+        ),
     )
     parser.add_argument(
         "--align-pulse-acceleration",
@@ -2852,7 +2867,10 @@ def parse_args():
         "--settle-speed",
         type=float,
         default=3.0,
-        help="speed target while steering/yaw settle (default: 3 m/s)",
+        help=(
+            "deprecated compatibility option; ignored because automatic "
+            "settling now coasts without a speed limit"
+        ),
     )
     parser.add_argument(
         "--settle-duration",

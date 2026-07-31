@@ -196,6 +196,8 @@ SCORE_PROFILES = {
         "max_road_wheel_rate_deg": 35.0,
         "max_lqr_feedback_road_wheel_deg": 8.0,
         "normal_feedback_speed_product_deg_mps": 500.0,
+        "high_speed_damping_blend": 0.0,
+        "recovery_entry_corridor_ratio": 0.80,
         "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.30,
         "geometric_feedforward_blend": 0.0,
@@ -216,6 +218,8 @@ SCORE_PROFILES = {
         "max_road_wheel_rate_deg": 50.0,
         "max_lqr_feedback_road_wheel_deg": 8.0,
         "normal_feedback_speed_product_deg_mps": 500.0,
+        "high_speed_damping_blend": 0.0,
+        "recovery_entry_corridor_ratio": 0.80,
         "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.35,
         "geometric_feedforward_blend": 0.0,
@@ -236,6 +240,8 @@ SCORE_PROFILES = {
         "max_road_wheel_rate_deg": 60.0,
         "max_lqr_feedback_road_wheel_deg": 7.0,
         "normal_feedback_speed_product_deg_mps": 500.0,
+        "high_speed_damping_blend": 0.0,
+        "recovery_entry_corridor_ratio": 0.80,
         "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.40,
         "geometric_feedforward_blend": 0.0,
@@ -255,7 +261,9 @@ SCORE_PROFILES = {
         "speed_kd": 0.06,
         "max_road_wheel_rate_deg": 90.0,
         "max_lqr_feedback_road_wheel_deg": 2.5,
-        "normal_feedback_speed_product_deg_mps": 4.0,
+        "normal_feedback_speed_product_deg_mps": 15.0,
+        "high_speed_damping_blend": 1.0,
+        "recovery_entry_corridor_ratio": 0.90,
         "max_recovery_feedback_road_wheel_deg": 10.0,
         "curvature_preview_time": 0.45,
         "geometric_feedforward_blend": 1.0,
@@ -1615,6 +1623,7 @@ class LearningCsvLogger:
         "lqr_geometric_feedforward_deg",
         "lqr_feedback_deg",
         "lqr_feedback_unclipped_deg",
+        "lateral_damping_blend",
         "road_wheel_deg",
         "road_wheel_rate_deg",
         "comfort_road_wheel_rate_limit_deg",
@@ -1664,6 +1673,11 @@ class LearningCsvLogger:
                     "max_recovery_road_wheel_deg",
                     "max_lqr_feedback_road_wheel_deg",
                     "normal_feedback_speed_product_deg_mps",
+                    "high_speed_damping_blend",
+                    "high_speed_damping_gain",
+                    "high_speed_damping_min_speed",
+                    "high_speed_damping_full_speed",
+                    "recovery_entry_corridor_ratio",
                     "normal_feedback_full_curvature",
                     "max_recovery_feedback_road_wheel_deg",
                     "recovery_feedback_speed_product_deg_mps",
@@ -1840,7 +1854,8 @@ class GlobalPathLqrPidController:
         )
         recovery_lateral_threshold = min(
             self.args.large_lateral_error,
-            0.80 * routed_corridor,
+            self.args.recovery_entry_corridor_ratio
+            * routed_corridor,
         )
         recovery_entry = (
             abs(heading_error)
@@ -1903,7 +1918,7 @@ class GlobalPathLqrPidController:
             + feedforward_blend * geometric_feedforward
         )
         feedback_controller = "lqr"
-        lqr_feedback_unclipped = float(lqr["feedback"])
+        lqr_feedback_raw = float(lqr["feedback"])
         straight_feedback_limit_deg = min(
             self.args.max_lqr_feedback_road_wheel_deg,
             (
@@ -1925,6 +1940,41 @@ class GlobalPathLqrPidController:
                 - straight_feedback_limit_deg
             )
         )
+        speed_damping_blend = clip(
+            (
+                model_speed
+                - self.args.high_speed_damping_min_speed
+            )
+            / (
+                self.args.high_speed_damping_full_speed
+                - self.args.high_speed_damping_min_speed
+            ),
+            0.0,
+            1.0,
+        )
+        damping_blend = (
+            self.args.high_speed_damping_blend
+            * speed_damping_blend
+            * (1.0 - curve_authority_blend)
+        )
+        damped_feedback = -self.args.high_speed_damping_gain * (
+            0.00261 * projection["lateral_error"]
+            + 0.00182 * lateral_error_rate
+            + 0.10599 * heading_error
+            + 0.01139 * heading_error_rate
+        )
+        provisional_limit = math.radians(feedback_limit_deg)
+        lqr_feedback_unclipped = (
+            (1.0 - damping_blend)
+            * clip(
+                lqr_feedback_raw,
+                -provisional_limit,
+                provisional_limit,
+            )
+            + damping_blend * damped_feedback
+        )
+        if damping_blend > 0.0:
+            feedback_controller = "pole_damped_lqr"
         if recovery_mode:
             # Raw kinematic LQR is intentionally aggressive outside its
             # linear region.  In the high-speed straight test it requested
@@ -1934,6 +1984,7 @@ class GlobalPathLqrPidController:
             # speed-scaled cap preserves authority at low speed without
             # commanding a hairpin correction at motorway speed.
             feedback_controller = "stanley_recovery"
+            damping_blend = 0.0
             stanley_cross_track = math.atan2(
                 self.args.recovery_stanley_gain
                 * projection["lateral_error"],
@@ -1962,6 +2013,7 @@ class GlobalPathLqrPidController:
         )
         lqr["feedback_controller"] = feedback_controller
         lqr["feedback_limit"] = feedback_limit
+        lqr["damping_blend"] = damping_blend
         road_wheel_raw = (
             float(lqr["feedforward"]) + float(lqr["feedback"])
         )
@@ -3460,6 +3512,7 @@ class GlobalLqrPidRuntime:
             "lqr_feedback_unclipped_deg": math.degrees(
                 lqr["feedback_unclipped"]
             ),
+            "lateral_damping_blend": lqr["damping_blend"],
             "road_wheel_deg": math.degrees(
                 output["road_wheel"]
             ),
@@ -3515,6 +3568,8 @@ class GlobalLqrPidRuntime:
                 f"kappa={projection['curvature']:.4f}->"
                 f"{output['control_curvature']:.4f} "
                 f"model={lqr['model']} "
+                f"feedback_ctrl={lqr['feedback_controller']} "
+                f"damp={lqr['damping_blend']:.2f} "
                 f"delta_ff={math.degrees(lqr['feedforward']):.2f}deg "
                 f"delta_fb={math.degrees(lqr['feedback']):.2f}/"
                 f"{math.degrees(lqr['feedback_unclipped']):.2f}deg "
@@ -3969,10 +4024,10 @@ def run_self_test(args=None):
                 f"max_error={max_intersection_error:.3f}m"
             )
 
-        # Regression for the onsite "high-speed snake" trace: the vehicle
-        # arrived on a straight at 30 m/s with 0.65 m cross-track error.
-        # A fixed +/-2.5 deg feedback clip behaved like a relay, eventually
-        # triggering unrestricted recovery and oscillating by over 4 m.
+        # Dynamic-bicycle regression for the onsite "high-speed snake"
+        # trace.  A kinematic replay hid the tyre/yaw lag that repeatedly
+        # carried the vehicle through the centreline, so preserve the
+        # measured initial [e, e_dot, heading, yaw-rate] state here.
         high_speed_route = {
             "x": np.linspace(0.0, 420.0, 1401).tolist(),
             "y": np.zeros(1401).tolist(),
@@ -3985,36 +4040,55 @@ def run_self_test(args=None):
         )
         high_speed_controller.set_route(
             high_speed_route,
-            initial_speed=30.012,
+            initial_speed=29.8033,
             legal_speed=33.333333,
             expected_speed=33.333333,
         )
-        sim_x = 0.0
-        sim_y = 0.646
-        sim_heading = math.radians(1.353)
-        sim_speed = 30.012
-        sim_output = None
+        sim_x = 6.60
+        sim_speed = 29.8033
+        sim_lateral_state = np.array(
+            [
+                [0.61656],
+                [0.70381],
+                [math.radians(1.353)],
+                [0.0],
+            ],
+            dtype=float,
+        )
         high_speed_errors = []
         high_speed_recovery_samples = 0
         reached_high_speed_goal = False
         for index in range(800):
-            sim_yaw_rate = (
-                0.0
-                if sim_output is None
-                else (
-                    sim_speed
-                    * math.tan(sim_output["road_wheel"])
-                    / VEHICLE.wheelbase
-                )
+            sim_y = float(sim_lateral_state[0, 0])
+            sim_lateral_error_rate = float(
+                sim_lateral_state[1, 0]
+            )
+            sim_heading = float(sim_lateral_state[2, 0])
+            sim_yaw_rate = float(sim_lateral_state[3, 0])
+            sim_vy_body = (
+                sim_lateral_error_rate
+                - sim_speed * math.sin(sim_heading)
+            )
+            cos_heading = math.cos(sim_heading)
+            sin_heading = math.sin(sim_heading)
+            sim_vx_world = (
+                cos_heading * sim_speed
+                - sin_heading * sim_vy_body
+            )
+            sim_vy_world = (
+                sin_heading * sim_speed
+                + cos_heading * sim_vy_body
             )
             sim_ego = {
                 "x": sim_x,
                 "y": sim_y,
                 "heading": sim_heading,
-                "vx_world": sim_speed * math.cos(sim_heading),
-                "vy_world": sim_speed * math.sin(sim_heading),
+                "vx_world": sim_vx_world,
+                "vy_world": sim_vy_world,
                 "yaw_rate": sim_yaw_rate,
-                "speed": sim_speed,
+                "speed": math.hypot(
+                    sim_vx_world, sim_vy_world
+                ),
             }
             sim_output = high_speed_controller.control(
                 sim_ego, now=30.0 + 0.02 * index
@@ -4028,19 +4102,23 @@ def run_self_test(args=None):
                 sim_output["recovery_mode"]
             )
             sim_road_wheel = sim_output["road_wheel"]
-            sim_heading = wrap_angle(
-                sim_heading
-                + sim_speed
-                * math.tan(sim_road_wheel)
-                / VEHICLE.wheelbase
-                * 0.02
+            continuous_a, continuous_b, continuous_e = (
+                high_speed_controller.lqr
+                .dynamic_continuous_matrices(
+                    max(sim_speed, 3.0)
+                )
             )
-            sim_x += (
-                sim_speed * math.cos(sim_heading) * 0.02
+            discrete_a, discrete_b, _ = exact_zero_order_hold(
+                continuous_a,
+                continuous_b,
+                continuous_e,
+                dt=0.02,
             )
-            sim_y += (
-                sim_speed * math.sin(sim_heading) * 0.02
+            sim_lateral_state = (
+                discrete_a @ sim_lateral_state
+                + discrete_b * sim_road_wheel
             )
+            sim_x += sim_speed * cos_heading * 0.02
             sim_speed = max(
                 0.0,
                 sim_speed + sim_output["acceleration"] * 0.02,
@@ -4053,6 +4131,10 @@ def run_self_test(args=None):
             or max(high_speed_errors) > 1.05
             or max(high_speed_errors[-50:]) > 0.02
             or high_speed_recovery_samples != 0
+            or (
+                sim_output["lqr"]["feedback_controller"]
+                != "pole_damped_lqr"
+            )
         ):
             raise AssertionError(
                 "attack high-speed straight damping failed: "
@@ -4521,6 +4603,33 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--high-speed-damping-blend",
+        type=float,
+        default=None,
+        help=(
+            "blend from clipped LQR to pole-placed straight-road "
+            "damping at high speed"
+        ),
+    )
+    parser.add_argument(
+        "--high-speed-damping-gain",
+        type=float,
+        default=1.5,
+        help="gain multiplier for high-speed straight-road damping",
+    )
+    parser.add_argument(
+        "--high-speed-damping-min-speed",
+        type=float,
+        default=15.0,
+        help="m/s speed where straight-road damping begins blending in",
+    )
+    parser.add_argument(
+        "--high-speed-damping-full-speed",
+        type=float,
+        default=25.0,
+        help="m/s speed where straight-road damping reaches full authority",
+    )
+    parser.add_argument(
         "--recovery-feedback-speed-product-deg-mps",
         type=float,
         default=80.0,
@@ -4546,6 +4655,15 @@ def parse_args():
         type=float,
         default=0.40,
         help="recovery exits only inside this lateral-error band",
+    )
+    parser.add_argument(
+        "--recovery-entry-corridor-ratio",
+        type=float,
+        default=None,
+        help=(
+            "fraction of the legal routed corridor that triggers "
+            "nonlinear recovery"
+        ),
     )
     parser.add_argument(
         "--recovery-exit-heading-error-deg",
@@ -4714,6 +4832,16 @@ def validate_args(args):
         "normal_feedback_speed_product_deg_mps": (
             args.normal_feedback_speed_product_deg_mps
         ),
+        "high_speed_damping_gain": args.high_speed_damping_gain,
+        "high_speed_damping_min_speed": (
+            args.high_speed_damping_min_speed
+        ),
+        "high_speed_damping_full_speed": (
+            args.high_speed_damping_full_speed
+        ),
+        "recovery_entry_corridor_ratio": (
+            args.recovery_entry_corridor_ratio
+        ),
         "normal_feedback_full_curvature": (
             args.normal_feedback_full_curvature
         ),
@@ -4775,6 +4903,22 @@ def validate_args(args):
         raise ValueError(
             "--geometric-feedforward-blend must be between 0 and 1"
         )
+    if not 0.0 <= args.high_speed_damping_blend <= 1.0:
+        raise ValueError(
+            "--high-speed-damping-blend must be between 0 and 1"
+        )
+    if not 0.0 < args.recovery_entry_corridor_ratio < 1.0:
+        raise ValueError(
+            "--recovery-entry-corridor-ratio must be between 0 and 1"
+        )
+    if (
+        args.high_speed_damping_full_speed
+        <= args.high_speed_damping_min_speed
+    ):
+        raise ValueError(
+            "--high-speed-damping-full-speed must be greater than "
+            "--high-speed-damping-min-speed"
+        )
     if (
         args.expected_speed_mps is not None
         and (
@@ -4798,7 +4942,7 @@ def validate_args(args):
         )
     recovery_lateral_entry = min(
         args.large_lateral_error,
-        0.80
+        args.recovery_entry_corridor_ratio
         * (args.rule_lane_half_width - args.rule_lane_margin),
     )
     if args.recovery_exit_lateral_error >= recovery_lateral_entry:
